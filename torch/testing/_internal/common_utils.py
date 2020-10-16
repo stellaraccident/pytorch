@@ -1172,6 +1172,8 @@ class TestCase(expecttest.TestCase):
                 assert debug_msg is not None
                 msg = "Scalars failed to compare as equal! " + debug_msg
             self.assertTrue(result, msg=msg)
+        elif isinstance(x, torch.jit.RecursiveScriptClass) and isinstance(y, torch.jit.RecursiveScriptClass):
+            self.assertTrue(x._c.equals(y._c), msg=msg)
         else:
             super().assertEqual(x, y, msg=msg)
 

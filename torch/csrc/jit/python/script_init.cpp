@@ -105,20 +105,31 @@ struct PythonResolver : public Resolver {
       return script_class.class_type_.type_;
     }
 
-    py::bool_ isClass = py::module::import("inspect").attr("isclass")(obj);
+    auto unwrapped =
+        py::module::import("torch._jit_internal").attr("safe_unwrap")(obj);
+    py::bool_ isClass =
+        py::module::import("inspect").attr("isclass")(unwrapped);
+
     if (!py::cast<bool>(isClass)) {
       return nullptr;
     }
 
-    if (isNamedTupleClass(obj)) {
-      return registerNamedTuple(obj, loc);
+    if (isNamedTupleClass(unwrapped)) {
+      return registerNamedTuple(unwrapped, loc);
     }
 
     auto qualifiedName = c10::QualifiedName(
         py::cast<std::string>(py::module::import("torch._jit_internal")
-                                  .attr("_qualified_name")(obj)));
+                                  .attr("_qualified_name")(unwrapped)));
 
-    return get_python_cu()->get_type(qualifiedName);
+    auto pyClass =
+        py::module::import("torch.jit._state")
+            .attr("_get_script_class")(qualifiedName.qualifiedName());
+    if (!pyClass.is_none()) {
+      return get_python_cu()->get_type(qualifiedName);
+    }
+
+    return nullptr;
   }
 
   TypePtr resolveType(const std::string& name, const SourceRange& loc)
@@ -781,6 +792,11 @@ void initJitScriptBindings(PyObject* module) {
                   return method.name();
                 });
               })
+          .def(
+              "_properties", [](Object& self) { return self.get_properties(); })
+          .def(
+              "equals",
+              [](Object& self, const Object& rhs) { return self.equals(rhs); })
           .def("__copy__", &Object::copy)
           .def(py::pickle(
               [](const Object& self)
@@ -1106,7 +1122,11 @@ void initJitScriptBindings(PyObject* module) {
       .def(
           "get_interface",
           [](const std::shared_ptr<CompilationUnit>& self,
-             const std::string& name) { return self->get_interface(name); });
+             const std::string& name) { return self->get_interface(name); })
+      .def(
+          "get_class",
+          [](const std::shared_ptr<CompilationUnit>& self,
+             const std::string& name) { return self->get_class(name); });
 
   py::class_<StrongFunctionPtr>(m, "ScriptFunction", py::dynamic_attr())
       .def(
@@ -1541,9 +1561,12 @@ void initJitScriptBindings(PyObject* module) {
 
   m.def("_get_graph_executor_optimize", &torch::jit::getGraphExecutorOptimize);
 
-  m.def("_create_module_with_type", [](const ClassTypePtr& type) {
-    return Module(get_python_cu(), type);
-  });
+  m.def(
+       "_create_module_with_type",
+       [](const ClassTypePtr& type) { return Module(get_python_cu(), type); })
+      .def("_create_object_with_type", [](const ClassTypePtr& type) {
+        return Object(get_python_cu(), type);
+      });
 
   m.def("_export_opnames", [](Module& sm) {
     return debugMakeList(torch::jit::export_opnames(sm));

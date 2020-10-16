@@ -985,6 +985,7 @@ std::shared_ptr<SugaredValue> toSugaredValue(
     return createSimpleEnumValue(obj, m, loc);
   }
 
+  obj = py::module::import("inspect").attr("unwrap")(obj);
   py::bool_ is_class = py::module::import("inspect").attr("isclass")(obj);
   if (py::cast<bool>(is_class)) {
     py::str qualifiedName =
