@@ -5,6 +5,11 @@
 #include <atomic>
 #include <stdexcept>
 
+namespace pybind11 {
+  template <typename, typename...>
+  class class_;
+}
+
 namespace c10 {
 class intrusive_ptr_target;
 namespace raw {
@@ -206,6 +211,16 @@ class intrusive_ptr final {
     }
     target_ = NullType::singleton();
   }
+
+  // Make pybind11::class_ be a friend class of intrusive_ptr, so that custom smart
+  // holder in pybind11 could access the private constructor of intrusive_ptr(T*)
+  // which took the ownership of the object.
+  // This is required by customer holder macro PYBIND11_DECLARE_HOLDER_TYPE, where
+  // it uses intrusive_ptr(TTarget*) to initialize and take ownership of the object.
+  // For details, see
+  // https://pybind11.readthedocs.io/en/stable/advanced/smart_ptrs.html#custom-smart-pointers
+  template <typename, typename...>
+  friend class pybind11::class_;
 
   // This constructor will not increase the ref counter for you.
   // This is not public because we shouldn't make intrusive_ptr out of raw
