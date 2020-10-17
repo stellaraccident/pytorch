@@ -1,6 +1,8 @@
 #include <c10d/ProcessGroup.hpp>
 
 #include <c10/util/Logging.h>
+#include <sys/types.h>
+#include <torch/custom_class.h>
 
 namespace c10d {
 
@@ -77,7 +79,7 @@ std::exception_ptr ProcessGroup::Work::exception() const {
   return exception_;
 }
 
-int ProcessGroup::Work::sourceRank() const {
+int64_t ProcessGroup::Work::sourceRank() const {
   throw std::runtime_error(
       "sourceRank() may only be called on work objects "
       "that correspond to a recv or recv-from-any call.");
