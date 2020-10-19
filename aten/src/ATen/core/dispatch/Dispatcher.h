@@ -348,6 +348,12 @@ inline Return Dispatcher::callWithDispatchKey(const TypedOperatorHandle<Return(A
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(!c10::isAliasDispatchKey(dispatchKey));
   const KernelFunction& kernel = op.operatorIterator_->op.lookup(dispatchKey);
 
+  {
+    std::stringstream msg;
+    msg << "DISPATCH[" << op.schema().name() << "] -> " << dispatchKey;
+    std::string s = msg.str();
+    fprintf(stderr, "%s\n", s.c_str());
+  }
 #ifndef PYTORCH_DISABLE_PER_OP_PROFILING
   // Check if we need to run callbacks registered with RecordFunction
   // If true and callbacks need inputs, we box the arguments and pass
@@ -395,6 +401,14 @@ inline Return Dispatcher::redispatch(const TypedOperatorHandle<Return (Args...)>
       DispatchKeySet(DispatchKeySet::FULL_AFTER, currentDispatchKey),
       args...
     );
+  {
+    std::stringstream msg;
+    msg << "--> RE-DISPATCH[" << op.schema().name() << "]: " << currentDispatchKey
+      << " -> " << dispatchKey;
+    std::string s = msg.str();
+    fprintf(stderr, "%s\n", s.c_str());
+  }
+
   // do not use RecordFunction on redispatch
   const KernelFunction& kernel = op.operatorIterator_->op.lookup(dispatchKey);
   return kernel.template call<Return, Args...>(op, std::forward<Args>(args)...);
@@ -405,6 +419,13 @@ inline void Dispatcher::callBoxed(const OperatorHandle& op, Stack* stack) const 
   const auto& entry = op.operatorIterator_->op;
   auto dispatchKey = entry.dispatchKeyExtractor().getDispatchKeyBoxed(stack);
   const auto& kernel = entry.lookup(dispatchKey);
+
+  {
+    std::stringstream msg;
+    msg << "--> CALLBOXED[" << op.schema().name() << "]: " << dispatchKey;
+    std::string s = msg.str();
+    fprintf(stderr, "%s\n", s.c_str());
+  }
 
 #ifndef PYTORCH_DISABLE_PER_OP_PROFILING
   // using already existing stack to record function execution in observers
