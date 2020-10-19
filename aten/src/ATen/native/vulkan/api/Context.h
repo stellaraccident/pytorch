@@ -43,8 +43,8 @@ class Context final {
   template<typename... Arguments>
   void dispatch(
       Command::Buffer& command_buffer,
-      const Shader::Descriptor& shader_descriptor,
       const Shader::Layout::Signature& shader_layout_signature,
+      const Shader::Descriptor& shader_descriptor,
       const Shader::WorkGroup& local_work_group,
       const Shader::WorkGroup& global_work_group,
       Arguments&&... arguments);

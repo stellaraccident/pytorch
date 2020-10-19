@@ -18,12 +18,15 @@ struct Command final {
 
   class Buffer final {
    public:
+    Buffer();
     Buffer(VkDevice device, VkCommandPool command_pool);
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     Buffer(Buffer&&);
     Buffer& operator=(Buffer&&);
     ~Buffer() = default;
+
+    operator bool() const;
 
     void begin();
     void end();
@@ -87,6 +90,10 @@ inline Command::Buffer& Command::Buffer::operator=(Buffer&& buffer) {
   };
 
   return *this;
+}
+
+inline Command::Buffer::operator bool() const {
+  return VK_NULL_HANDLE != command_buffer_;
 }
 
 } // namespace api
