@@ -265,7 +265,7 @@ class TORCH_API Pickler {
 };
 
 // returns a (tensor, record_size) for a tensor, converting it to a CPU tensor
-// if necessary
+// if it was CUDA and toCpu is True.
 TORCH_API WriteableTensorData getWriteableTensorData(
     const at::Tensor& tensor, bool toCpu=true);
 
