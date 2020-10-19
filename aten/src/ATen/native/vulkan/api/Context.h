@@ -26,10 +26,10 @@ class Context final {
  public:
   explicit Context(const Adapter& adapter);
   Context(const Context&) = delete;
-  Context(Context&&) = default;
+  Context(Context&&) = delete;
   Context& operator=(const Context&) = delete;
-  Context& operator=(Context&&) = default;
-  ~Context() = default;
+  Context& operator=(Context&&) = delete;
+  ~Context();
 
   GPU gpu();
   Command& command();
@@ -38,20 +38,31 @@ class Context final {
   Descriptor& descriptor();
   Resource& resource();
 
+  // GPU RPC
+
+  template<typename... Arguments>
+  void dispatch(
+      Command::Buffer& command_buffer,
+      const Shader::Descriptor& shader_descriptor,
+      const Shader::Layout::Signature& shader_layout_signature,
+      const Shader::WorkGroup& local_work_group,
+      const Shader::WorkGroup& global_work_group,
+      Arguments&&... arguments);
+
+  // This function is expensive and its use bad for performance. Only use this
+  // function for debugging or as a short term hack on way to a more performant
+  // solution.
+
+  void flush();
+
  private:
   VkDevice device();
   VkQueue queue();
 
  private:
-  class Deleter final {
-   public:
-    void operator()(VkDevice device) const;
-  };
-
- private:
   // Construction and destruction order matters.  Do not move members around.
   Adapter adapter_;
-  Handle<VkDevice, Deleter> device_;
+  Handle<VkDevice, decltype(&VK_DELETER(Device))> device_;
   VkQueue queue_;
   Command command_;
   Shader shader_;
@@ -103,6 +114,63 @@ inline VkDevice Context::device() {
 inline VkQueue Context::queue() {
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(queue_);
   return queue_;
+}
+
+namespace detail {
+
+template<
+    size_t...Indices,
+    typename ...Arguments>
+inline void bind_arguments(
+    Descriptor::Set& descriptor_set,
+    const std::index_sequence<Indices...>,
+    Arguments&&...arguments) {
+  const auto expander{
+    (descriptor_set.bind(Indices, arguments), 0)...,
+  };
+  (void)(expander);
+}
+
+} // namespace detail
+
+template<typename... Arguments>
+inline void dispatch(
+    Command::Buffer& command_buffer,
+    const Shader::Layout::Signature& shader_layout_signature,
+    const Shader::Descriptor& shader_descriptor,
+    const Shader::WorkGroup& local_work_group,
+    const Shader::WorkGroup& global_work_group,
+    Arguments&&... arguments) {
+  // Forward declaration
+  Descriptor::Set dispatch_prologue(
+      Command::Buffer&,
+      const Shader::Layout::Signature&,
+      const Shader::Descriptor&,
+      const Shader::WorkGroup&);
+
+  // Factor out template parameter independent code to minimize code bloat.
+  Descriptor::Set descriptor_set = dispatch_prologue(
+      command_buffer,
+      shader_layout_signature,
+      shader_descriptor,
+      local_work_group);
+
+  detail::bind_arguments(
+      descriptor_set,
+      std::index_sequence_for<Arguments...>{},
+      std::forward<Arguments>(arguments)...);
+
+  // Forward declaration
+  void dispatch_epilogue(
+      Command::Buffer&,
+      const Descriptor::Set&,
+      const Shader::WorkGroup&);
+
+  // Factor out template parameter independent code to minimize code bloat.
+  dispatch_epilogue(
+      command_buffer,
+      descriptor_set,
+      global_work_group);
 }
 
 } // namespace api
