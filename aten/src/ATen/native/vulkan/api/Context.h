@@ -71,6 +71,7 @@ class Context final {
   Resource resource_;
 };
 
+C10_EXPORT bool available();
 Context* context();
 
 //
