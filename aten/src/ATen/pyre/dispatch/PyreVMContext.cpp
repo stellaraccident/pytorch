@@ -54,7 +54,9 @@ CachedKernel loadKernel(
   kernel.context = c10::pyre::vm_context_ptr::steal(context);
   iree_vm_module_release(hal_module);
 
-  std::string full_name = "module." + func_name;
+  // Resolve the $async entry point — coarse-fences calling convention.
+  // Args: out, inputs..., workspace, wait_fence, signal_fence → void.
+  std::string full_name = "module." + func_name + "$async";
   PYRE_LOG(DEBUG) << "resolving: " << full_name << "\n";
   iree_string_view_t nv = {
       full_name.c_str(), static_cast<iree_host_size_t>(full_name.size())};
