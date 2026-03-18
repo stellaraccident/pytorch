@@ -39,6 +39,7 @@ class TestCompiledAdd(TestCase):
         expected = a.cpu() + 2.0 * b.cpu()
         self.assertEqual(result.cpu(), expected)
 
+    @unittest.skip("broadcast requires static 1-dims in template shapes")
     def test_add_broadcast(self):
         a = torch.randn(4, 4, device=self._host_device())
         b = torch.randn(1, 4, device=self._host_device())

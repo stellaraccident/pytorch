@@ -19,7 +19,7 @@ namespace at::pyre {
 struct CachedKernel {
   c10::pyre::vm_module_ptr module;
   c10::pyre::vm_context_ptr context;
-  iree_vm_function_t function;  // resolved $async entry point
+  iree_vm_function_t function;  // resolved entry point
 };
 
 // Load a VMFB byte buffer into a VM module and create a ready-to-dispatch

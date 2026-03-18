@@ -69,10 +69,17 @@ void PyreKernelDispatch::invokeAsync(
 
   PYRE_LOG(TRACE) << "  args packed: " << iree_vm_list_size(args) << "\n";
 
+  iree_vm_function_t func = kernel->function;
+  PYRE_LOG(TRACE) << "  kernel@" << kernel
+                  << " func.module=" << static_cast<void*>(func.module)
+                  << " ordinal=" << func.ordinal
+                  << " context=" << static_cast<void*>(kernel->context.get())
+                  << "\n";
+
   // Invoke (sync CPU path — function is void, no rets needed).
   PYRE_CHECK_OK(iree_vm_invoke(
       kernel->context.get(),
-      kernel->function,
+      func,
       IREE_VM_INVOCATION_FLAG_NONE,
       /*policy=*/nullptr,
       args,
@@ -81,21 +88,9 @@ void PyreKernelDispatch::invokeAsync(
 
   PYRE_LOG(TRACE) << "  invoke OK\n";
 
-  // Record timeline bookkeeping.
-  // Sync invoke: the work is done, manually signal the stream semaphore
-  // so that downstream synchronize() calls don't hang.
-  ++stream_ctx.timepoint;
-  auto* sem = stream_ctx.timeline.get();
-  uint64_t tp = stream_ctx.timepoint;
-  PYRE_CHECK_OK(iree_hal_semaphore_signal(sem, tp));
-  for (const auto& input : inputs) {
-    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
-        input.storage().data_ptr().get_context());
-    if (ctx) ctx->recordUse(sem, tp);
-  }
-  auto* out_ctx = static_cast<c10::pyre::PyreBufferContext*>(
-      output.storage().data_ptr().get_context());
-  if (out_ctx) out_ctx->recordMutation(sem, tp);
+  // Sync invoke: work is already complete. No timeline bookkeeping
+  // needed — the semaphore-based sync path (used by fill/copy transfer
+  // ops) is independent from the VM invoke sync path.
 
   iree_vm_list_release(args);
 }
