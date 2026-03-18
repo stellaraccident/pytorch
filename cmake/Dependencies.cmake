@@ -101,6 +101,15 @@ if(USE_XPU)
   endforeach()
 endif()
 
+# ---[ Pyre (replaces hipified ROCm backend)
+if(USE_PYRE)
+  if(USE_ROCM)
+    message(FATAL_ERROR "USE_PYRE and USE_ROCM are mutually exclusive. "
+      "Pyre replaces the hipified ROCm backend.")
+  endif()
+  include(${CMAKE_CURRENT_LIST_DIR}/public/pyre.cmake)
+endif()
+
 # ---[ Custom Protobuf
 if(CAFFE2_CMAKE_BUILDING_WITH_MAIN_REPO AND NOT INTERN_BUILD_MOBILE)
   disable_ubsan()

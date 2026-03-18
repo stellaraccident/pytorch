@@ -796,6 +796,9 @@ if(BUILD_LIBTORCHLESS)
   if(USE_XPU)
     find_library(TORCH_XPU_LIB torch_xpu PATHS $ENV{LIBTORCH_LIB_PATH} NO_DEFAULT_PATH)
   endif()
+  if(USE_PYRE)
+    find_library(TORCH_PYRE_LIB torch_pyre PATHS $ENV{LIBTORCH_LIB_PATH} NO_DEFAULT_PATH)
+  endif()
   add_subdirectory(../torch torch)
   # ---[ Torch python bindings build
   set(TORCH_PYTHON_COMPILE_OPTIONS ${TORCH_PYTHON_COMPILE_OPTIONS} PARENT_SCOPE)
@@ -1219,6 +1222,16 @@ if(USE_XPU)
   endif()
 endif()
 
+if(USE_PYRE)
+  set(Caffe2_PYRE_SRCS
+    ${TORCH_ROOT}/aten/src/ATen/pyre/PyreFallback.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/PyreTensor.cpp
+  )
+  add_library(torch_pyre ${Caffe2_PYRE_SRCS})
+  torch_compile_options(torch_pyre)
+  target_compile_definitions(torch_pyre PRIVATE USE_PYRE)
+endif()
+
 if(NOT MSVC AND USE_XNNPACK)
   TARGET_LINK_LIBRARIES(torch_cpu PRIVATE fxdiv)
 endif()
@@ -1581,6 +1594,10 @@ if(USE_XPU)
   target_compile_definitions(torch_xpu PRIVATE TORCH_XPU_BUILD_MAIN_LIB)
 endif()
 
+if(USE_PYRE)
+  target_compile_definitions(torch_pyre PRIVATE TORCH_PYRE_BUILD_MAIN_LIB)
+endif()
+
 set(EXPERIMENTAL_SINGLE_THREAD_POOL "0" CACHE STRING
   "Experimental option to use a single thread pool for inter- and intra-op parallelism")
 if("${EXPERIMENTAL_SINGLE_THREAD_POOL}")
@@ -1599,6 +1616,8 @@ if(USE_CUDA)
   caffe2_interface_library(torch_cuda torch_cuda_library)
 elseif(USE_ROCM)
   caffe2_interface_library(torch_hip torch_hip_library)
+elseif(USE_PYRE)
+  caffe2_interface_library(torch_pyre torch_pyre_library)
 elseif(USE_XPU)
   caffe2_interface_library(torch_xpu torch_xpu_library)
 endif()
@@ -1611,6 +1630,8 @@ if(USE_CUDA)
   install(TARGETS torch_cuda torch_cuda_library EXPORT Caffe2Targets DESTINATION "${TORCH_INSTALL_LIB_DIR}")
 elseif(USE_ROCM)
   install(TARGETS torch_hip torch_hip_library EXPORT Caffe2Targets DESTINATION "${TORCH_INSTALL_LIB_DIR}")
+elseif(USE_PYRE)
+  install(TARGETS torch_pyre torch_pyre_library EXPORT Caffe2Targets DESTINATION "${TORCH_INSTALL_LIB_DIR}")
 elseif(USE_XPU)
   install(TARGETS torch_xpu torch_xpu_library EXPORT Caffe2Targets DESTINATION "${TORCH_INSTALL_LIB_DIR}")
 endif()
@@ -1623,6 +1644,8 @@ if(USE_CUDA)
   target_link_libraries(torch PUBLIC torch_cuda_library)
 elseif(USE_ROCM)
   target_link_libraries(torch PUBLIC torch_hip_library)
+elseif(USE_PYRE)
+  target_link_libraries(torch PUBLIC torch_pyre_library)
 endif()
 
 if(USE_XPU)
@@ -1675,6 +1698,21 @@ if(USE_CUDA)
     # Link mslk to torch_cuda (only for (1) CUDA build for SM100).
     target_link_libraries(torch_cuda PRIVATE mslk)
   endif()
+endif()
+
+# ---[ Pyre library.
+if(USE_PYRE)
+  target_link_libraries(torch_pyre PUBLIC c10_pyre)
+  target_link_libraries(torch_pyre PRIVATE ${Caffe2_PYRE_DEPENDENCY_LIBS})
+
+  target_include_directories(
+    torch_pyre INTERFACE $<INSTALL_INTERFACE:include>)
+  target_include_directories(
+    torch_pyre PRIVATE ${Caffe2_PYRE_INCLUDE})
+
+  add_dependencies(torch_pyre torch_cpu)
+
+  target_link_libraries(torch_pyre PUBLIC torch_cpu_library)
 endif()
 
 # ---[ XPU library.

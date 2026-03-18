@@ -2883,11 +2883,18 @@ Call this whenever a new thread is created in order to propagate values from
   PyObject* has_xpu = Py_False;
 #endif
 
+#ifdef USE_PYRE
+  PyObject* has_pyre = Py_True;
+#else
+  PyObject* has_pyre = Py_False;
+#endif
+
   ASSERT_TRUE(set_module_attr("_has_cuda", has_cuda));
   ASSERT_TRUE(
       set_module_attr("_has_magma", at::hasMAGMA() ? Py_True : Py_False));
   ASSERT_TRUE(set_module_attr("_has_mps", has_mps));
   ASSERT_TRUE(set_module_attr("_has_xpu", has_xpu));
+  ASSERT_TRUE(set_module_attr("_has_pyre", has_pyre));
   ASSERT_TRUE(
       set_module_attr("_has_mkldnn", at::hasMKLDNN() ? Py_True : Py_False));
   ASSERT_TRUE(set_module_attr(

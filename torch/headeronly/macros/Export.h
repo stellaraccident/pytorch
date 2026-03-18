@@ -136,6 +136,20 @@
 #define TORCH_XPU_API C10_IMPORT
 #endif
 
+// libc10_pyre.so
+#ifdef C10_PYRE_BUILD_MAIN_LIB
+#define C10_PYRE_API C10_EXPORT
+#else
+#define C10_PYRE_API C10_IMPORT
+#endif
+
+// libtorch_pyre.so
+#ifdef TORCH_PYRE_BUILD_MAIN_LIB
+#define TORCH_PYRE_API C10_EXPORT
+#else
+#define TORCH_PYRE_API C10_IMPORT
+#endif
+
 // Enums only need to be exported on windows for non-CUDA files
 #if defined(_WIN32) && defined(__CUDACC__)
 #define C10_API_ENUM C10_API

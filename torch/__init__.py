@@ -2799,6 +2799,8 @@ def _register_device_module(device_type, module):
     sys.modules[torch_module_name] = module
 
 
+from torch import pyre as pyre  # noqa: F401 — auto-registers "host" backend if USE_PYRE
+
 from torch import (
     export as export,
     func as func,

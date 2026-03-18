@@ -157,6 +157,10 @@ if(USE_XPU)
   add_subdirectory(xpu)
 endif()
 
+if(USE_PYRE)
+  add_subdirectory(pyre)
+endif()
+
 if(NOT BUILD_LIBTORCHLESS)
   # ---[ Installation
   # Note: for now, we will put all export path into one single Caffe2Targets group
