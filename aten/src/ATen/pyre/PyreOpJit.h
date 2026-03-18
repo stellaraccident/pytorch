@@ -28,6 +28,19 @@ at::Tensor jitSubOp(
     const at::Tensor& other,
     const at::Scalar& alpha);
 
+// Matrix multiply.
+at::Tensor jitMmOp(
+    const at::Tensor& self,
+    const at::Tensor& other);
+
+// addmm: beta * bias + alpha * (mat1 @ mat2)
+at::Tensor jitAddmmOp(
+    const at::Tensor& bias,
+    const at::Tensor& mat1,
+    const at::Tensor& mat2,
+    const at::Scalar& beta,
+    const at::Scalar& alpha);
+
 // Unary ops.
 at::Tensor jitUnaryOp(
     const at::Tensor& self,

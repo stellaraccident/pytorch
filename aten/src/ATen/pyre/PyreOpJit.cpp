@@ -12,6 +12,14 @@
 
 namespace at::pyre {
 
+// Encode broadcast pattern for cache key — "1" for size-1 dims, "d" otherwise.
+// Must be consistent with broadcastAwareShapeStr in PyreKernelAsmBuilder.
+static std::string broadcastKey(c10::IntArrayRef sizes) {
+  std::string r;
+  for (auto d : sizes) r += (d == 1) ? "1" : "d";
+  return r;
+}
+
 bool jitAvailable() {
   return PyreKernelCompiler::isAvailable();
 }
@@ -82,6 +90,8 @@ at::Tensor jitBinaryOp(
       self_c.sizes(), other_c.sizes(), out_shape, adapters);
 
   auto cache_key = func_name + "::" + scalarTypeToTorchMlir(dtype)
+                 + "::" + std::to_string(out_shape.size())
+                 + "::" + broadcastKey(self_c.sizes()) + "+" + broadcastKey(other_c.sizes())
                  + "::" + c10::pyre::PyreDevice::get(0)->capabilities().cacheKey();
 
   auto* kernel = getOrCompile(cache_key, func_name, mlir);
@@ -123,7 +133,16 @@ at::Tensor jitAddOp(
         self_c.sizes(), other_c.sizes(), out_shape, adapters);
   }
 
+  // Alpha value is baked into the MLIR constant — different values need
+  // different compiled kernels.
+  std::string alpha_suffix;
+  if (func_name != "pyre_add")
+    alpha_suffix = "::a" + std::to_string(static_cast<int64_t>(alpha_val));
+
   auto cache_key = func_name + "::" + scalarTypeToTorchMlir(dtype)
+                 + "::" + std::to_string(out_shape.size())
+                 + "::" + broadcastKey(self_c.sizes()) + "+" + broadcastKey(other_c.sizes())
+                 + alpha_suffix
                  + "::" + c10::pyre::PyreDevice::get(0)->capabilities().cacheKey();
 
   auto* kernel = getOrCompile(cache_key, func_name, mlir);
@@ -165,11 +184,122 @@ at::Tensor jitSubOp(
         self_c.sizes(), other_c.sizes(), out_shape, adapters);
   }
 
+  std::string alpha_suffix;
+  if (func_name != "pyre_sub")
+    alpha_suffix = "::a" + std::to_string(static_cast<int64_t>(alpha_val));
+
   auto cache_key = func_name + "::" + scalarTypeToTorchMlir(dtype)
+                 + "::" + std::to_string(out_shape.size())
+                 + "::" + broadcastKey(self_c.sizes()) + "+" + broadcastKey(other_c.sizes())
+                 + alpha_suffix
                  + "::" + c10::pyre::PyreDevice::get(0)->capabilities().cacheKey();
 
   auto* kernel = getOrCompile(cache_key, func_name, mlir);
   return invokeKernel(kernel, {self_c, other_c}, out_shape, self.options());
+}
+
+// -------------------------------------------------------------------------- //
+// Matrix multiply
+// -------------------------------------------------------------------------- //
+
+at::Tensor jitMmOp(
+    const at::Tensor& self,
+    const at::Tensor& other) {
+  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
+      "pyre: mm requires tensors with IREE buffers");
+  TORCH_CHECK(self.dim() == 2 && other.dim() == 2,
+      "pyre: mm requires 2D tensors");
+  TORCH_CHECK(self.size(1) == other.size(0),
+      "pyre: mm dimension mismatch");
+
+  auto dtype = self.scalar_type();
+  std::vector<int64_t> out_shape = {self.size(0), other.size(1)};
+
+  auto mlir = expandBinaryTemplate(
+      "pyre_mm", "mm", dtype,
+      self.sizes(), other.sizes(), out_shape, {});
+
+  auto cache_key = std::string("pyre_mm::") + scalarTypeToTorchMlir(dtype)
+                 + "::2"
+                 + "::" + broadcastKey(self.sizes()) + "+" + broadcastKey(other.sizes())
+                 + "::" + c10::pyre::PyreDevice::get(0)->capabilities().cacheKey();
+
+  auto* kernel = getOrCompile(cache_key, "pyre_mm", mlir);
+  return invokeKernel(kernel, {self, other}, out_shape, self.options());
+}
+
+at::Tensor jitAddmmOp(
+    const at::Tensor& bias,
+    const at::Tensor& mat1,
+    const at::Tensor& mat2,
+    const at::Scalar& beta,
+    const at::Scalar& alpha) {
+  TORCH_CHECK(beta.toDouble() == 1.0 && alpha.toDouble() == 1.0,
+      "pyre: addmm only supports beta=1, alpha=1 currently");
+  TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2,
+      "pyre: addmm requires 2D matrices");
+  TORCH_CHECK(hasPyreBuffer(bias) && hasPyreBuffer(mat1) && hasPyreBuffer(mat2),
+      "pyre: addmm requires tensors with IREE buffers");
+
+  auto dtype = mat1.scalar_type();
+
+  // Detect rank-2 transpose: strides are swapped relative to contiguous.
+  auto isTransposed2D = [](const at::Tensor& t) {
+    return t.dim() == 2 && t.stride(0) == 1 && t.stride(1) == t.size(0);
+  };
+
+  TORCH_CHECK(mat1.is_contiguous(),
+      "pyre: addmm mat1 must be contiguous");
+
+  std::string mlir;
+  std::string func_name;
+  std::string cache_variant;
+  at::Tensor mat2_for_invoke;
+
+  if (isTransposed2D(mat2)) {
+    // mat2 is a transpose view — pass the underlying contiguous storage
+    // with the original (un-transposed) shape. The kernel does the
+    // transpose in MLIR via torch.aten.t.
+    func_name = "pyre_addmm_t";
+    cache_variant = "t";
+    // The underlying storage has shape [N,K] (mat2.T is [K,N]).
+    // mat2.sizes() is [K,N], original is [N,K].
+    std::vector<int64_t> orig_shape = {mat2.size(1), mat2.size(0)};
+    std::vector<int64_t> out_shape = {mat1.size(0), mat2.size(1)};
+    mlir = expandAddmmTransposedTemplate(
+        func_name, dtype,
+        bias.sizes(), mat1.sizes(), orig_shape, out_shape);
+    // Pass the underlying contiguous tensor (the one before .T).
+    mat2_for_invoke = mat2.t();  // undo the transpose to get original layout
+  } else {
+    TORCH_CHECK(mat2.is_contiguous(),
+        "pyre: addmm mat2 must be contiguous or transposed");
+    func_name = "pyre_addmm";
+    cache_variant = "c";
+    std::vector<int64_t> out_shape_v = {mat1.size(0), mat2.size(1)};
+    mlir = expandAddmmTemplate(
+        func_name, dtype,
+        bias.sizes(), mat1.sizes(), mat2.sizes(), out_shape_v);
+    mat2_for_invoke = mat2;
+  }
+
+  std::vector<int64_t> out_shape = {mat1.size(0),
+      isTransposed2D(mat2) ? mat2.size(1) : mat2.size(1)};
+
+  auto cache_key = func_name + "::" + scalarTypeToTorchMlir(dtype)
+                 + "::" + cache_variant
+                 + "::" + broadcastKey(bias.sizes())
+                 + "+" + broadcastKey(mat1.sizes())
+                 + "+" + broadcastKey(mat2_for_invoke.sizes())
+                 + "::" + c10::pyre::PyreDevice::get(0)->capabilities().cacheKey();
+
+  auto* kernel = getOrCompile(cache_key, func_name, mlir);
+
+  auto output = at::empty(out_shape, mat1.options());
+  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  auto& ctx = stream.context();
+  PyreKernelDispatch::invoke(kernel, {bias, mat1, mat2_for_invoke}, output, ctx);
+  return output;
 }
 
 // -------------------------------------------------------------------------- //
@@ -193,6 +323,7 @@ at::Tensor jitUnaryOp(
       self_c.sizes(), self_c.sizes(), adapter);
 
   auto cache_key = func_name + "::" + scalarTypeToTorchMlir(dtype)
+                 + "::" + std::to_string(self_c.dim())
                  + "::" + c10::pyre::PyreDevice::get(0)->capabilities().cacheKey();
 
   auto* kernel = getOrCompile(cache_key, func_name, mlir);

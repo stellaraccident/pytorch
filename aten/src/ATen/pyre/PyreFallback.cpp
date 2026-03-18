@@ -87,14 +87,16 @@ at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
 at::Tensor pyre_copy_from(
     const at::Tensor& self, const at::Tensor& dst, bool /*non_blocking*/) {
   if (self.is_privateuseone() && dst.is_privateuseone()) {
-    TORCH_CHECK(self.is_contiguous() && dst.is_contiguous(),
-        "pyre: non-contiguous d2d copy not supported");
     if (self.dtype() != dst.dtype()) {
-      auto tmp = self.to(at::kCPU).to(dst.dtype()).to(dst.device());
-      PyreTensor tmp_pt(tmp), dst_pt(dst);
-      dst_pt.copyFrom(tmp_pt,
-          tmp.storage_offset() * tmp.element_size(),
-          dst.storage_offset() * dst.element_size(), tmp.nbytes());
+      // Cross-dtype: route through CPU.
+      auto cpu_src = self.to(at::kCPU).to(dst.dtype()).contiguous();
+      PyreTensor dst_pt(dst);
+      dst_pt.updateFromHost(cpu_src.data_ptr(),
+          dst.storage_offset() * dst.element_size(),
+          cpu_src.nbytes());
+    } else if (!self.is_contiguous() || !dst.is_contiguous()) {
+      TORCH_CHECK(false, "pyre: non-contiguous d2d copy not yet supported. "
+          "Use .contiguous() before copying between device tensors.");
     } else {
       PyreTensor src_pt(self), dst_pt(dst);
       dst_pt.copyFrom(src_pt,
@@ -108,11 +110,12 @@ at::Tensor pyre_copy_from(
     dst_pt.updateFromHost(src.data_ptr(),
         dst.storage_offset() * dst.element_size(), src.nbytes());
   } else {
-    TORCH_CHECK(self.is_contiguous(), "pyre: copy from non-contiguous not supported");
-    PyreTensor src_pt(self);
-    at::Tensor tmp = at::empty(self.sizes(), dst.options().dtype(self.dtype()));
+    // pyre → CPU: make contiguous if needed.
+    auto self_c = self.is_contiguous() ? self : self.contiguous();
+    PyreTensor src_pt(self_c);
+    at::Tensor tmp = at::empty(self_c.sizes(), dst.options().dtype(self_c.dtype()));
     src_pt.readToHost(tmp.data_ptr(),
-        self.storage_offset() * self.element_size(), self.nbytes());
+        self_c.storage_offset() * self_c.element_size(), self_c.nbytes());
     dst.copy_(tmp);
   }
   return dst;
@@ -226,6 +229,24 @@ at::Tensor pyre_neg(const at::Tensor& self) {
   return jitUnaryOp(self, "pyre_neg", "torch.aten.neg");
 }
 
+at::Tensor pyre_addmm(
+    const at::Tensor& bias, const at::Tensor& mat1, const at::Tensor& mat2,
+    const at::Scalar& beta, const at::Scalar& alpha) {
+  if (!jitAvailable())
+    return at::addmm(bias.cpu(), mat1.cpu(), mat2.cpu(), beta, alpha).to(mat1.device());
+  TORCH_CHECK(hasPyreBuffer(bias) && hasPyreBuffer(mat1) && hasPyreBuffer(mat2),
+      "pyre: addmm requires tensors with IREE buffers");
+  return jitAddmmOp(bias, mat1, mat2, beta, alpha);
+}
+
+at::Tensor pyre_mm(const at::Tensor& self, const at::Tensor& other) {
+  if (!jitAvailable())
+    return at::mm(self.cpu(), other.cpu()).to(self.device());
+  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
+      "pyre: mm requires tensors with IREE buffers");
+  return jitMmOp(self, other);
+}
+
 at::Tensor pyre_relu(const at::Tensor& self) {
   if (!jitAvailable())
     return self.cpu().relu().to(self.device());
@@ -268,6 +289,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("sub.Tensor", pyre_sub);
   m.impl("mul.Tensor", pyre_mul);
   m.impl("div.Tensor", pyre_div);
+  m.impl("addmm", pyre_addmm);
+  m.impl("mm", pyre_mm);
   m.impl("neg", pyre_neg);
   m.impl("relu", pyre_relu);
 }

@@ -39,4 +39,23 @@ std::string expandUnaryTemplate(
     c10::ArrayRef<int64_t> out_shape,
     const ArgAdapter& adapter);
 
+// addmm: beta * bias + alpha * (mat1 @ mat2)
+std::string expandAddmmTemplate(
+    const std::string& func_name,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> bias_shape,
+    c10::ArrayRef<int64_t> mat1_shape,
+    c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+// addmm with mat2 transposed inside the kernel.
+// mat2_orig_shape is the original [N,K] before transpose.
+std::string expandAddmmTransposedTemplate(
+    const std::string& func_name,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> bias_shape,
+    c10::ArrayRef<int64_t> mat1_shape,
+    c10::ArrayRef<int64_t> mat2_orig_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
 } // namespace at::pyre
