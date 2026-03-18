@@ -3,12 +3,45 @@
 
 namespace c10::pyre {
 
+// -------------------------------------------------------------------------- //
+// DeviceCapabilities
+// -------------------------------------------------------------------------- //
+
+DeviceCapabilities::DeviceCapabilities(
+    std::string backend, std::string target)
+    : backend_(std::move(backend)), target_(std::move(target)) {
+  flags_.push_back("--iree-hal-target-backends=" + backend_);
+  flags_.push_back("--iree-input-type=torch");
+  flags_.push_back("--iree-torch-externalize-transients");
+  if (backend_ == "llvm-cpu") {
+    flags_.push_back("--iree-llvmcpu-target-cpu=" + target_);
+  } else if (backend_ == "rocm") {
+    flags_.push_back("--iree-rocm-target-chip=" + target_);
+  }
+  cache_key_ = backend_ + "-" + target_;
+}
+
+int64_t DeviceCapabilities::preferredVectorWidth(c10::ScalarType dtype) const {
+  switch (dtype) {
+    case c10::ScalarType::Float: return 8;
+    case c10::ScalarType::Double: return 4;
+    case c10::ScalarType::Int: return 8;
+    case c10::ScalarType::Long: return 4;
+    case c10::ScalarType::Half:
+    case c10::ScalarType::BFloat16: return 16;
+    default: return 1;
+  }
+}
+
+// -------------------------------------------------------------------------- //
+// PyreDevice
+// -------------------------------------------------------------------------- //
+
 PyreDevice::PyreDevice(iree_hal_device_t* device, iree_hal_driver_t* driver)
     : device_(device),
       driver_(driver),
       allocator_(iree_hal_device_allocator(device)),
       capabilities_("llvm-cpu", "host") {
-  // Initialize the default stream immediately.
   initStreamContext(default_stream_);
 }
 
@@ -66,9 +99,6 @@ StreamId PyreDevice::getStreamFromPool(bool high_priority) {
 }
 
 void PyreDevice::syncAllStreams() {
-  // TODO(pyre-workspace-k4t): Join all active semaphores into a single
-  // multi-wait instead of waiting sequentially. This requires collecting
-  // active semaphores into an iree_hal_semaphore_list_t.
   auto sync_ctx = [](PyreStreamContext& ctx) {
     if (ctx.initialized() && ctx.timepoint > 0) {
       pyre_log_status(

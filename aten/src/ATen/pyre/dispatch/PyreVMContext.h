@@ -1,34 +1,26 @@
 #pragma once
 
-// VM dispatch context management: load VMFB modules, create VM contexts,
-// and resolve entry points for kernel invocation.
-//
-// CachedKernel holds a loaded module, a VM context linking it with the
-// HAL module, and the resolved $async entry point function.
-//
-// See epic1_kernel_dispatch.md §4.8 tier 1 and §4.10.
+// VM dispatch context: load compiled kernels and resolve entry points.
 
+#include <ATen/pyre/dispatch/PyreKernelCompiler.h>
 #include <c10/pyre/impl/PyreHelpers.h>
 
-#include <cstdint>
+#include <memory>
 #include <string>
-#include <vector>
 
 namespace at::pyre {
 
 struct CachedKernel {
+  std::shared_ptr<CompilerOutput> vmfb;  // owns VMFB data (module refs it)
   c10::pyre::vm_module_ptr module;
   c10::pyre::vm_context_ptr context;
-  iree_vm_function_t function;  // resolved entry point
+  iree_vm_function_t function{};
 };
 
-// Load a VMFB byte buffer into a VM module and create a ready-to-dispatch
-// CachedKernel with context and resolved entry point.
-//
-// func_name is the base function name (without $async suffix).
-// The context links the kernel module with the HAL module from the VM instance.
+// Load a compiled VMFB into a ready-to-dispatch CachedKernel.
+// Takes ownership of the CompilerOutput.
 CachedKernel loadKernel(
-    const std::vector<uint8_t>& vmfb,
+    std::shared_ptr<CompilerOutput> vmfb,
     const std::string& func_name);
 
 } // namespace at::pyre

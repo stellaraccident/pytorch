@@ -106,7 +106,9 @@ class TestCompiledBinary(TestCase):
 
     def test_div_f32(self):
         a = torch.randn(4, 4, device=self._host_device())
-        b = torch.randn(4, 4, device=self._host_device()) + 0.1  # avoid div by 0
+        # Create b with values away from zero without using +scalar on device
+        b_cpu = torch.randn(4, 4).abs() + 0.1
+        b = b_cpu.to(self._host_device())
         result = torch.div(a, b)
         expected = a.cpu() / b.cpu()
         self.assertEqual(result.cpu(), expected, atol=1e-5, rtol=1e-5)

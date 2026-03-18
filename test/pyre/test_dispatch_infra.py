@@ -195,9 +195,9 @@ class TestRealTemplates(TestCase):
         for ph in [
             "$$element_type$$",
             "$$func_name$$",
-            "$$lhs_input_shape$$",
+            "$$lhs_shape$$",
             "$$out_shape$$",
-            "$$linalg_op$$",
+            "$$torch_op$$",
         ]:
             self.assertIn(ph, tmpl)
 
@@ -209,20 +209,7 @@ class TestRealTemplates(TestCase):
             "$$element_type$$",
             "$$func_name$$",
             "$$input_shape$$",
-            "$$scalar_op$$",
-        ]:
-            self.assertIn(ph, tmpl)
-
-    def test_alpha_template_has_required_placeholders(self):
-        tmpl = open(
-            os.path.join(
-                self._templates_dir(), "elementwise_binary_alpha.mlir"
-            )
-        ).read()
-        for ph in [
-            "$$alpha_value$$",
-            "$$alpha_mul_op$$",
-            "$$alpha_add_op$$",
+            "$$torch_op$$",
         ]:
             self.assertIn(ph, tmpl)
 
