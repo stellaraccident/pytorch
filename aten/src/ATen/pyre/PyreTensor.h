@@ -61,4 +61,13 @@ class PyreTensor {
       const std::function<void(iree_hal_command_buffer_t*)>& record_fn);
 };
 
+// Map PyTorch ScalarType to IREE HAL element type.
+iree_hal_element_type_t toIreeElementType(c10::ScalarType dtype);
+
+// Build an IREE buffer view wrapping a PyTorch tensor's HAL buffer.
+// Lightweight metadata wrapper — no data copy. The underlying buffer
+// is shared between the PyTorch tensor and the IREE buffer view.
+// Caller owns the returned buffer view (must release when done).
+iree_hal_buffer_view_t* buildBufferView(const at::Tensor& tensor);
+
 } // namespace at::pyre

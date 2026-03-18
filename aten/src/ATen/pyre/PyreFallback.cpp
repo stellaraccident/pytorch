@@ -6,10 +6,19 @@
 
 #include <ATen/core/Tensor.h>
 #include <ATen/EmptyTensor.h>
+#include <ATen/ExpandUtils.h>
+#include <ATen/Functions.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/Resize.h>
 #include <ATen/native/TensorShape.h>
 #include <ATen/pyre/PyreTensor.h>
+#include <ATen/pyre/dispatch/PyreArgAdapter.h>
+#include <ATen/pyre/dispatch/PyreKernelCache.h>
+#include <ATen/pyre/dispatch/PyreKernelCompiler.h>
+#include <ATen/pyre/dispatch/PyreKernelDispatch.h>
+#include <ATen/pyre/dispatch/PyreKernelLibrary.h>
+#include <ATen/pyre/dispatch/PyreSpecKey.h>
+#include <c10/pyre/impl/PyreDevice.h>
 
 #include <c10/core/Allocator.h>
 #include <c10/core/DeviceGuard.h>
@@ -241,6 +250,172 @@ at::Tensor pyre_abs(const at::Tensor& self) {
   return at::abs_out(result, self);
 }
 
+// --- Compiled elementwise ops ---
+// These replace CPU fallback with IREE-compiled kernels.
+
+bool compiled_dispatch_available() {
+  static bool checked = false;
+  static bool available = false;
+  if (!checked) {
+    available = PyreKernelCompiler::isAvailable();
+    checked = true;
+  }
+  return available;
+}
+
+at::Tensor compiled_binary_op(
+    const at::Tensor& self,
+    const at::Tensor& other,
+    const std::string& op_name,
+    const std::string& linalg_op,
+    const at::Scalar& alpha = at::Scalar(1)) {
+  if (!compiled_dispatch_available()) {
+    // Fall through to CPU fallback if compiler unavailable.
+    auto result_cpu = at::add(self.cpu(), other.cpu(), alpha);
+    return result_cpu.to(self.device());
+  }
+
+  auto dtype = self.scalar_type();
+  auto out_shape = at::infer_size(self.sizes(), other.sizes());
+  std::vector<ArgAdapter> adapters = {
+      ArgAdapter::analyze(self),
+      ArgAdapter::analyze(other),
+  };
+  auto self_c = adapters[0].kind == ArgAdapter::kContiguous
+      ? self.contiguous() : self;
+  auto other_c = adapters[1].kind == ArgAdapter::kContiguous
+      ? other.contiguous() : other;
+
+  PYRE_LOG(INFO) << "compiled_binary_op: " << op_name << " dtype="
+                 << c10::toString(dtype) << " shape=" << self.sizes()
+                 << " x " << other.sizes() << "\n";
+
+  double alpha_val = alpha.toDouble();
+  std::string mlir;
+  std::string func_name = op_name;
+
+  if (std::abs(alpha_val - 1.0) < 1e-12) {
+    mlir = expandBinaryTemplate(
+        func_name, linalg_op, dtype,
+        self_c.sizes(), other_c.sizes(), out_shape, adapters);
+  } else {
+    func_name = op_name + "_alpha";
+    std::string add_op = pyreIsFloatingType(dtype) ? "arith.addf" : "arith.addi";
+    std::string mul_op = pyreIsFloatingType(dtype) ? "arith.mulf" : "arith.muli";
+    if (linalg_op == "sub") {
+      add_op = pyreIsFloatingType(dtype) ? "arith.subf" : "arith.subi";
+    }
+    mlir = expandBinaryAlphaTemplate(
+        func_name, add_op, mul_op, alpha_val, dtype,
+        self_c.sizes(), other_c.sizes(), out_shape, adapters);
+  }
+
+  auto& device = *c10::pyre::PyreDevice::get(0);
+  auto cache_key = func_name + "::" + scalarTypeToMlir(dtype)
+                 + "::" + device.capabilities().cacheKey();
+  PYRE_LOG(DEBUG) << "cache_key=" << cache_key << " func=" << func_name << "\n";
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+
+  if (kernel) {
+    PYRE_LOG(INFO) << "cache HIT: " << cache_key << "\n";
+  } else {
+    PYRE_LOG(INFO) << "cache MISS: " << cache_key << ", compiling...\n";
+    PYRE_LOG(DEBUG) << "expanded MLIR:\n" << mlir << "\n";
+    auto vmfb = PyreKernelCompiler::compileSync(
+        mlir, device.capabilities().compilerFlags());
+    PYRE_LOG(INFO) << "compilation done, VMFB " << vmfb.size() << " bytes\n";
+    kernel = cache.store(cache_key, func_name, vmfb);
+  }
+
+  auto output = at::empty(
+      out_shape, self.options());
+  c10::pyre::PyreStream stream(
+      c10::pyre::getCurrentHostStream(0));
+  auto& stream_ctx = stream.context();
+
+  std::vector<at::Tensor> inputs = {self_c, other_c};
+  PyreKernelDispatch::invokeAsync(kernel, inputs, output, stream_ctx);
+
+  return output;
+}
+
+at::Tensor compiled_unary_op(
+    const at::Tensor& self,
+    const std::string& op_name,
+    const std::string& scalar_op) {
+  if (!compiled_dispatch_available()) {
+    if (op_name == "neg") return (-self.cpu()).to(self.device());
+    if (op_name == "abs") return self.cpu().abs().to(self.device());
+    if (op_name == "relu") return self.cpu().relu().to(self.device());
+    return self.cpu().to(self.device());
+  }
+
+  PYRE_LOG(INFO) << "compiled_unary_op: " << op_name << " dtype="
+                 << c10::toString(self.scalar_type())
+                 << " shape=" << self.sizes() << "\n";
+
+  auto dtype = self.scalar_type();
+  ArgAdapter adapter = ArgAdapter::analyze(self);
+  auto self_c = adapter.kind == ArgAdapter::kContiguous
+      ? self.contiguous() : self;
+
+  auto mlir = expandUnaryTemplate(
+      op_name, scalar_op, dtype,
+      self_c.sizes(), self_c.sizes(), adapter);
+
+  auto& device = *c10::pyre::PyreDevice::get(0);
+  auto cache_key = op_name + "::" + scalarTypeToMlir(dtype)
+                 + "::" + device.capabilities().cacheKey();
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, op_name);
+
+  if (!kernel) {
+    auto vmfb = PyreKernelCompiler::compileSync(
+        mlir, device.capabilities().compilerFlags());
+    kernel = cache.store(cache_key, op_name, vmfb);
+  }
+
+  auto output = at::empty_like(self_c);
+  c10::pyre::PyreStream stream(
+      c10::pyre::getCurrentHostStream(0));
+  auto& stream_ctx = stream.context();
+
+  std::vector<at::Tensor> inputs = {self_c};
+  PyreKernelDispatch::invokeAsync(kernel, inputs, output, stream_ctx);
+
+  return output;
+}
+
+// --- Compiled op wrappers ---
+
+at::Tensor pyre_add(const at::Tensor& self, const at::Tensor& other,
+                     const at::Scalar& alpha) {
+  return compiled_binary_op(self, other, "pyre_add", "add", alpha);
+}
+
+at::Tensor pyre_sub(const at::Tensor& self, const at::Tensor& other,
+                     const at::Scalar& alpha) {
+  return compiled_binary_op(self, other, "pyre_sub", "sub", alpha);
+}
+
+at::Tensor pyre_mul(const at::Tensor& self, const at::Tensor& other) {
+  return compiled_binary_op(self, other, "pyre_mul", "mul");
+}
+
+at::Tensor pyre_div(const at::Tensor& self, const at::Tensor& other) {
+  return compiled_binary_op(self, other, "pyre_div", "div");
+}
+
+at::Tensor pyre_neg(const at::Tensor& self) {
+  return compiled_unary_op(self, "pyre_neg", "torch.aten.neg");
+}
+
+at::Tensor pyre_relu(const at::Tensor& self) {
+  return compiled_unary_op(self, "pyre_relu", "torch.aten.relu");
+}
+
 // --- CPU fallback ---
 
 void cpu_fallback(
@@ -273,6 +448,14 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 
   // Functional ops that need proper output allocation
   m.impl("abs", pyre_abs);
+
+  // Compiled elementwise ops (replace CPU fallback)
+  m.impl("add.Tensor", pyre_add);
+  m.impl("sub.Tensor", pyre_sub);
+  m.impl("mul.Tensor", pyre_mul);
+  m.impl("div.Tensor", pyre_div);
+  m.impl("neg", pyre_neg);
+  m.impl("relu", pyre_relu);
 }
 
 // Fallback: anything not registered above goes through CPU fallback.

@@ -1226,6 +1226,14 @@ if(USE_PYRE)
   set(Caffe2_PYRE_SRCS
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreFallback.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreTensor.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgAdapter.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgShapeSpecializer.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCache.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCompiler.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelDispatch.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelLibrary.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreSpecKey.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreVMContext.cpp
   )
   add_library(torch_pyre ${Caffe2_PYRE_SRCS})
   torch_compile_options(torch_pyre)

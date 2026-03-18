@@ -1,4 +1,5 @@
 #include <ATen/pyre/PyreTensor.h>
+#include <c10/pyre/impl/PyreRuntime.h>
 
 #include <cstring>
 
@@ -151,6 +152,60 @@ void PyreTensor::readToHost(
       IREE_HAL_MEMORY_ACCESS_READ, offset, length, &mapping));
   std::memcpy(data, mapping.contents.data, length);
   iree_hal_buffer_unmap_range(&mapping);
+}
+
+// -------------------------------------------------------------------------- //
+// Buffer View Bridge
+// -------------------------------------------------------------------------- //
+
+iree_hal_element_type_t toIreeElementType(c10::ScalarType dtype) {
+  switch (dtype) {
+    case c10::ScalarType::Float:
+      return IREE_HAL_ELEMENT_TYPE_FLOAT_32;
+    case c10::ScalarType::Double:
+      return IREE_HAL_ELEMENT_TYPE_FLOAT_64;
+    case c10::ScalarType::Half:
+      return IREE_HAL_ELEMENT_TYPE_FLOAT_16;
+    case c10::ScalarType::BFloat16:
+      return IREE_HAL_ELEMENT_TYPE_BFLOAT_16;
+    case c10::ScalarType::Int:
+      return IREE_HAL_ELEMENT_TYPE_INT_32;
+    case c10::ScalarType::Long:
+      return IREE_HAL_ELEMENT_TYPE_INT_64;
+    case c10::ScalarType::Short:
+      return IREE_HAL_ELEMENT_TYPE_INT_16;
+    case c10::ScalarType::Byte:
+      return IREE_HAL_ELEMENT_TYPE_UINT_8;
+    case c10::ScalarType::Char:
+      return IREE_HAL_ELEMENT_TYPE_SINT_8;
+    case c10::ScalarType::Bool:
+      return IREE_HAL_ELEMENT_TYPE_BOOL_8;
+    default:
+      TORCH_CHECK(
+          false, "pyre: unsupported dtype for buffer view: ",
+          c10::toString(dtype));
+  }
+}
+
+iree_hal_buffer_view_t* buildBufferView(const at::Tensor& tensor) {
+  auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+      tensor.storage().data_ptr().get_context());
+  TORCH_CHECK(ctx && ctx->buffer, "pyre: tensor has no IREE buffer");
+
+  auto iree_dtype = toIreeElementType(tensor.scalar_type());
+
+  auto sizes = tensor.sizes();
+  std::vector<iree_hal_dim_t> shape(sizes.begin(), sizes.end());
+
+  iree_hal_buffer_view_t* view = nullptr;
+  PYRE_CHECK_OK(iree_hal_buffer_view_create(
+      ctx->buffer.get(),
+      shape.size(), shape.data(),
+      iree_dtype,
+      IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      c10::pyre::PyreRuntime::get().hostAllocator(),
+      &view));
+  return view;
 }
 
 } // namespace at::pyre

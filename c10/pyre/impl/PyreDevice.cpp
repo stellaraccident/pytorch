@@ -6,7 +6,8 @@ namespace c10::pyre {
 PyreDevice::PyreDevice(iree_hal_device_t* device, iree_hal_driver_t* driver)
     : device_(device),
       driver_(driver),
-      allocator_(iree_hal_device_allocator(device)) {
+      allocator_(iree_hal_device_allocator(device)),
+      capabilities_("llvm-cpu", "host") {
   // Initialize the default stream immediately.
   initStreamContext(default_stream_);
 }
