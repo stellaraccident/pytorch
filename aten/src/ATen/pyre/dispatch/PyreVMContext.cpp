@@ -10,7 +10,8 @@ namespace at::pyre {
 
 CachedKernel loadKernel(
     std::shared_ptr<CompilerOutput> vmfb,
-    const std::string& func_name) {
+    const std::string& func_name,
+    bool native_abi) {
   auto& runtime = c10::pyre::PyreRuntime::get();
   auto* device = c10::pyre::PyreDevice::get(0);
   auto alloc = runtime.hostAllocator();
@@ -54,9 +55,11 @@ CachedKernel loadKernel(
   kernel.context = c10::pyre::vm_context_ptr::steal(context);
   iree_vm_module_release(hal_module);
 
-  // Resolve the $async entry point — coarse-fences calling convention.
-  // Args: out, inputs..., workspace, wait_fence, signal_fence → void.
-  std::string full_name = "module." + func_name + "$async";
+  // Resolve entry point. Torch-mlir convention uses $async suffix;
+  // native IREE convention uses the bare function name.
+  std::string full_name = native_abi
+      ? "module." + func_name
+      : "module." + func_name + "$async";
   PYRE_LOG(DEBUG) << "resolving: " << full_name << "\n";
   iree_string_view_t nv = {
       full_name.c_str(), static_cast<iree_host_size_t>(full_name.size())};

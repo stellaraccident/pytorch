@@ -16,13 +16,16 @@ namespace at::pyre {
 class PyreKernelCache {
  public:
   // Returns cached kernel or nullptr on miss.
+  // If native_abi is true, resolves bare function name (native IREE).
   CachedKernel* lookup(const std::string& cache_key,
-                        const std::string& func_name);
+                        const std::string& func_name,
+                        bool native_abi = false);
 
   // Store a compiled kernel. Returns pointer to stored entry.
   CachedKernel* store(const std::string& cache_key,
                        const std::string& func_name,
-                       std::shared_ptr<CompilerOutput> vmfb);
+                       std::shared_ptr<CompilerOutput> vmfb,
+                       bool native_abi = false);
 
   // Disk cache operations.
   std::shared_ptr<CompilerOutput> loadFromDisk(const std::string& cache_key);

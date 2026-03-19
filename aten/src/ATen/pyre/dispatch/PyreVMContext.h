@@ -19,8 +19,11 @@ struct CachedKernel {
 
 // Load a compiled VMFB into a ready-to-dispatch CachedKernel.
 // Takes ownership of the CompilerOutput.
+// If native_abi is true, resolves "module.func_name" directly
+// (native IREE convention). Otherwise appends "$async" (torch-mlir).
 CachedKernel loadKernel(
     std::shared_ptr<CompilerOutput> vmfb,
-    const std::string& func_name);
+    const std::string& func_name,
+    bool native_abi = false);
 
 } // namespace at::pyre

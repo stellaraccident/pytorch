@@ -28,7 +28,8 @@ std::string PyreKernelCache::diskCachePath(const std::string& cache_key) const {
 
 CachedKernel* PyreKernelCache::lookup(
     const std::string& cache_key,
-    const std::string& func_name) {
+    const std::string& func_name,
+    bool native_abi) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cache_.find(cache_key);
@@ -43,7 +44,7 @@ CachedKernel* PyreKernelCache::lookup(
   auto vmfb = loadFromDisk(cache_key);
   if (vmfb) {
     PYRE_LOG(INFO) << "cache hit (disk): " << cache_key << "\n";
-    return store(cache_key, func_name, std::move(vmfb));
+    return store(cache_key, func_name, std::move(vmfb), native_abi);
   }
 
   return nullptr;
@@ -52,7 +53,8 @@ CachedKernel* PyreKernelCache::lookup(
 CachedKernel* PyreKernelCache::store(
     const std::string& cache_key,
     const std::string& func_name,
-    std::shared_ptr<CompilerOutput> vmfb) {
+    std::shared_ptr<CompilerOutput> vmfb,
+    bool native_abi) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = cache_.find(cache_key);
   if (it != cache_.end()) return &it->second;
@@ -60,7 +62,7 @@ CachedKernel* PyreKernelCache::store(
   // Save to disk before loading (best-effort).
   saveToDisk(cache_key, *vmfb);
 
-  auto kernel = loadKernel(std::move(vmfb), func_name);
+  auto kernel = loadKernel(std::move(vmfb), func_name, native_abi);
   auto [inserted_it, ok] = cache_.emplace(cache_key, std::move(kernel));
   return &inserted_it->second;
 }

@@ -1233,6 +1233,9 @@ if(USE_PYRE)
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCache.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCompiler.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelDispatch.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreStridedCopyKernel.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreStridedFillKernel.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/StridedCopyPlan.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreVMContext.cpp
   )
   # Generate PyreKernelTemplates.inc from .mlir templates.

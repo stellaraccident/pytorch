@@ -10,6 +10,23 @@
 #include <ATen/native/TensorShape.h>
 #include <ATen/pyre/PyreTensor.h>
 #include <ATen/pyre/PyreOp.h>
+#include <ATen/pyre/dispatch/PyreStridedCopyKernel.h>
+#include <ATen/pyre/dispatch/PyreStridedFillKernel.h>
+#include <ATen/pyre/dispatch/StridedCopyPlan.h>
+
+#ifdef AT_PER_OPERATOR_HEADERS
+#include <ATen/ops/as_strided_native.h>
+#include <ATen/ops/expand_native.h>
+#include <ATen/ops/permute_native.h>
+#include <ATen/ops/reshape_native.h>
+#include <ATen/ops/resize_native.h>
+#include <ATen/ops/slice_native.h>
+#include <ATen/ops/t_native.h>
+#include <ATen/ops/unsqueeze_native.h>
+#include <ATen/ops/view_native.h>
+#else
+#include <ATen/NativeFunctions.h>
+#endif
 
 #include <c10/core/Allocator.h>
 #include <c10/core/DeviceGuard.h>
@@ -67,22 +84,25 @@ at::Tensor empty_strided(
 
 at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
   if (self.numel() == 0) return self;
-  TORCH_CHECK(self.is_contiguous(),
-      "pyre: fill on non-contiguous not supported");
-  TORCH_CHECK(self.element_size() <= 4,
-      "pyre: fill not supported for ", self.dtype());
 
-  PyreTensor pt(self);
-  alignas(4) uint8_t pattern[4] = {};
-  AT_DISPATCH_ALL_TYPES_AND2(
-      at::kHalf, at::kBFloat16, self.scalar_type(), "pyre_fill", [&] {
-        if constexpr (sizeof(scalar_t) <= 4) {
-          scalar_t val = value.to<scalar_t>();
-          std::memcpy(pattern, &val, sizeof(scalar_t));
-        }
-      });
-  pt.fill(pattern, self.element_size(),
-          self.storage_offset() * self.element_size(), self.nbytes());
+  // Fast path: contiguous with element_size ≤ 4 → HAL pattern fill.
+  if (self.is_contiguous() && self.element_size() <= 4) {
+    PyreTensor pt(self);
+    alignas(4) uint8_t pattern[4] = {};
+    AT_DISPATCH_ALL_TYPES_AND2(
+        at::kHalf, at::kBFloat16, self.scalar_type(), "pyre_fill", [&] {
+          if constexpr (sizeof(scalar_t) <= 4) {
+            scalar_t val = value.to<scalar_t>();
+            std::memcpy(pattern, &val, sizeof(scalar_t));
+          }
+        });
+    pt.fill(pattern, self.element_size(),
+            self.storage_offset() * self.element_size(), self.nbytes());
+    return self;
+  }
+
+  // Compiled fill: handles non-contiguous and 8-byte types.
+  executeCompiledFill(self, value);
   return self;
 }
 
@@ -115,45 +135,44 @@ at::Tensor pyre_copy_from(
       dst_pt.updateFromHost(cpu_src.data_ptr(),
           dst.storage_offset() * dst.element_size(),
           cpu_src.nbytes());
-    } else if (!self.is_contiguous() || !dst.is_contiguous()) {
-      // No device-side strided copy yet. Read source to CPU (bypassing
-      // .contiguous() which would recurse), then upload to dst.
-      if (dst.is_contiguous()) {
-        // Non-contiguous src → contiguous dst: read src via CPU.
-        auto cpu_copy = pyreReadToCpuContiguous(self);
-        PyreTensor dst_pt(dst);
-        dst_pt.updateFromHost(cpu_copy.data_ptr(),
-            dst.storage_offset() * dst.element_size(), cpu_copy.nbytes());
-      } else {
-        // Both non-contiguous: only safe when strides match exactly
-        // (e.g. clone allocates with matching strides). Otherwise
-        // route through CPU to avoid silent data corruption.
-        if (self.strides() == dst.strides() &&
-            self.sizes() == dst.sizes() &&
-            self.storage().nbytes() == dst.storage().nbytes()) {
-          PyreTensor src_pt(self), dst_pt(dst);
-          dst_pt.copyFrom(src_pt, 0, 0,
-              static_cast<iree_device_size_t>(self.storage().nbytes()));
-        } else {
-          auto cpu_copy = pyreReadToCpuContiguous(self);
-          auto tmp = at::empty(cpu_copy.sizes(), dst.options());
-          PyreTensor tmp_pt(tmp);
-          tmp_pt.updateFromHost(cpu_copy.data_ptr(), 0, cpu_copy.nbytes());
-          dst.copy_(tmp);
-        }
-      }
     } else {
-      PyreTensor src_pt(self), dst_pt(dst);
-      dst_pt.copyFrom(src_pt,
-          self.storage_offset() * self.element_size(),
-          dst.storage_offset() * dst.element_size(), self.nbytes());
+      // Same-dtype device-to-device: three-tier copy strategy.
+      auto plan = planCopy(
+          self.sizes(), self.strides(), dst.strides(),
+          self.storage_offset(), dst.storage_offset(),
+          self.element_size());
+      switch (plan.tier) {
+        case CopyPlan::kSingleCopy:
+        case CopyPlan::kDecomposed: {
+          PyreTensor src_pt(self), dst_pt(dst);
+          auto* src_ctx = static_cast<c10::pyre::PyreBufferContext*>(
+              self.storage().data_ptr().get_context());
+          auto* dst_ctx = static_cast<c10::pyre::PyreBufferContext*>(
+              dst.storage().data_ptr().get_context());
+          executeCopyPlan(plan, src_pt.buffer(), dst_pt.buffer(),
+                          dst_pt.device(), src_ctx, dst_ctx);
+          break;
+        }
+        case CopyPlan::kCompiledKernel:
+          executeCompiledCopy(plan, self, dst);
+          break;
+      }
     }
   } else if (self.is_cpu()) {
-    TORCH_CHECK(dst.is_contiguous(), "pyre: copy to non-contiguous not supported");
+    // CPU→device: make src contiguous, upload to dst.
+    // If dst is non-contiguous, upload to temp then d2d copy.
     auto src = self.contiguous().to(dst.dtype());
-    PyreTensor dst_pt(dst);
-    dst_pt.updateFromHost(src.data_ptr(),
-        dst.storage_offset() * dst.element_size(), src.nbytes());
+    if (dst.is_contiguous()) {
+      PyreTensor dst_pt(dst);
+      dst_pt.updateFromHost(src.data_ptr(),
+          dst.storage_offset() * dst.element_size(), src.nbytes());
+    } else {
+      auto tmp = at::empty(src.sizes(), dst.options());
+      PyreTensor tmp_pt(tmp);
+      tmp_pt.updateFromHost(src.data_ptr(), 0, src.nbytes());
+      // d2d copy from contiguous tmp → non-contiguous dst.
+      pyre_copy_from(tmp, dst, false);
+    }
   } else {
     // pyre → CPU
     if (self.is_contiguous()) {

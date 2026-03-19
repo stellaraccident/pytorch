@@ -28,10 +28,11 @@ class TestStorageAllocator(TestCase):
             self.assertEqual(t.to("cpu").sum().item(), 4.0,
                              msg=f"fill failed for {dtype}")
 
-    def test_fill_8byte_types_rejected(self):
+    def test_fill_8byte_types(self):
         for dtype in [torch.float64, torch.int64]:
-            with self.assertRaisesRegex(RuntimeError, "fill not supported for"):
-                torch.ones(4, device="host:0", dtype=dtype)
+            t = torch.ones(4, device="host:0", dtype=dtype)
+            self.assertEqual(t.to("cpu").sum().item(), 4.0,
+                             msg=f"8-byte fill failed for {dtype}")
 
     def test_fill_zero_value(self):
         t = torch.zeros(8, device="host:0")
@@ -140,15 +141,36 @@ class TestNonContiguousCopy(TestCase):
         z = y.clone()
         self.assertEqual(z.cpu(), y.cpu())
 
-    def test_fill_noncontiguous_fails(self):
+    def test_fill_noncontiguous(self):
         x = torch.randn(4, 8, device="host:0")
-        with self.assertRaises(RuntimeError):
-            x[:, ::2].fill_(0.0)
+        y = x[:, ::2]
+        y.fill_(0.0)
+        self.assertTrue((y.cpu() == 0).all())
 
-    def test_fill_float64_fails(self):
-        x = torch.zeros(4, dtype=torch.float64, device="host:0")
-        with self.assertRaises(RuntimeError):
-            x.fill_(3.14)
+    def test_fill_float64(self):
+        t = torch.zeros(4, dtype=torch.float64, device="host:0")
+        t.fill_(3.14)
+        self.assertTrue(torch.allclose(t.cpu(),
+                        torch.full((4,), 3.14, dtype=torch.float64)))
+
+    def test_d2d_copy_narrowed(self):
+        x = torch.randn(4, 8, device="host:0")
+        y = x[:, :3]  # narrowed columns
+        z = y.clone()
+        self.assertEqual(z.cpu(), y.cpu())
+
+    def test_d2d_copy_permuted_3d(self):
+        x = torch.randn(2, 3, 4, device="host:0")
+        y = x.permute(2, 0, 1)  # non-contiguous
+        z = y.clone()
+        self.assertEqual(z.cpu(), y.cpu())
+
+    def test_cpu_to_noncontiguous_dst(self):
+        # CPU→device where dst is non-contiguous: should work via temp+copy.
+        src = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        dst = torch.empty(4, 8, device="host:0")[:, ::2]
+        dst.copy_(src.to("host:0"))
+        self.assertEqual(dst.cpu(), src)
 
 
 if __name__ == "__main__":
