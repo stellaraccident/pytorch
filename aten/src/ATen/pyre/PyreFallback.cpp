@@ -1,4 +1,7 @@
 // Pyre kernel registrations for PrivateUse1 (host device).
+//
+// Non-compiled ops (empty, fill, copy, view) live here.
+// Compiled ops are registered via PyreOp.h / PyreOps.cpp.
 
 #include <ATen/core/Tensor.h>
 #include <ATen/EmptyTensor.h>
@@ -6,13 +9,14 @@
 #include <ATen/native/Resize.h>
 #include <ATen/native/TensorShape.h>
 #include <ATen/pyre/PyreTensor.h>
-#include <ATen/pyre/PyreOpJit.h>
+#include <ATen/pyre/PyreOp.h>
 
 #include <c10/core/Allocator.h>
 #include <c10/core/DeviceGuard.h>
 
 #include <torch/library.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace at::pyre {
@@ -82,6 +86,23 @@ at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
   return self;
 }
 
+// Read a (possibly non-contiguous) device tensor to CPU as a contiguous tensor.
+// Reads the entire underlying storage buffer, reconstructs the strided view
+// on CPU, then calls .contiguous() on the CPU side. This avoids the recursion
+// that .contiguous() on a device tensor would cause (it dispatches to _copy_from).
+at::Tensor pyreReadToCpuContiguous(const at::Tensor& src) {
+  PyreTensor pt(src);
+  auto storage_bytes = src.storage().nbytes();
+  auto cpu_storage = at::empty(
+      {static_cast<int64_t>(storage_bytes / src.element_size())},
+      src.options().device(at::kCPU));
+  pt.readToHost(cpu_storage.data_ptr(), 0, storage_bytes);
+  // Reconstruct the same strided view on CPU, then make contiguous.
+  auto cpu_view = cpu_storage.as_strided(
+      src.sizes(), src.strides(), src.storage_offset());
+  return cpu_view.contiguous();
+}
+
 // --- _copy_from ---
 
 at::Tensor pyre_copy_from(
@@ -95,8 +116,25 @@ at::Tensor pyre_copy_from(
           dst.storage_offset() * dst.element_size(),
           cpu_src.nbytes());
     } else if (!self.is_contiguous() || !dst.is_contiguous()) {
-      TORCH_CHECK(false, "pyre: non-contiguous d2d copy not yet supported. "
-          "Use .contiguous() before copying between device tensors.");
+      // No device-side strided copy yet. Read source to CPU (bypassing
+      // .contiguous() which would recurse), then upload to dst.
+      if (dst.is_contiguous()) {
+        // Non-contiguous src → contiguous dst: read src via CPU.
+        auto cpu_copy = pyreReadToCpuContiguous(self);
+        PyreTensor dst_pt(dst);
+        dst_pt.updateFromHost(cpu_copy.data_ptr(),
+            dst.storage_offset() * dst.element_size(), cpu_copy.nbytes());
+      } else {
+        // Both may be non-contiguous. Copy the entire underlying storage
+        // buffer (which is always physically contiguous on device).
+        // This works when src and dst have the same strides (e.g. clone).
+        PyreTensor src_pt(self), dst_pt(dst);
+        auto src_bytes = self.storage().nbytes();
+        auto dst_bytes = dst.storage().nbytes();
+        auto copy_bytes = std::min(src_bytes, dst_bytes);
+        dst_pt.copyFrom(src_pt, 0, 0,
+            static_cast<iree_device_size_t>(copy_bytes));
+      }
     } else {
       PyreTensor src_pt(self), dst_pt(dst);
       dst_pt.copyFrom(src_pt,
@@ -110,13 +148,17 @@ at::Tensor pyre_copy_from(
     dst_pt.updateFromHost(src.data_ptr(),
         dst.storage_offset() * dst.element_size(), src.nbytes());
   } else {
-    // pyre → CPU: make contiguous if needed.
-    auto self_c = self.is_contiguous() ? self : self.contiguous();
-    PyreTensor src_pt(self_c);
-    at::Tensor tmp = at::empty(self_c.sizes(), dst.options().dtype(self_c.dtype()));
-    src_pt.readToHost(tmp.data_ptr(),
-        self_c.storage_offset() * self_c.element_size(), self_c.nbytes());
-    dst.copy_(tmp);
+    // pyre → CPU
+    if (self.is_contiguous()) {
+      PyreTensor src_pt(self);
+      at::Tensor tmp = at::empty(self.sizes(), dst.options().dtype(self.dtype()));
+      src_pt.readToHost(tmp.data_ptr(),
+          self.storage_offset() * self.element_size(), self.nbytes());
+      dst.copy_(tmp);
+    } else {
+      auto cpu_copy = pyreReadToCpuContiguous(self);
+      dst.copy_(cpu_copy);
+    }
   }
   return dst;
 }
@@ -184,77 +226,6 @@ at::Tensor pyre_abs(const at::Tensor& self) {
   return at::abs_out(result, self);
 }
 
-// --- Compiled elementwise ops ---
-
-at::Tensor pyre_add(const at::Tensor& self, const at::Tensor& other,
-                     const at::Scalar& alpha) {
-  if (!jitAvailable()) {
-    return at::add(self.cpu(), other.cpu(), alpha).to(self.device());
-  }
-  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
-      "pyre: add requires tensors with IREE buffers, not CPU fallback tensors");
-  return jitAddOp(self, other, alpha);
-}
-
-at::Tensor pyre_sub(const at::Tensor& self, const at::Tensor& other,
-                     const at::Scalar& alpha) {
-  if (!jitAvailable())
-    return at::sub(self.cpu(), other.cpu(), alpha).to(self.device());
-  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
-      "pyre: sub requires tensors with IREE buffers");
-  return jitSubOp(self, other, alpha);
-}
-
-at::Tensor pyre_mul(const at::Tensor& self, const at::Tensor& other) {
-  if (!jitAvailable())
-    return at::mul(self.cpu(), other.cpu()).to(self.device());
-  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
-      "pyre: mul requires tensors with IREE buffers");
-  return jitBinaryOp(self, other, "pyre_mul", "mul");
-}
-
-at::Tensor pyre_div(const at::Tensor& self, const at::Tensor& other) {
-  if (!jitAvailable())
-    return at::div(self.cpu(), other.cpu()).to(self.device());
-  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
-      "pyre: div requires tensors with IREE buffers");
-  return jitBinaryOp(self, other, "pyre_div", "div");
-}
-
-at::Tensor pyre_neg(const at::Tensor& self) {
-  if (!jitAvailable())
-    return (-self.cpu()).to(self.device());
-  TORCH_CHECK(hasPyreBuffer(self),
-      "pyre: neg requires tensor with IREE buffer");
-  return jitUnaryOp(self, "pyre_neg", "torch.aten.neg");
-}
-
-at::Tensor pyre_addmm(
-    const at::Tensor& bias, const at::Tensor& mat1, const at::Tensor& mat2,
-    const at::Scalar& beta, const at::Scalar& alpha) {
-  if (!jitAvailable())
-    return at::addmm(bias.cpu(), mat1.cpu(), mat2.cpu(), beta, alpha).to(mat1.device());
-  TORCH_CHECK(hasPyreBuffer(bias) && hasPyreBuffer(mat1) && hasPyreBuffer(mat2),
-      "pyre: addmm requires tensors with IREE buffers");
-  return jitAddmmOp(bias, mat1, mat2, beta, alpha);
-}
-
-at::Tensor pyre_mm(const at::Tensor& self, const at::Tensor& other) {
-  if (!jitAvailable())
-    return at::mm(self.cpu(), other.cpu()).to(self.device());
-  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
-      "pyre: mm requires tensors with IREE buffers");
-  return jitMmOp(self, other);
-}
-
-at::Tensor pyre_relu(const at::Tensor& self) {
-  if (!jitAvailable())
-    return self.cpu().relu().to(self.device());
-  TORCH_CHECK(hasPyreBuffer(self),
-      "pyre: relu requires tensor with IREE buffer");
-  return jitUnaryOp(self, "pyre_relu", "torch.aten.relu");
-}
-
 // --- CPU fallback ---
 
 void cpu_fallback(
@@ -284,15 +255,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("resize_", pyre_resize_);
   m.impl("abs", pyre_abs);
 
-  // Compiled elementwise ops
-  m.impl("add.Tensor", pyre_add);
-  m.impl("sub.Tensor", pyre_sub);
-  m.impl("mul.Tensor", pyre_mul);
-  m.impl("div.Tensor", pyre_div);
-  m.impl("addmm", pyre_addmm);
-  m.impl("mm", pyre_mm);
-  m.impl("neg", pyre_neg);
-  m.impl("relu", pyre_relu);
+  // Compiled ops (CRTP registry)
+  registerCompiledOps(m);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {

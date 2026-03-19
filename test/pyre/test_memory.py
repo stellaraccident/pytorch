@@ -127,5 +127,29 @@ class TestDestructionOrder(TestCase):
         gc.collect()
 
 
+class TestNonContiguousCopy(TestCase):
+    def test_d2d_copy_transposed(self):
+        x = torch.randn(4, 8, device="host:0")
+        y = x.t()  # non-contiguous
+        z = y.clone()  # triggers d2d copy via CPU roundtrip
+        self.assertEqual(z.cpu(), y.cpu())
+
+    def test_d2d_copy_sliced(self):
+        x = torch.randn(8, 8, device="host:0")
+        y = x[::2]  # non-contiguous
+        z = y.clone()
+        self.assertEqual(z.cpu(), y.cpu())
+
+    def test_fill_noncontiguous_fails(self):
+        x = torch.randn(4, 8, device="host:0")
+        with self.assertRaises(RuntimeError):
+            x[:, ::2].fill_(0.0)
+
+    def test_fill_float64_fails(self):
+        x = torch.zeros(4, dtype=torch.float64, device="host:0")
+        with self.assertRaises(RuntimeError):
+            x.fill_(3.14)
+
+
 if __name__ == "__main__":
     run_tests()

@@ -54,6 +54,7 @@ class TestMLP(TestCase):
 
         self.assertEqual(y_host.cpu(), y_cpu, atol=1e-5, rtol=1e-5)
 
+    @unittest.skipUnless(has_compiler(), "IREE compiler not available")
     def test_mlp_different_batch_sizes(self):
         """MLP works with varying batch sizes."""
         torch.manual_seed(0)

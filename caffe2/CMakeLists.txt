@@ -1225,7 +1225,7 @@ endif()
 if(USE_PYRE)
   set(Caffe2_PYRE_SRCS
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreFallback.cpp
-    ${TORCH_ROOT}/aten/src/ATen/pyre/PyreOpJit.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/PyreOps.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreTensor.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgAdapter.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgShapeSpecializer.cpp
