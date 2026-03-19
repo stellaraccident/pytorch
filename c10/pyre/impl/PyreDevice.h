@@ -1,7 +1,7 @@
 #pragma once
 
-// PyreDevice: Per-device instance owning HAL device, allocator, and
-// stream pool with timeline semaphores.
+// PyreDevice: Per-device instance owning HAL device, allocator, stream pool,
+// and compiler capabilities.
 //
 // Each accessible device gets its own instance with independent stream
 // contexts. The PyreRuntime singleton manages the collection of devices.
@@ -9,6 +9,7 @@
 #include <iree/hal/api.h>
 
 #include <c10/core/Device.h>
+#include <c10/core/ScalarType.h>
 #include <c10/macros/Export.h>
 #include <c10/pyre/impl/PyreHelpers.h>
 #include <c10/pyre/impl/PyreStream.h>
@@ -16,8 +17,26 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace c10::pyre {
+
+// Per-device compiler flags and cache key. Lives on PyreDevice.
+class C10_PYRE_API DeviceCapabilities {
+ public:
+  DeviceCapabilities(std::string backend, std::string target);
+
+  const std::vector<std::string>& compilerFlags() const { return flags_; }
+  const std::string& cacheKey() const { return cache_key_; }
+  int64_t preferredVectorWidth(c10::ScalarType dtype) const;
+
+ private:
+  std::string backend_;
+  std::string target_;
+  std::vector<std::string> flags_;
+  std::string cache_key_;
+};
 
 class C10_PYRE_API PyreDevice {
  public:
@@ -32,6 +51,9 @@ class C10_PYRE_API PyreDevice {
   iree_hal_allocator_t* allocator() const { return allocator_; }
   iree_hal_driver_t* driver() const { return driver_; }
 
+  // Compiler capabilities for this device.
+  const DeviceCapabilities& capabilities() const { return capabilities_; }
+
   // Stream pool — lazily creates stream contexts with timeline semaphores.
   PyreStreamContext& defaultStream() { return default_stream_; }
   PyreStreamContext& streamFromId(StreamId id);
@@ -45,6 +67,7 @@ class C10_PYRE_API PyreDevice {
   iree_hal_device_t* device_;
   iree_hal_driver_t* driver_;           // borrowed from runtime
   iree_hal_allocator_t* allocator_;     // borrowed from device
+  DeviceCapabilities capabilities_;
 
   // Stream pool
   PyreStreamContext default_stream_;
@@ -53,10 +76,7 @@ class C10_PYRE_API PyreDevice {
   std::atomic<uint32_t> low_priority_next_{0};
   std::atomic<uint32_t> high_priority_next_{0};
 
-  // Lazily initialize a stream context with a new timeline semaphore.
   void initStreamContext(PyreStreamContext& ctx);
-
-  // Wait on all stream timelines (used during teardown).
   void syncAllStreams();
 };
 

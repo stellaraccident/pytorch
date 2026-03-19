@@ -1,0 +1,26 @@
+#pragma once
+
+// VM dispatch context: load compiled kernels and resolve entry points.
+
+#include <ATen/pyre/dispatch/PyreKernelCompiler.h>
+#include <c10/pyre/impl/PyreHelpers.h>
+
+#include <memory>
+#include <string>
+
+namespace at::pyre {
+
+struct CachedKernel {
+  std::shared_ptr<CompilerOutput> vmfb;  // owns VMFB data (module refs it)
+  c10::pyre::vm_module_ptr module;
+  c10::pyre::vm_context_ptr context;
+  iree_vm_function_t function{};
+};
+
+// Load a compiled VMFB into a ready-to-dispatch CachedKernel.
+// Takes ownership of the CompilerOutput.
+CachedKernel loadKernel(
+    std::shared_ptr<CompilerOutput> vmfb,
+    const std::string& func_name);
+
+} // namespace at::pyre

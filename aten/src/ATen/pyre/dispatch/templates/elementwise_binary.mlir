@@ -1,0 +1,26 @@
+// Binary elementwise template (add, sub, mul, div).
+// Uses torch-mlir calling convention matching fusilli's pattern exactly.
+//
+// Placeholders:
+//   $$element_type$$   — torch element type (f32, f64, si32, si64)
+//   $$func_name$$      — entry point name
+//   $$lhs_shape$$      — lhs shape comma-separated (e.g., "4,4" or "?,?")
+//   $$rhs_shape$$      — rhs shape comma-separated
+//   $$out_shape$$      — output shape comma-separated
+//   $$torch_op$$       — torch dialect op (torch.aten.add.Tensor, etc.)
+//   $$extra_args$$     — extra args after lhs,rhs (e.g., ", %alpha" for add)
+//   $$extra_arg_decls$$— extra SSA declarations (e.g., "%alpha = torch.constant.int 1")
+//   $$extra_arg_types$$— extra type list (e.g., ", !torch.int")
+
+module @module {
+  func.func @$$func_name$$(
+      %out_: !torch.tensor<[$$out_shape$$], $$element_type$$>,
+      %lhs: !torch.vtensor<[$$lhs_shape$$], $$element_type$$>,
+      %rhs: !torch.vtensor<[$$rhs_shape$$], $$element_type$$>
+  ) attributes {torch.assume_strict_symbolic_shapes} {
+    $$extra_arg_decls$$
+    %result = $$torch_op$$ %lhs, %rhs$$extra_args$$ : !torch.vtensor<[$$lhs_shape$$], $$element_type$$>, !torch.vtensor<[$$rhs_shape$$], $$element_type$$>$$extra_arg_types$$ -> !torch.vtensor<[$$out_shape$$], $$element_type$$>
+    torch.overwrite.tensor.contents %result overwrites %out_ : !torch.vtensor<[$$out_shape$$], $$element_type$$>, !torch.tensor<[$$out_shape$$], $$element_type$$>
+    return
+  }
+}

@@ -404,3 +404,4 @@ CLAUDE.local.md
 /debug_*.py
 CLAUDE_CONTEXT/
 /.claude/settings.local.json
+aten/src/ATen/pyre/dispatch/PyreKernelTemplates.inc

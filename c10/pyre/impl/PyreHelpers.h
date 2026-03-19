@@ -9,15 +9,63 @@
 
 #include <iree/async/util/proactor_pool.h>
 #include <iree/hal/api.h>
+#include <iree/hal/fence.h>
 #include <iree/vm/api.h>
 
 #include <c10/macros/Export.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Logging.h>
 
+#include <cstdlib>
+#include <iostream>
 #include <string>
 
 namespace c10::pyre {
+
+// -------------------------------------------------------------------------- //
+// Logging
+//
+// Controlled by PYRE_LOG_LEVEL env var:
+//   0 or unset: silent (default)
+//   1: errors and warnings
+//   2: info (dispatch decisions, cache hits/misses, compilation)
+//   3: debug (template expansion, MLIR text, arg details)
+//   4: trace (every function entry, VM invocation args)
+// -------------------------------------------------------------------------- //
+
+enum class PyreLogLevel : int {
+  SILENT = 0,
+  WARN = 1,
+  INFO = 2,
+  DEBUG = 3,
+  TRACE = 4,
+};
+
+inline PyreLogLevel pyreLogLevel() {
+  static PyreLogLevel level = [] {
+    const char* env = std::getenv("PYRE_LOG_LEVEL");
+    if (!env) return PyreLogLevel::SILENT;
+    int v = std::atoi(env);
+    if (v < 0) v = 0;
+    if (v > 4) v = 4;
+    return static_cast<PyreLogLevel>(v);
+  }();
+  return level;
+}
+
+inline bool pyreLogEnabled(PyreLogLevel level) {
+  return static_cast<int>(pyreLogLevel()) >= static_cast<int>(level);
+}
+
+// Usage: PYRE_LOG(INFO) << "cache hit for " << key;
+// Compiles to nothing when log level check fails (short-circuit).
+// Uses ternary+voidify to avoid dangling-else binding.
+struct PyreLogVoidify { void operator&(std::ostream&) const {} };
+#define PYRE_LOG(level)                                               \
+  !::c10::pyre::pyreLogEnabled(::c10::pyre::PyreLogLevel::level)     \
+      ? (void)0                                                       \
+      : ::c10::pyre::PyreLogVoidify() &                               \
+            std::cerr << "[pyre:" #level "] "
 
 // -------------------------------------------------------------------------- //
 // Status handling
@@ -141,11 +189,38 @@ using hal_driver_ptr = iree_ptr<
     iree_hal_driver_retain,
     iree_hal_driver_release>;
 
+// IREE HAL buffer view
+using hal_buffer_view_ptr = iree_ptr<
+    iree_hal_buffer_view_t,
+    iree_hal_buffer_view_retain,
+    iree_hal_buffer_view_release>;
+
+// IREE HAL fence
+using hal_fence_ptr = iree_ptr<
+    iree_hal_fence_t,
+    iree_hal_fence_retain,
+    iree_hal_fence_release>;
+
 // IREE VM types
 using vm_instance_ptr = iree_ptr<
     iree_vm_instance_t,
     iree_vm_instance_retain,
     iree_vm_instance_release>;
+
+using vm_context_ptr = iree_ptr<
+    iree_vm_context_t,
+    iree_vm_context_retain,
+    iree_vm_context_release>;
+
+using vm_module_ptr = iree_ptr<
+    iree_vm_module_t,
+    iree_vm_module_retain,
+    iree_vm_module_release>;
+
+using vm_list_ptr = iree_ptr<
+    iree_vm_list_t,
+    iree_vm_list_retain,
+    iree_vm_list_release>;
 
 // IREE async types
 using proactor_pool_ptr = iree_ptr<

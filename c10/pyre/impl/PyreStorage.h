@@ -28,6 +28,8 @@ class PyreDevice;
 // Ownership: Storage → StorageImpl → DataPtr → PyreBufferContext.
 // The DataPtr deleter destroys this context when the tensor is freed.
 struct C10_PYRE_API PyreBufferContext {
+  static constexpr uint64_t kMagic = 0x5059524542554643ULL;  // "PYREBUFX"
+  uint64_t magic = kMagic;
   hal_buffer_ptr buffer;
   iree_hal_buffer_mapping_t mapping = {};
   PyreDevice* device = nullptr;  // non-owning back-reference

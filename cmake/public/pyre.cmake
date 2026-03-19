@@ -39,6 +39,28 @@ set(BUILD_SHARED_LIBS ${_pyre_saved_build_shared})
 
 set(PYTORCH_FOUND_PYRE ON)
 
+# --------------------------------------------------------------------------- #
+# IREE Compiler Loader
+#
+# The IREE compiler is a separate shared library (libIREECompiler.so) loaded
+# at runtime via dlopen. We build the loader stub — a thin trampoline library
+# that resolves compiler API symbols from the loaded library.
+#
+# This avoids linking the full IREE compiler into PyTorch. The compiler is
+# found at runtime via PYRE_IREE_COMPILER_LIB or PYRE_IREE_COMPILE env vars.
+# --------------------------------------------------------------------------- #
+
+set(_pyre_compiler_bindings ${PYRE_IREE_SOURCE_DIR}/compiler/bindings/c)
+
+add_library(pyre_iree_compiler_loader STATIC
+  ${_pyre_compiler_bindings}/iree/compiler/loader/loader.cpp)
+target_include_directories(pyre_iree_compiler_loader PUBLIC
+  ${_pyre_compiler_bindings})
+target_link_libraries(pyre_iree_compiler_loader PRIVATE ${CMAKE_DL_LIBS})
+set_property(TARGET pyre_iree_compiler_loader PROPERTY POSITION_INDEPENDENT_CODE ON)
+
 # Collect variables for downstream targets.
-set(Caffe2_PYRE_DEPENDENCY_LIBS iree_runtime_unified)
-set(Caffe2_PYRE_INCLUDE ${PYRE_IREE_SOURCE_DIR}/runtime/src)
+set(Caffe2_PYRE_DEPENDENCY_LIBS iree_runtime_unified pyre_iree_compiler_loader)
+set(Caffe2_PYRE_INCLUDE
+  ${PYRE_IREE_SOURCE_DIR}/runtime/src
+  ${_pyre_compiler_bindings})
