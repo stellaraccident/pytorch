@@ -1235,9 +1235,35 @@ if(USE_PYRE)
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelDispatch.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreVMContext.cpp
   )
+  # Generate PyreKernelTemplates.inc from .mlir templates.
+  set(PYRE_TEMPLATE_DIR ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/templates)
+  set(PYRE_TEMPLATES
+    ${PYRE_TEMPLATE_DIR}/addmm.mlir
+    ${PYRE_TEMPLATE_DIR}/addmm_transposed.mlir
+    ${PYRE_TEMPLATE_DIR}/elementwise_binary.mlir
+    ${PYRE_TEMPLATE_DIR}/elementwise_unary.mlir
+  )
+  set(PYRE_TEMPLATES_INC
+    ${CMAKE_BINARY_DIR}/aten/src/ATen/pyre/dispatch/PyreKernelTemplates.inc)
+  add_custom_command(
+    OUTPUT ${PYRE_TEMPLATES_INC}
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+      ${CMAKE_BINARY_DIR}/aten/src/ATen/pyre/dispatch
+    COMMAND ${PYTHON_EXECUTABLE}
+      ${TORCH_ROOT}/tools/embed_templates.py
+      ${PYRE_TEMPLATES}
+      -o ${PYRE_TEMPLATES_INC}
+    DEPENDS ${PYRE_TEMPLATES}
+      ${TORCH_ROOT}/tools/embed_templates.py
+    COMMENT "Generating PyreKernelTemplates.inc"
+  )
+  add_custom_target(pyre_templates DEPENDS ${PYRE_TEMPLATES_INC})
+
   add_library(torch_pyre ${Caffe2_PYRE_SRCS})
+  add_dependencies(torch_pyre pyre_templates)
   torch_compile_options(torch_pyre)
   target_compile_definitions(torch_pyre PRIVATE USE_PYRE)
+  target_include_directories(torch_pyre PRIVATE ${CMAKE_BINARY_DIR}/aten/src)
 endif()
 
 if(NOT MSVC AND USE_XNNPACK)
