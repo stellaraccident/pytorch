@@ -7,11 +7,26 @@
 #include <c10/util/ArrayRef.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace at::pyre {
 
-std::string expandBinaryTemplate(
+// Expanded kernel: MLIR text + metadata for content-hash cache key.
+struct ExpandedKernel {
+  std::string mlir;
+  const char* template_sha1;
+  std::vector<std::pair<std::string, std::string>> substitutions;
+};
+
+// Content-hash cache key: SHA1 of template digest + substitutions + flags.
+std::string contentHashCacheKey(
+    const char* aten_name,
+    const char* template_sha1,
+    const std::vector<std::pair<std::string, std::string>>& substitutions,
+    c10::ArrayRef<std::string> compiler_flags);
+
+ExpandedKernel expandBinaryTemplate(
     const std::string& func_name,
     const std::string& linalg_op,
     c10::ScalarType dtype,
@@ -20,7 +35,7 @@ std::string expandBinaryTemplate(
     c10::ArrayRef<int64_t> out_shape,
     const std::vector<ArgAdapter>& adapters);
 
-std::string expandBinaryAlphaTemplate(
+ExpandedKernel expandBinaryAlphaTemplate(
     const std::string& func_name,
     const std::string& alpha_add_op,
     const std::string& alpha_mul_op,
@@ -31,7 +46,7 @@ std::string expandBinaryAlphaTemplate(
     c10::ArrayRef<int64_t> out_shape,
     const std::vector<ArgAdapter>& adapters);
 
-std::string expandUnaryTemplate(
+ExpandedKernel expandUnaryTemplate(
     const std::string& func_name,
     const std::string& scalar_op,
     c10::ScalarType dtype,
@@ -39,8 +54,7 @@ std::string expandUnaryTemplate(
     c10::ArrayRef<int64_t> out_shape,
     const ArgAdapter& adapter);
 
-// addmm: beta * bias + alpha * (mat1 @ mat2)
-std::string expandAddmmTemplate(
+ExpandedKernel expandAddmmTemplate(
     const std::string& func_name,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> bias_shape,
@@ -48,9 +62,7 @@ std::string expandAddmmTemplate(
     c10::ArrayRef<int64_t> mat2_shape,
     c10::ArrayRef<int64_t> out_shape);
 
-// addmm with mat2 transposed inside the kernel.
-// mat2_orig_shape is the original [N,K] before transpose.
-std::string expandAddmmTransposedTemplate(
+ExpandedKernel expandAddmmTransposedTemplate(
     const std::string& func_name,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> bias_shape,

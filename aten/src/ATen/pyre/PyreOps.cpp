@@ -7,20 +7,15 @@ namespace at::pyre {
 // ---------------------------------------------------------------------------
 
 c10::DimVector inferShapeBroadcast(const OpContext& ctx) {
-  TORCH_CHECK(ctx.inputs.size() >= 2);
+  TORCH_CHECK(ctx.raw_inputs.size() >= 2);
+  // Use raw (logical) shapes for broadcast inference.
   return c10::DimVector(
-      at::infer_size(ctx.inputs[0].sizes(), ctx.inputs[1].sizes()));
+      at::infer_size(ctx.raw_inputs[0].sizes(), ctx.raw_inputs[1].sizes()));
 }
 
 c10::DimVector inferShapeIdentity(const OpContext& ctx) {
-  return c10::DimVector(ctx.inputs[0].sizes());
-}
-
-std::string cacheKeySuffixScalar0(const OpContext& ctx) {
-  if (ctx.scalars.empty()) return "";
-  double v = ctx.scalars[0].toDouble();
-  if (std::abs(v - 1.0) < 1e-12) return "";
-  return "::a" + std::to_string(static_cast<int64_t>(v));
+  // Use raw (logical) shape — physical shape may differ for permuted inputs.
+  return c10::DimVector(ctx.raw_inputs[0].sizes());
 }
 
 std::string funcNameDefault(const char* aten_name) {
@@ -32,7 +27,7 @@ std::string funcNameDefault(const char* aten_name) {
   return s;
 }
 
-std::string expandBinaryStandard(
+ExpandedKernel expandBinaryStandard(
     const char* torch_op, const std::string& func_name,
     const OpContext& ctx) {
   bool has_alpha = !ctx.scalars.empty() &&
@@ -45,23 +40,25 @@ std::string expandBinaryStandard(
     else
       arith_op = isFloatDtype(ctx.dtype) ? "arith.addf" : "arith.addi";
 
+    auto out_shape = at::infer_size(
+        ctx.raw_inputs[0].sizes(), ctx.raw_inputs[1].sizes());
     return expandBinaryAlphaTemplate(
         func_name, arith_op,
         isFloatDtype(ctx.dtype) ? "arith.mulf" : "arith.muli",
         ctx.scalars[0].toDouble(), ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-        at::infer_size(ctx.inputs[0].sizes(), ctx.inputs[1].sizes()),
-        ctx.decision.arg_adapters);
+        out_shape, ctx.decision.arg_adapters);
   }
 
+  auto out_shape = at::infer_size(
+      ctx.raw_inputs[0].sizes(), ctx.raw_inputs[1].sizes());
   return expandBinaryTemplate(
       func_name, torch_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-      at::infer_size(ctx.inputs[0].sizes(), ctx.inputs[1].sizes()),
-      ctx.decision.arg_adapters);
+      out_shape, ctx.decision.arg_adapters);
 }
 
-std::string expandUnaryStandard(
+ExpandedKernel expandUnaryStandard(
     const char* torch_op, const std::string& func_name,
     const OpContext& ctx) {
   ArgAdapter adapter = ctx.decision.arg_adapters.empty()
@@ -116,7 +113,7 @@ at::Tensor invokeKernel(
 // MmOp::expandTemplate
 // ---------------------------------------------------------------------------
 
-std::string MmOp::expandTemplate(
+ExpandedKernel MmOp::expandTemplate(
     const std::string& func_name, const OpContext& ctx) {
   auto out_shape = inferShape(ctx);
   return expandBinaryTemplate(
@@ -129,14 +126,18 @@ std::string MmOp::expandTemplate(
 // AddmmOp::expandTemplate
 // ---------------------------------------------------------------------------
 
-std::string AddmmOp::expandTemplate(
+ExpandedKernel AddmmOp::expandTemplate(
     const std::string& func_name, const OpContext& ctx) {
-  bool mat2_t = ctx.decision.arg_adapters.size() > 2
-      && ctx.decision.arg_adapters[2].kind == ArgAdapter::kTranspose;
-  if (mat2_t)
+  bool mat2_permuted = ctx.decision.arg_adapters.size() > 2
+      && ctx.decision.arg_adapters[2].kind == ArgAdapter::kPermute;
+  if (mat2_permuted) {
+    // ctx.inputs[2] is the physical (contiguous) layout after un-permuting.
+    // expandAddmmTransposedTemplate expects the physical shape and emits
+    // torch.aten.t inside the kernel to reconstruct logical shape.
     return expandAddmmTransposedTemplate(func_name, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
         ctx.inputs[2].sizes(), inferShape(ctx));
+  }
   return expandAddmmTemplate(func_name, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
       ctx.inputs[2].sizes(), inferShape(ctx));

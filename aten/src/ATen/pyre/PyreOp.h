@@ -24,15 +24,14 @@
 
 #include <torch/library.h>
 
-#include <cmath>
-#include <cstring>
 #include <string>
 #include <vector>
 
 namespace at::pyre {
 
 struct OpContext {
-  c10::ArrayRef<at::Tensor> inputs;
+  c10::ArrayRef<at::Tensor> inputs;       // post-adapter (physical layout)
+  c10::ArrayRef<at::Tensor> raw_inputs;   // pre-adapter (logical layout)
   c10::ArrayRef<at::Scalar> scalars;
   c10::ScalarType dtype;
   const SpecDecision& decision;
@@ -41,12 +40,11 @@ struct OpContext {
 // Stock helper functions (non-templated, do the real work).
 c10::DimVector inferShapeBroadcast(const OpContext& ctx);
 c10::DimVector inferShapeIdentity(const OpContext& ctx);
-std::string cacheKeySuffixScalar0(const OpContext& ctx);
 std::string funcNameDefault(const char* aten_name);
-std::string expandBinaryStandard(
+ExpandedKernel expandBinaryStandard(
     const char* torch_op, const std::string& func_name,
     const OpContext& ctx);
-std::string expandUnaryStandard(
+ExpandedKernel expandUnaryStandard(
     const char* torch_op, const std::string& func_name,
     const OpContext& ctx);
 
@@ -90,28 +88,18 @@ struct PyreOp {
         {raw_inputs.begin(), raw_inputs.end()},
         decision.arg_adapters);
 
-    OpContext ctx{adapted, scalars, dtype, decision};
+    OpContext ctx{adapted, raw_inputs, scalars, dtype, decision};
 
     auto out_shape  = Derived::inferShape(ctx);
     auto func_name  = Derived::buildFuncName(ctx);
-    auto mlir       = Derived::expandTemplate(func_name, ctx);
-    // Build cache key: spec_key encodes op+dtype+rank of first input.
-    // Append all input shapes to avoid aliasing across different
-    // shape combinations (e.g. binary ops with different rhs ranks).
-    std::string shapes_key;
-    for (const auto& t : adapted) {
-      shapes_key += "::";
-      for (int64_t d = 0; d < t.dim(); ++d) {
-        if (d > 0) shapes_key += "x";
-        shapes_key += (t.size(d) == 1) ? "1" : "d";
-      }
-    }
-    auto cache_key  = decision.spec_key.toString()
-        + shapes_key
-        + Derived::cacheKeySuffix(ctx)
-        + "::" + c10::pyre::PyreDevice::get(0)->capabilities().cacheKey();
+    auto expanded   = Derived::expandTemplate(func_name, ctx);
 
-    auto* kernel = getOrCompile(cache_key, func_name, mlir);
+    auto cache_key = contentHashCacheKey(
+        Derived::aten_name, expanded.template_sha1,
+        expanded.substitutions,
+        c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+    auto* kernel = getOrCompile(cache_key, func_name, expanded.mlir);
     return invokeKernel(kernel, adapted, out_shape,
                         raw_inputs[0].options());
   }
@@ -130,11 +118,10 @@ struct RegularBinaryOp : PyreOp<Derived> {
   static c10::DimVector inferShape(const OpContext& ctx) {
     return inferShapeBroadcast(ctx);
   }
-  static std::string expandTemplate(
+  static ExpandedKernel expandTemplate(
       const std::string& func_name, const OpContext& ctx) {
     return expandBinaryStandard(Derived::torch_op, func_name, ctx);
   }
-  static std::string cacheKeySuffix(const OpContext&) { return ""; }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
   }
@@ -155,12 +142,9 @@ struct AlphaBinaryOp : PyreOp<Derived> {
   static c10::DimVector inferShape(const OpContext& ctx) {
     return inferShapeBroadcast(ctx);
   }
-  static std::string expandTemplate(
+  static ExpandedKernel expandTemplate(
       const std::string& func_name, const OpContext& ctx) {
     return expandBinaryStandard(Derived::torch_op, func_name, ctx);
-  }
-  static std::string cacheKeySuffix(const OpContext& ctx) {
-    return cacheKeySuffixScalar0(ctx);
   }
   static std::string buildFuncName(const OpContext& ctx) {
     auto base = funcNameDefault(Derived::aten_name);
@@ -184,11 +168,10 @@ struct RegularUnaryOp : PyreOp<Derived> {
   static c10::DimVector inferShape(const OpContext& ctx) {
     return inferShapeIdentity(ctx);
   }
-  static std::string expandTemplate(
+  static ExpandedKernel expandTemplate(
       const std::string& func_name, const OpContext& ctx) {
     return expandUnaryStandard(Derived::torch_op, func_name, ctx);
   }
-  static std::string cacheKeySuffix(const OpContext&) { return ""; }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
   }
@@ -230,10 +213,9 @@ struct MmOp : PyreOp<MmOp> {
   static c10::DimVector inferShape(const OpContext& ctx) {
     return {ctx.inputs[0].size(0), ctx.inputs[1].size(1)};
   }
-  static std::string expandTemplate(
+  static ExpandedKernel expandTemplate(
       const std::string& func_name, const OpContext& ctx);
 
-  static std::string cacheKeySuffix(const OpContext&) { return ""; }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(aten_name);
   }
@@ -266,26 +248,16 @@ struct AddmmOp : PyreOp<AddmmOp> {
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
-    return {ctx.inputs[1].size(0), ctx.inputs[2].size(1)};
+    // Use raw (logical) shapes: mat1=[M,K], mat2=[K,N] → output=[M,N]
+    return {ctx.raw_inputs[1].size(0), ctx.raw_inputs[2].size(1)};
   }
 
-  static std::string expandTemplate(
+  static ExpandedKernel expandTemplate(
       const std::string& func_name, const OpContext& ctx);
-
-  static std::string cacheKeySuffix(const OpContext& ctx) {
-    if (ctx.scalars.size() < 2) return "";
-    double b = ctx.scalars[0].toDouble(), a = ctx.scalars[1].toDouble();
-    if (std::abs(b - 1.0) < 1e-12 && std::abs(a - 1.0) < 1e-12)
-      return "";
-    uint64_t bb, ab;
-    std::memcpy(&bb, &b, sizeof(bb));
-    std::memcpy(&ab, &a, sizeof(ab));
-    return "::b" + std::to_string(bb) + "a" + std::to_string(ab);
-  }
 
   static std::string buildFuncName(const OpContext& ctx) {
     bool mat2_t = ctx.decision.arg_adapters.size() > 2
-        && ctx.decision.arg_adapters[2].kind == ArgAdapter::kTranspose;
+        && ctx.decision.arg_adapters[2].kind == ArgAdapter::kPermute;
     return mat2_t ? "pyre_addmm_t" : "pyre_addmm";
   }
 };

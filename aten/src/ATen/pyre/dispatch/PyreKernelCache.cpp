@@ -22,6 +22,7 @@ std::string PyreKernelCache::cacheDir() const {
 }
 
 std::string PyreKernelCache::diskCachePath(const std::string& cache_key) const {
+  // cache_key is a 40-char SHA1 hex digest — filesystem-safe as-is.
   return cacheDir() + "/" + cache_key + ".vmfb";
 }
 

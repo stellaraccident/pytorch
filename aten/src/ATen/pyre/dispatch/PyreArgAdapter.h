@@ -1,22 +1,17 @@
 #pragma once
 
-// Stride analysis and MLIR adapter function generation.
+// Stride analysis for kernel arg adaptation.
 //
-// Templates have a two-level type system:
-//   - Input type: physical layout as received from PyTorch (possibly strided)
-//   - Compute type: linearized canonical layout for the core kernel
+// Detects pure axis permutations from stride patterns and provides
+// the permutation vector. applyAdapters() un-permutes to recover the
+// physical (contiguous) layout. Template expansion emits
+// torch.aten.permute to reconstruct the logical shape inside the kernel.
 //
-// Adapters transform from input type to compute type. When the adapter is
-// identity, the types are the same and the compiler sees through it.
-//
-// Epic 1: identity adapter (active) + contiguous fallback.
-// Transpose/permute adapter structure in place for future.
-// See epic1_kernel_dispatch.md §4.3.
+// See epic1_kernel_dispatch.md §10.3 P1-C.
 
 #include <ATen/Tensor.h>
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace at::pyre {
@@ -24,22 +19,21 @@ namespace at::pyre {
 struct ArgAdapter {
   enum Kind {
     kIdentity,    // Contiguous (row-major) — free
-    kTranspose,   // Reversed/permuted strides — compiler fuses
+    kPermute,     // Pure axis permutation — compiler fuses, zero copy
     kContiguous,  // Arbitrary strides — force contiguous (data movement)
   };
 
   Kind kind = kIdentity;
-  std::vector<int64_t> permutation;  // for kTranspose
-
-  // Generate the MLIR body for this adapter function.
-  // type_name is the MLIR type alias (e.g., "!lhs_compute_type").
-  std::string generateBody(const std::string& type_name) const;
+  std::vector<int64_t> permutation;  // for kPermute: logical→physical mapping
 
   // Analyze a tensor's strides and choose the appropriate adapter.
   static ArgAdapter analyze(const at::Tensor& tensor);
 };
 
-// Apply adapters to inputs: identity is no-op, contiguous calls .contiguous().
+// Apply adapters to inputs:
+//   kIdentity  — no-op
+//   kPermute   — inverse-permute to physical (contiguous) layout
+//   kContiguous — force .contiguous() (data copy)
 std::vector<at::Tensor> applyAdapters(
     const std::vector<at::Tensor>& inputs,
     const std::vector<ArgAdapter>& adapters);

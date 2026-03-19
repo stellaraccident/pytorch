@@ -29,6 +29,7 @@ module @module {
   }
 }
 )mlir";
+static constexpr const char kTemplate_addmm_sha1[] = "6822659348ad16d314486e94a783cd1b34a4a760";
 
 static constexpr const char kTemplate_addmm_transposed[] = R"mlir(
 // addmm with mat2 transposed: bias + mat1 @ mat2.T
@@ -58,6 +59,7 @@ module @module {
   }
 }
 )mlir";
+static constexpr const char kTemplate_addmm_transposed_sha1[] = "b06ed33ebd8effe31a5efaafcda7f3ea905e7937";
 
 static constexpr const char kTemplate_elementwise_binary[] = R"mlir(
 // Binary elementwise template (add, sub, mul, div).
@@ -87,6 +89,7 @@ module @module {
   }
 }
 )mlir";
+static constexpr const char kTemplate_elementwise_binary_sha1[] = "303b07538904f3d1a468e6c2902ac7d66abf003b";
 
 static constexpr const char kTemplate_elementwise_unary[] = R"mlir(
 // Unary elementwise template (neg, abs, relu).
@@ -110,5 +113,6 @@ module @module {
   }
 }
 )mlir";
+static constexpr const char kTemplate_elementwise_unary_sha1[] = "3e91d76ae793a90191ecb7e1c3f17268a8a12367";
 
 } // namespace at::pyre

@@ -1233,7 +1233,6 @@ if(USE_PYRE)
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCache.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCompiler.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelDispatch.cpp
-    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreSpecKey.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreVMContext.cpp
   )
   add_library(torch_pyre ${Caffe2_PYRE_SRCS})

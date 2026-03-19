@@ -16,6 +16,7 @@ distribution time.
 """
 
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -38,13 +39,18 @@ def generate_inc(template_paths: list[str], output_path: str) -> None:
             with open(path) as f:
                 content = f.read()
 
+            digest = hashlib.sha1(content.encode()).hexdigest()
+
             out.write(
                 f'static constexpr const char kTemplate_{name}[] = R"mlir(\n'
             )
             out.write(content)
             if not content.endswith("\n"):
                 out.write("\n")
-            out.write(')mlir";\n\n')
+            out.write(')mlir";\n')
+            out.write(
+                f'static constexpr const char kTemplate_{name}_sha1[] = "{digest}";\n\n'
+            )
 
         out.write("} // namespace at::pyre\n")
 
