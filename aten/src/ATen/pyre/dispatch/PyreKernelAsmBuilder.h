@@ -35,6 +35,54 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// --- Comparison ops (tensor-tensor) ---
+
+KernelSpec buildComparisonKernelSpec(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+std::string generateComparisonMlir(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+// --- Comparison ops (tensor-scalar) ---
+
+KernelSpec buildComparisonScalarKernelSpec(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value);
+
+std::string generateComparisonScalarMlir(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value);
+
+// --- Scalar binary ops ---
+
+KernelSpec buildScalarBinaryKernelSpec(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+std::string generateScalarBinaryMlir(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
 // --- Binary ops ---
 
 KernelSpec buildBinaryKernelSpec(
@@ -73,13 +121,19 @@ KernelSpec buildUnaryKernelSpec(
     const std::string& func_name, const std::string& scalar_op,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
-    const ArgAdapter& adapter);
+    const ArgAdapter& adapter,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
 
 std::string generateUnaryMlir(
     const std::string& func_name, const std::string& scalar_op,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
-    const ArgAdapter& adapter);
+    const ArgAdapter& adapter,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
 
 // --- mm ---
 

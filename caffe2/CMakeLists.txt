@@ -1247,6 +1247,9 @@ if(USE_PYRE)
     ${PYRE_TEMPLATE_DIR}/elementwise_binary.mlir
     ${PYRE_TEMPLATE_DIR}/elementwise_unary.mlir
     ${PYRE_TEMPLATE_DIR}/mm.mlir
+    ${PYRE_TEMPLATE_DIR}/scalar_binary.mlir
+    ${PYRE_TEMPLATE_DIR}/comparison.mlir
+    ${PYRE_TEMPLATE_DIR}/comparison_scalar.mlir
   )
   set(PYRE_TEMPLATES_INC
     ${CMAKE_BINARY_DIR}/aten/src/ATen/pyre/dispatch/PyreKernelTemplates.inc)

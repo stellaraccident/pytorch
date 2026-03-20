@@ -52,10 +52,30 @@ std::string buildBinaryMlir(
 
 KernelSpec buildUnarySpec(
     const char* torch_op, const std::string& func_name,
-    const OpContext& ctx);
+    const OpContext& ctx,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
 std::string buildUnaryMlir(
     const char* torch_op, const std::string& func_name,
-    const OpContext& ctx);
+    const OpContext& ctx,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+// Scalar binary helpers — split into spec + mlir.
+KernelSpec buildScalarBinarySpec(
+    const char* torch_op, const std::string& func_name,
+    const OpContext& ctx, double scalar_value,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+std::string buildScalarBinaryMlirHelper(
+    const char* torch_op, const std::string& func_name,
+    const OpContext& ctx, double scalar_value,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
 
 // Compile-and-cache, returning the cached entry.
 // AbiConfig controls compiler flags and function resolution.
@@ -119,7 +139,12 @@ struct PyreOp {
     }
 
     return invokeKernel(kernel, adapted, out_shape,
-                        raw_inputs[0].options());
+                        Derived::outputOptions(ctx));
+  }
+
+  // Default: output options from first input. Override for comparison ops.
+  static at::TensorOptions outputOptions(const OpContext& ctx) {
+    return ctx.raw_inputs[0].options();
   }
 };
 
@@ -208,6 +233,40 @@ struct RegularUnaryOp : PyreOp<Derived> {
 };
 
 // ---------------------------------------------------------------------------
+// Intermediate: ParameterizedUnaryOp — single input + constant extra args
+// ---------------------------------------------------------------------------
+
+template <typename Derived>
+struct ParameterizedUnaryOp : PyreOp<Derived> {
+  static at::Tensor impl(const at::Tensor& self) {
+    return PyreOp<Derived>::dispatch({self}, {});
+  }
+
+  static c10::DimVector inferShape(const OpContext& ctx) {
+    return inferShapeIdentity(ctx);
+  }
+  static KernelSpec buildKernelSpec(
+      const std::string& func_name, const OpContext& ctx) {
+    return buildUnarySpec(
+        Derived::torch_op, func_name, ctx,
+        Derived::extraArgDecls(ctx),
+        Derived::extraArgs(),
+        Derived::extraArgTypes());
+  }
+  static std::string generateMlir(
+      const std::string& func_name, const OpContext& ctx) {
+    return buildUnaryMlir(
+        Derived::torch_op, func_name, ctx,
+        Derived::extraArgDecls(ctx),
+        Derived::extraArgs(),
+        Derived::extraArgTypes());
+  }
+  static std::string buildFuncName(const OpContext&) {
+    return funcNameDefault(Derived::aten_name);
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Concrete ops
 // ---------------------------------------------------------------------------
 
@@ -227,6 +286,45 @@ struct MulOp : RegularBinaryOp<MulOp> {
 struct DivOp : RegularBinaryOp<DivOp> {
   static constexpr const char* aten_name = "div.Tensor";
   static constexpr const char* torch_op = "div";
+};
+
+// --- Binary ops (Epic 3) ---
+
+struct PowTensorOp : RegularBinaryOp<PowTensorOp> {
+  static constexpr const char* aten_name = "pow.Tensor_Tensor";
+  static constexpr const char* torch_op = "pow";
+};
+struct MaximumOp : RegularBinaryOp<MaximumOp> {
+  static constexpr const char* aten_name = "maximum";
+  static constexpr const char* torch_op = "maximum";
+};
+struct MinimumOp : RegularBinaryOp<MinimumOp> {
+  static constexpr const char* aten_name = "minimum";
+  static constexpr const char* torch_op = "minimum";
+};
+struct RemainderOp : RegularBinaryOp<RemainderOp> {
+  static constexpr const char* aten_name = "remainder.Tensor";
+  static constexpr const char* torch_op = "remainder";
+};
+struct FmodOp : RegularBinaryOp<FmodOp> {
+  static constexpr const char* aten_name = "fmod.Tensor";
+  static constexpr const char* torch_op = "fmod";
+};
+struct BitwiseAndOp : RegularBinaryOp<BitwiseAndOp> {
+  static constexpr const char* aten_name = "bitwise_and.Tensor";
+  static constexpr const char* torch_op = "bitwise_and";
+};
+struct BitwiseOrOp : RegularBinaryOp<BitwiseOrOp> {
+  static constexpr const char* aten_name = "bitwise_or.Tensor";
+  static constexpr const char* torch_op = "bitwise_or";
+};
+struct BitwiseXorOp : RegularBinaryOp<BitwiseXorOp> {
+  static constexpr const char* aten_name = "bitwise_xor.Tensor";
+  static constexpr const char* torch_op = "bitwise_xor";
+};
+struct Atan2Op : RegularBinaryOp<Atan2Op> {
+  static constexpr const char* aten_name = "atan2";
+  static constexpr const char* torch_op = "atan2";
 };
 struct MmOp : PyreOp<MmOp> {
   static constexpr const char* aten_name = "mm";
@@ -263,6 +361,365 @@ struct ReluOp : RegularUnaryOp<ReluOp> {
 struct AbsOp : RegularUnaryOp<AbsOp> {
   static constexpr const char* aten_name = "abs";
   static constexpr const char* torch_op = "torch.aten.abs";
+};
+
+// --- Pure unary ops (Epic 3) ---
+
+struct SiluOp : RegularUnaryOp<SiluOp> {
+  static constexpr const char* aten_name = "silu";
+  static constexpr const char* torch_op = "torch.aten.silu";
+};
+struct SigmoidOp : RegularUnaryOp<SigmoidOp> {
+  static constexpr const char* aten_name = "sigmoid";
+  static constexpr const char* torch_op = "torch.aten.sigmoid";
+};
+struct TanhOp : RegularUnaryOp<TanhOp> {
+  static constexpr const char* aten_name = "tanh";
+  static constexpr const char* torch_op = "torch.aten.tanh";
+};
+struct RsqrtOp : RegularUnaryOp<RsqrtOp> {
+  static constexpr const char* aten_name = "rsqrt";
+  static constexpr const char* torch_op = "torch.aten.rsqrt";
+};
+struct ExpOp : RegularUnaryOp<ExpOp> {
+  static constexpr const char* aten_name = "exp";
+  static constexpr const char* torch_op = "torch.aten.exp";
+};
+struct LogOp : RegularUnaryOp<LogOp> {
+  static constexpr const char* aten_name = "log";
+  static constexpr const char* torch_op = "torch.aten.log";
+};
+struct SqrtOp : RegularUnaryOp<SqrtOp> {
+  static constexpr const char* aten_name = "sqrt";
+  static constexpr const char* torch_op = "torch.aten.sqrt";
+};
+struct SinOp : RegularUnaryOp<SinOp> {
+  static constexpr const char* aten_name = "sin";
+  static constexpr const char* torch_op = "torch.aten.sin";
+};
+struct CosOp : RegularUnaryOp<CosOp> {
+  static constexpr const char* aten_name = "cos";
+  static constexpr const char* torch_op = "torch.aten.cos";
+};
+struct CeilOp : RegularUnaryOp<CeilOp> {
+  static constexpr const char* aten_name = "ceil";
+  static constexpr const char* torch_op = "torch.aten.ceil";
+};
+struct FloorOp : RegularUnaryOp<FloorOp> {
+  static constexpr const char* aten_name = "floor";
+  static constexpr const char* torch_op = "torch.aten.floor";
+};
+struct RoundOp : RegularUnaryOp<RoundOp> {
+  static constexpr const char* aten_name = "round";
+  static constexpr const char* torch_op = "torch.aten.round";
+};
+struct ReciprocalOp : RegularUnaryOp<ReciprocalOp> {
+  static constexpr const char* aten_name = "reciprocal";
+  static constexpr const char* torch_op = "torch.aten.reciprocal";
+};
+struct ErfOp : RegularUnaryOp<ErfOp> {
+  static constexpr const char* aten_name = "erf";
+  static constexpr const char* torch_op = "torch.aten.erf";
+};
+struct BitwiseNotOp : RegularUnaryOp<BitwiseNotOp> {
+  static constexpr const char* aten_name = "bitwise_not";
+  static constexpr const char* torch_op = "torch.aten.bitwise_not";
+};
+struct LogicalNotOp : RegularUnaryOp<LogicalNotOp> {
+  static constexpr const char* aten_name = "logical_not";
+  static constexpr const char* torch_op = "torch.aten.logical_not";
+};
+struct SignOp : RegularUnaryOp<SignOp> {
+  static constexpr const char* aten_name = "sign";
+  static constexpr const char* torch_op = "torch.aten.sign";
+};
+
+// --- Parameterized unary ops (Epic 3) ---
+
+struct GeluOp : ParameterizedUnaryOp<GeluOp> {
+  static constexpr const char* aten_name = "gelu";
+  static constexpr const char* torch_op = "torch.aten.gelu";
+  // ATen signature: gelu(Tensor self, *, str approximate="none") -> Tensor
+  static at::Tensor impl(const at::Tensor& self, c10::string_view /*approximate*/ = "none") {
+    return PyreOp<GeluOp>::dispatch({self}, {});
+  }
+  static std::string extraArgDecls(const OpContext&) {
+    return "    %approx = torch.constant.str \"none\"";
+  }
+  static std::string extraArgs() { return ", %approx"; }
+  static std::string extraArgTypes() { return ", !torch.str"; }
+};
+
+struct HardtanhOp : ParameterizedUnaryOp<HardtanhOp> {
+  static constexpr const char* aten_name = "hardtanh";
+  static constexpr const char* torch_op = "torch.aten.hardtanh";
+  // ATen signature: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1)
+  static at::Tensor impl(const at::Tensor& self,
+                          const at::Scalar& /*min_val*/ = -1,
+                          const at::Scalar& /*max_val*/ = 1) {
+    return PyreOp<HardtanhOp>::dispatch({self}, {});
+  }
+  static std::string extraArgDecls(const OpContext&) {
+    return "    %min = torch.constant.float -1.000000e+00\n"
+           "    %max = torch.constant.float 1.000000e+00";
+  }
+  static std::string extraArgs() { return ", %min, %max"; }
+  static std::string extraArgTypes() { return ", !torch.float, !torch.float"; }
+};
+
+struct LeakyReluOp : ParameterizedUnaryOp<LeakyReluOp> {
+  static constexpr const char* aten_name = "leaky_relu";
+  static constexpr const char* torch_op = "torch.aten.leaky_relu";
+  // ATen signature: leaky_relu(Tensor self, Scalar negative_slope=0.01)
+  static at::Tensor impl(const at::Tensor& self,
+                          const at::Scalar& /*negative_slope*/ = 0.01) {
+    return PyreOp<LeakyReluOp>::dispatch({self}, {});
+  }
+  static std::string extraArgDecls(const OpContext&) {
+    return "    %neg_slope = torch.constant.float 1.000000e-02";
+  }
+  static std::string extraArgs() { return ", %neg_slope"; }
+  static std::string extraArgTypes() { return ", !torch.float"; }
+};
+
+struct EluOp : ParameterizedUnaryOp<EluOp> {
+  static constexpr const char* aten_name = "elu";
+  static constexpr const char* torch_op = "torch.aten.elu";
+  // ATen signature: elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1)
+  static at::Tensor impl(const at::Tensor& self,
+                          const at::Scalar& /*alpha*/ = 1,
+                          const at::Scalar& /*scale*/ = 1,
+                          const at::Scalar& /*input_scale*/ = 1) {
+    return PyreOp<EluOp>::dispatch({self}, {});
+  }
+  static std::string extraArgDecls(const OpContext&) {
+    return "    %alpha = torch.constant.float 1.000000e+00\n"
+           "    %scale = torch.constant.float 1.000000e+00\n"
+           "    %input_scale = torch.constant.float 1.000000e+00";
+  }
+  static std::string extraArgs() { return ", %alpha, %scale, %input_scale"; }
+  static std::string extraArgTypes() {
+    return ", !torch.float, !torch.float, !torch.float";
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Intermediate: ScalarBinaryOp — one tensor + one scalar, identity shape
+// ---------------------------------------------------------------------------
+
+template <typename Derived>
+struct ScalarBinaryOp : PyreOp<Derived> {
+  static c10::DimVector inferShape(const OpContext& ctx) {
+    return inferShapeIdentity(ctx);
+  }
+  static KernelSpec buildKernelSpec(
+      const std::string& func_name, const OpContext& ctx) {
+    double scalar_val = ctx.scalars[0].toDouble();
+    return buildScalarBinarySpec(
+        Derived::torch_op, func_name, ctx, scalar_val,
+        Derived::extraArgDecls(ctx),
+        Derived::extraArgs(),
+        Derived::extraArgTypes());
+  }
+  static std::string generateMlir(
+      const std::string& func_name, const OpContext& ctx) {
+    double scalar_val = ctx.scalars[0].toDouble();
+    return buildScalarBinaryMlirHelper(
+        Derived::torch_op, func_name, ctx, scalar_val,
+        Derived::extraArgDecls(ctx),
+        Derived::extraArgs(),
+        Derived::extraArgTypes());
+  }
+  static std::string buildFuncName(const OpContext&) {
+    return funcNameDefault(Derived::aten_name);
+  }
+  // Default: no extra args. Override in add.Scalar/sub.Scalar for alpha.
+  static std::string extraArgDecls(const OpContext&) { return ""; }
+  static std::string extraArgs() { return ""; }
+  static std::string extraArgTypes() { return ""; }
+};
+
+// --- Scalar binary ops (Epic 3) ---
+
+struct AddScalarOp : ScalarBinaryOp<AddScalarOp> {
+  static constexpr const char* aten_name = "add.Scalar";
+  static constexpr const char* torch_op = "torch.aten.add.Scalar";
+  // ATen: add.Scalar(Tensor self, Scalar other, Scalar alpha=1)
+  static at::Tensor impl(const at::Tensor& self,
+                          const at::Scalar& other,
+                          const at::Scalar& alpha = 1) {
+    // Fold alpha*other into a single scalar for simplicity
+    double val = other.toDouble() * alpha.toDouble();
+    return PyreOp<AddScalarOp>::dispatch({self}, {at::Scalar(val)});
+  }
+  static std::string extraArgDecls(const OpContext& ctx) {
+    return "    %alpha = torch.constant.int 1";
+  }
+  static std::string extraArgs() { return ", %alpha"; }
+  static std::string extraArgTypes() { return ", !torch.int"; }
+};
+
+struct SubScalarOp : ScalarBinaryOp<SubScalarOp> {
+  static constexpr const char* aten_name = "sub.Scalar";
+  static constexpr const char* torch_op = "torch.aten.sub.Scalar";
+  // ATen: sub.Scalar(Tensor self, Scalar other, Scalar alpha=1)
+  static at::Tensor impl(const at::Tensor& self,
+                          const at::Scalar& other,
+                          const at::Scalar& alpha = 1) {
+    double val = other.toDouble() * alpha.toDouble();
+    return PyreOp<SubScalarOp>::dispatch({self}, {at::Scalar(val)});
+  }
+  static std::string extraArgDecls(const OpContext& ctx) {
+    return "    %alpha = torch.constant.int 1";
+  }
+  static std::string extraArgs() { return ", %alpha"; }
+  static std::string extraArgTypes() { return ", !torch.int"; }
+};
+
+struct MulScalarOp : ScalarBinaryOp<MulScalarOp> {
+  static constexpr const char* aten_name = "mul.Scalar";
+  static constexpr const char* torch_op = "torch.aten.mul.Scalar";
+  static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
+    return PyreOp<MulScalarOp>::dispatch({self}, {other});
+  }
+};
+
+struct DivScalarOp : ScalarBinaryOp<DivScalarOp> {
+  static constexpr const char* aten_name = "div.Scalar";
+  static constexpr const char* torch_op = "torch.aten.div.Scalar";
+  static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
+    return PyreOp<DivScalarOp>::dispatch({self}, {other});
+  }
+};
+
+struct PowScalarOp : ScalarBinaryOp<PowScalarOp> {
+  static constexpr const char* aten_name = "pow.Tensor_Scalar";
+  static constexpr const char* torch_op = "torch.aten.pow.Tensor_Scalar";
+  static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
+    return PyreOp<PowScalarOp>::dispatch({self}, {other});
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Intermediate: ComparisonBinaryOp — two tensors → bool tensor
+// ---------------------------------------------------------------------------
+
+template <typename Derived>
+struct ComparisonBinaryOp : PyreOp<Derived> {
+  static at::Tensor impl(const at::Tensor& self, const at::Tensor& other) {
+    return PyreOp<Derived>::dispatch({self, other}, {});
+  }
+  static c10::DimVector inferShape(const OpContext& ctx) {
+    return inferShapeBroadcast(ctx);
+  }
+  static at::TensorOptions outputOptions(const OpContext& ctx) {
+    return ctx.raw_inputs[0].options().dtype(at::kBool);
+  }
+  static KernelSpec buildKernelSpec(
+      const std::string& func_name, const OpContext& ctx) {
+    auto out_shape = inferShapeBroadcast(ctx);
+    return buildComparisonKernelSpec(
+        func_name, Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+  }
+  static std::string generateMlir(
+      const std::string& func_name, const OpContext& ctx) {
+    auto out_shape = inferShapeBroadcast(ctx);
+    return generateComparisonMlir(
+        func_name, Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+  }
+  static std::string buildFuncName(const OpContext&) {
+    return funcNameDefault(Derived::aten_name);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Intermediate: ComparisonScalarOp — tensor + scalar → bool tensor
+// ---------------------------------------------------------------------------
+
+template <typename Derived>
+struct ComparisonScalarOp : PyreOp<Derived> {
+  static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
+    return PyreOp<Derived>::dispatch({self}, {other});
+  }
+  static c10::DimVector inferShape(const OpContext& ctx) {
+    return inferShapeIdentity(ctx);
+  }
+  static at::TensorOptions outputOptions(const OpContext& ctx) {
+    return ctx.raw_inputs[0].options().dtype(at::kBool);
+  }
+  static KernelSpec buildKernelSpec(
+      const std::string& func_name, const OpContext& ctx) {
+    double scalar_val = ctx.scalars[0].toDouble();
+    return buildComparisonScalarKernelSpec(
+        func_name, Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), scalar_val);
+  }
+  static std::string generateMlir(
+      const std::string& func_name, const OpContext& ctx) {
+    double scalar_val = ctx.scalars[0].toDouble();
+    return generateComparisonScalarMlir(
+        func_name, Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), scalar_val);
+  }
+  static std::string buildFuncName(const OpContext&) {
+    return funcNameDefault(Derived::aten_name);
+  }
+};
+
+// --- Comparison ops (tensor-tensor, Epic 3) ---
+
+struct EqTensorOp : ComparisonBinaryOp<EqTensorOp> {
+  static constexpr const char* aten_name = "eq.Tensor";
+  static constexpr const char* torch_op = "torch.aten.eq.Tensor";
+};
+struct NeTensorOp : ComparisonBinaryOp<NeTensorOp> {
+  static constexpr const char* aten_name = "ne.Tensor";
+  static constexpr const char* torch_op = "torch.aten.ne.Tensor";
+};
+struct LtTensorOp : ComparisonBinaryOp<LtTensorOp> {
+  static constexpr const char* aten_name = "lt.Tensor";
+  static constexpr const char* torch_op = "torch.aten.lt.Tensor";
+};
+struct LeTensorOp : ComparisonBinaryOp<LeTensorOp> {
+  static constexpr const char* aten_name = "le.Tensor";
+  static constexpr const char* torch_op = "torch.aten.le.Tensor";
+};
+struct GtTensorOp : ComparisonBinaryOp<GtTensorOp> {
+  static constexpr const char* aten_name = "gt.Tensor";
+  static constexpr const char* torch_op = "torch.aten.gt.Tensor";
+};
+struct GeTensorOp : ComparisonBinaryOp<GeTensorOp> {
+  static constexpr const char* aten_name = "ge.Tensor";
+  static constexpr const char* torch_op = "torch.aten.ge.Tensor";
+};
+
+// --- Comparison ops (tensor-scalar, Epic 3) ---
+
+struct EqScalarOp : ComparisonScalarOp<EqScalarOp> {
+  static constexpr const char* aten_name = "eq.Scalar";
+  static constexpr const char* torch_op = "torch.aten.eq.Scalar";
+};
+struct NeScalarOp : ComparisonScalarOp<NeScalarOp> {
+  static constexpr const char* aten_name = "ne.Scalar";
+  static constexpr const char* torch_op = "torch.aten.ne.Scalar";
+};
+struct LtScalarOp : ComparisonScalarOp<LtScalarOp> {
+  static constexpr const char* aten_name = "lt.Scalar";
+  static constexpr const char* torch_op = "torch.aten.lt.Scalar";
+};
+struct LeScalarOp : ComparisonScalarOp<LeScalarOp> {
+  static constexpr const char* aten_name = "le.Scalar";
+  static constexpr const char* torch_op = "torch.aten.le.Scalar";
+};
+struct GtScalarOp : ComparisonScalarOp<GtScalarOp> {
+  static constexpr const char* aten_name = "gt.Scalar";
+  static constexpr const char* torch_op = "torch.aten.gt.Scalar";
+};
+struct GeScalarOp : ComparisonScalarOp<GeScalarOp> {
+  static constexpr const char* aten_name = "ge.Scalar";
+  static constexpr const char* torch_op = "torch.aten.ge.Scalar";
 };
 
 // --- One-off: addmm ---

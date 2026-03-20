@@ -92,24 +92,60 @@ std::string buildBinaryMlir(
 
 KernelSpec buildUnarySpec(
     const char* torch_op, const std::string& func_name,
-    const OpContext& ctx) {
+    const OpContext& ctx,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
   ArgAdapter adapter = ctx.decision.arg_adapters.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
       : ctx.decision.arg_adapters[0];
   return buildUnaryKernelSpec(
       func_name, torch_op, ctx.dtype,
-      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter);
+      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
+      extra_arg_decls, extra_args, extra_arg_types);
 }
 
 std::string buildUnaryMlir(
     const char* torch_op, const std::string& func_name,
-    const OpContext& ctx) {
+    const OpContext& ctx,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
   ArgAdapter adapter = ctx.decision.arg_adapters.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
       : ctx.decision.arg_adapters[0];
   return generateUnaryMlir(
       func_name, torch_op, ctx.dtype,
-      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter);
+      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
+      extra_arg_decls, extra_args, extra_arg_types);
+}
+
+// ---------------------------------------------------------------------------
+// Scalar binary helpers
+// ---------------------------------------------------------------------------
+
+KernelSpec buildScalarBinarySpec(
+    const char* torch_op, const std::string& func_name,
+    const OpContext& ctx, double scalar_value,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  return buildScalarBinaryKernelSpec(
+      func_name, torch_op, ctx.dtype,
+      ctx.inputs[0].sizes(), scalar_value,
+      extra_arg_decls, extra_args, extra_arg_types);
+}
+
+std::string buildScalarBinaryMlirHelper(
+    const char* torch_op, const std::string& func_name,
+    const OpContext& ctx, double scalar_value,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  return generateScalarBinaryMlir(
+      func_name, torch_op, ctx.dtype,
+      ctx.inputs[0].sizes(), scalar_value,
+      extra_arg_decls, extra_args, extra_arg_types);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,15 +247,73 @@ std::string AddmmOp::generateMlir(
 // ---------------------------------------------------------------------------
 
 void registerCompiledOps(torch::Library& m) {
+  // Binary ops
   AddOp::register_impl(m);
   SubOp::register_impl(m);
   MulOp::register_impl(m);
   DivOp::register_impl(m);
   MmOp::register_impl(m);
   AddmmOp::register_impl(m);
+  PowTensorOp::register_impl(m);
+  MaximumOp::register_impl(m);
+  MinimumOp::register_impl(m);
+  RemainderOp::register_impl(m);
+  FmodOp::register_impl(m);
+  BitwiseAndOp::register_impl(m);
+  BitwiseOrOp::register_impl(m);
+  BitwiseXorOp::register_impl(m);
+  Atan2Op::register_impl(m);
+
+  // Pure unary ops
   NegOp::register_impl(m);
   ReluOp::register_impl(m);
   AbsOp::register_impl(m);
+  SiluOp::register_impl(m);
+  SigmoidOp::register_impl(m);
+  TanhOp::register_impl(m);
+  RsqrtOp::register_impl(m);
+  ExpOp::register_impl(m);
+  LogOp::register_impl(m);
+  SqrtOp::register_impl(m);
+  SinOp::register_impl(m);
+  CosOp::register_impl(m);
+  CeilOp::register_impl(m);
+  FloorOp::register_impl(m);
+  RoundOp::register_impl(m);
+  ReciprocalOp::register_impl(m);
+  ErfOp::register_impl(m);
+  BitwiseNotOp::register_impl(m);
+  LogicalNotOp::register_impl(m);
+  SignOp::register_impl(m);
+
+  // Parameterized unary ops
+  GeluOp::register_impl(m);
+  HardtanhOp::register_impl(m);
+  LeakyReluOp::register_impl(m);
+  EluOp::register_impl(m);
+
+  // Scalar binary ops
+  AddScalarOp::register_impl(m);
+  SubScalarOp::register_impl(m);
+  MulScalarOp::register_impl(m);
+  DivScalarOp::register_impl(m);
+  PowScalarOp::register_impl(m);
+
+  // Comparison ops (tensor-tensor)
+  EqTensorOp::register_impl(m);
+  NeTensorOp::register_impl(m);
+  LtTensorOp::register_impl(m);
+  LeTensorOp::register_impl(m);
+  GtTensorOp::register_impl(m);
+  GeTensorOp::register_impl(m);
+
+  // Comparison ops (tensor-scalar)
+  EqScalarOp::register_impl(m);
+  NeScalarOp::register_impl(m);
+  LtScalarOp::register_impl(m);
+  LeScalarOp::register_impl(m);
+  GtScalarOp::register_impl(m);
+  GeScalarOp::register_impl(m);
 }
 
 } // namespace at::pyre

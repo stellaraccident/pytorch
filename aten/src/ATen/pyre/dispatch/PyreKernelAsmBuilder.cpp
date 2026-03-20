@@ -163,6 +163,24 @@ static BinaryOpInfo resolveBinaryOp(const std::string& linalg_op) {
     info.torch_op = "torch.aten.div.Tensor";
   } else if (linalg_op == "mm") {
     info.torch_op = "torch.aten.mm";
+  } else if (linalg_op == "pow") {
+    info.torch_op = "torch.aten.pow.Tensor_Tensor";
+  } else if (linalg_op == "maximum") {
+    info.torch_op = "torch.aten.maximum";
+  } else if (linalg_op == "minimum") {
+    info.torch_op = "torch.aten.minimum";
+  } else if (linalg_op == "remainder") {
+    info.torch_op = "torch.aten.remainder.Tensor";
+  } else if (linalg_op == "fmod") {
+    info.torch_op = "torch.aten.fmod.Tensor";
+  } else if (linalg_op == "bitwise_and") {
+    info.torch_op = "torch.aten.bitwise_and.Tensor";
+  } else if (linalg_op == "bitwise_or") {
+    info.torch_op = "torch.aten.bitwise_or.Tensor";
+  } else if (linalg_op == "bitwise_xor") {
+    info.torch_op = "torch.aten.bitwise_xor.Tensor";
+  } else if (linalg_op == "atan2") {
+    info.torch_op = "torch.aten.atan2";
   } else {
     TORCH_CHECK(false, "pyre: unknown binary op: ", linalg_op);
   }
@@ -483,6 +501,154 @@ std::string generateBinaryAlphaMlir(
 }
 
 // ---------------------------------------------------------------------------
+// Comparison ops (tensor-tensor) — build + generate
+// ---------------------------------------------------------------------------
+
+KernelSpec buildComparisonKernelSpec(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape,
+    c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"lhs_shape", broadcastAwareShapeStr(lhs_shape)},
+      {"rhs_shape", broadcastAwareShapeStr(rhs_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+      {"torch_op", torch_op},
+  };
+  return {kTemplate_comparison_sha1, std::move(vars)};
+}
+
+std::string generateComparisonMlir(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape,
+    c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"lhs_shape", broadcastAwareShapeStr(lhs_shape)},
+      {"rhs_shape", broadcastAwareShapeStr(rhs_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+      {"torch_op", torch_op},
+  };
+  return pyreSpliceRange(kTemplate_comparison, vars);
+}
+
+// ---------------------------------------------------------------------------
+// Comparison ops (tensor-scalar) — build + generate
+// ---------------------------------------------------------------------------
+
+KernelSpec buildComparisonScalarKernelSpec(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) shape += ",";
+    shape += "?";
+  }
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", shape}, {"out_shape", shape},
+      {"torch_op", torch_op},
+      {"scalar_decl", scalarDecl("scalar", scalar_value)},
+      {"scalar_type", scalarType(scalar_value)},
+  };
+  return {kTemplate_comparison_scalar_sha1, std::move(vars)};
+}
+
+std::string generateComparisonScalarMlir(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) shape += ",";
+    shape += "?";
+  }
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", shape}, {"out_shape", shape},
+      {"torch_op", torch_op},
+      {"scalar_decl", scalarDecl("scalar", scalar_value)},
+      {"scalar_type", scalarType(scalar_value)},
+  };
+  return pyreSpliceRange(kTemplate_comparison_scalar, vars);
+}
+
+// ---------------------------------------------------------------------------
+// Scalar binary ops — build + generate
+// ---------------------------------------------------------------------------
+
+KernelSpec buildScalarBinaryKernelSpec(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) shape += ",";
+    shape += "?";
+  }
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", shape}, {"out_shape", shape},
+      {"torch_op", torch_op},
+      {"scalar_decl", scalarDecl("scalar", scalar_value)},
+      {"scalar_type", scalarType(scalar_value)},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
+  };
+  return {kTemplate_scalar_binary_sha1, std::move(vars)};
+}
+
+std::string generateScalarBinaryMlir(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    double scalar_value,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) shape += ",";
+    shape += "?";
+  }
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", shape}, {"out_shape", shape},
+      {"torch_op", torch_op},
+      {"scalar_decl", scalarDecl("scalar", scalar_value)},
+      {"scalar_type", scalarType(scalar_value)},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
+  };
+  return pyreSpliceRange(kTemplate_scalar_binary, vars);
+}
+
+// ---------------------------------------------------------------------------
 // Unary ops — build + generate
 // ---------------------------------------------------------------------------
 
@@ -492,7 +658,10 @@ KernelSpec buildUnaryKernelSpec(
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> input_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const ArgAdapter& adapter) {
+    const ArgAdapter& adapter,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
   std::string elt = scalarTypeToTorchMlir(dtype);
 
   if (adapter.kind == ArgAdapter::kPermute) {
@@ -504,6 +673,9 @@ KernelSpec buildUnaryKernelSpec(
         {"element_type", elt}, {"func_name", func_name},
         {"input_phys_shape", phys_str}, {"input_log_shape", log_str},
         {"torch_op", scalar_op},
+        {"extra_arg_decls", extra_arg_decls},
+        {"extra_args", extra_args},
+        {"extra_arg_types", extra_arg_types},
     };
     std::string p;
     for (auto v : adapter.permutation) p += std::to_string(v) + ",";
@@ -520,6 +692,9 @@ KernelSpec buildUnaryKernelSpec(
       {"element_type", elt}, {"func_name", func_name},
       {"input_shape", shape}, {"out_shape", shape},
       {"torch_op", scalar_op},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
   };
   return {kTemplate_elementwise_unary_sha1, std::move(vars)};
 }
@@ -530,7 +705,10 @@ std::string generateUnaryMlir(
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> input_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const ArgAdapter& adapter) {
+    const ArgAdapter& adapter,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
   std::string elt = scalarTypeToTorchMlir(dtype);
 
   if (adapter.kind == ArgAdapter::kPermute) {
@@ -550,9 +728,11 @@ std::string generateUnaryMlir(
        << "      %input_phys: " << phys_type << "\n"
        << "  ) attributes {torch.assume_strict_symbolic_shapes} {\n"
        << emitPermuteLines("input", "input_phys",
-              inversePerm(adapter.permutation), phys_type, log_type) << "\n"
-       << "    %result = " << scalar_op << " %input : "
-       << log_type << " -> " << out_type << "\n"
+              inversePerm(adapter.permutation), phys_type, log_type) << "\n";
+    if (!extra_arg_decls.empty())
+      ss << "    " << extra_arg_decls << "\n";
+    ss << "    %result = " << scalar_op << " %input" << extra_args << " : "
+       << log_type << extra_arg_types << " -> " << out_type << "\n"
        << "    torch.overwrite.tensor.contents %result overwrites %out_ : "
        << out_type << ", " << out_ttype << "\n"
        << "    return\n"
@@ -570,6 +750,9 @@ std::string generateUnaryMlir(
       {"element_type", elt}, {"func_name", func_name},
       {"input_shape", shape}, {"out_shape", shape},
       {"torch_op", scalar_op},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
   };
   return pyreSpliceRange(kTemplate_elementwise_unary, vars);
 }
