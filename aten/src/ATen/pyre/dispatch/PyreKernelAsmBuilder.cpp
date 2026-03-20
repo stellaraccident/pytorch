@@ -14,7 +14,7 @@ namespace at::pyre {
 
 std::string contentHashCacheKey(
     const char* template_sha1,
-    const std::vector<std::pair<std::string, std::string>>& substitutions,
+    const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags) {
   std::string to_hash;
   to_hash += template_sha1;
@@ -56,7 +56,7 @@ static std::string concreteShapeStr(c10::ArrayRef<int64_t> sizes) {
 }
 
 // Check if any adapter in the list is kPermute.
-static bool hasPermutedAdapter(const std::vector<ArgAdapter>& adapters) {
+static bool hasPermutedAdapter(c10::ArrayRef<ArgAdapter> adapters) {
   for (const auto& a : adapters)
     if (a.kind == ArgAdapter::kPermute) return true;
   return false;
@@ -67,7 +67,7 @@ static bool hasPermutedAdapter(const std::vector<ArgAdapter>& adapters) {
 static std::string emitPermuteLines(
     const std::string& dst_name,
     const std::string& src_name,
-    const std::vector<int64_t>& perm,
+    c10::ArrayRef<int64_t> perm,
     const std::string& src_type,
     const std::string& dst_type) {
   std::ostringstream ss;
@@ -96,8 +96,8 @@ static std::string emitPermuteLines(
 }
 
 // Compute inverse permutation.
-static std::vector<int64_t> inversePerm(const std::vector<int64_t>& perm) {
-  std::vector<int64_t> inv(perm.size());
+static c10::SmallVector<int64_t, 6> inversePerm(c10::ArrayRef<int64_t> perm) {
+  c10::SmallVector<int64_t, 6> inv(perm.size());
   for (size_t i = 0; i < perm.size(); ++i)
     inv[perm[i]] = static_cast<int64_t>(i);
   return inv;
@@ -106,11 +106,11 @@ static std::vector<int64_t> inversePerm(const std::vector<int64_t>& perm) {
 // Compute logical shape from physical shape and adapter permutation.
 // The adapter's perm is the stride-sorted order. The inverse perm
 // applied to the physical shape gives the logical shape.
-static std::vector<int64_t> logicalShape(
+static c10::SmallVector<int64_t, 6> logicalShape(
     c10::ArrayRef<int64_t> physical_shape,
-    const std::vector<int64_t>& perm) {
+    c10::ArrayRef<int64_t> perm) {
   auto inv = inversePerm(perm);
-  std::vector<int64_t> logical(perm.size());
+  c10::SmallVector<int64_t, 6> logical(perm.size());
   for (size_t i = 0; i < perm.size(); ++i)
     logical[i] = physical_shape[inv[i]];
   return logical;
@@ -199,7 +199,7 @@ static BinaryAlphaOpInfo resolveAlphaOp(
 // Shared by buildBinaryWithPermuteSpec and generateBinaryWithPermuteMlir.
 // ---------------------------------------------------------------------------
 
-static std::vector<std::pair<std::string, std::string>>
+static SubstPairs
 buildBinaryWithPermuteVars(
     const std::string& func_name,
     const std::string& torch_op,
@@ -209,7 +209,7 @@ buildBinaryWithPermuteVars(
     c10::ArrayRef<int64_t> lhs_phys_shape,
     c10::ArrayRef<int64_t> rhs_phys_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters) {
+    c10::ArrayRef<ArgAdapter> adapters) {
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto out_str = broadcastAwareShapeStr(out_shape);
 
@@ -225,16 +225,16 @@ buildBinaryWithPermuteVars(
 
   auto lhs_log_shape = lhs_permuted
       ? logicalShape(lhs_phys_shape, adapters[0].permutation)
-      : std::vector<int64_t>(lhs_phys_shape.begin(), lhs_phys_shape.end());
+      : c10::SmallVector<int64_t, 6>(lhs_phys_shape.begin(), lhs_phys_shape.end());
   auto rhs_log_shape = rhs_permuted
       ? logicalShape(rhs_phys_shape, adapters[1].permutation)
-      : std::vector<int64_t>(rhs_phys_shape.begin(), rhs_phys_shape.end());
+      : c10::SmallVector<int64_t, 6>(rhs_phys_shape.begin(), rhs_phys_shape.end());
   auto lhs_log = lhs_permuted
       ? concreteShapeStr(lhs_log_shape) : broadcastAwareShapeStr(lhs_log_shape);
   auto rhs_log = rhs_permuted
       ? concreteShapeStr(rhs_log_shape) : broadcastAwareShapeStr(rhs_log_shape);
 
-  std::vector<std::pair<std::string, std::string>> subs = {
+  SubstPairs subs = {
       {"func_name", func_name}, {"torch_op", torch_op},
       {"lhs_phys", lhs_phys}, {"rhs_phys", rhs_phys},
       {"lhs_log", lhs_log}, {"rhs_log", rhs_log},
@@ -264,7 +264,7 @@ static KernelSpec buildBinaryWithPermuteSpec(
     c10::ArrayRef<int64_t> lhs_phys_shape,
     c10::ArrayRef<int64_t> rhs_phys_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters) {
+    c10::ArrayRef<ArgAdapter> adapters) {
   auto subs = buildBinaryWithPermuteVars(
       func_name, torch_op, extra_args, extra_arg_decls,
       dtype, lhs_phys_shape, rhs_phys_shape, out_shape, adapters);
@@ -285,7 +285,7 @@ static std::string generateBinaryWithPermuteMlir(
     c10::ArrayRef<int64_t> lhs_phys_shape,
     c10::ArrayRef<int64_t> rhs_phys_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters) {
+    c10::ArrayRef<ArgAdapter> adapters) {
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto out_str = broadcastAwareShapeStr(out_shape);
 
@@ -301,10 +301,10 @@ static std::string generateBinaryWithPermuteMlir(
 
   auto lhs_log_shape = lhs_permuted
       ? logicalShape(lhs_phys_shape, adapters[0].permutation)
-      : std::vector<int64_t>(lhs_phys_shape.begin(), lhs_phys_shape.end());
+      : c10::SmallVector<int64_t, 6>(lhs_phys_shape.begin(), lhs_phys_shape.end());
   auto rhs_log_shape = rhs_permuted
       ? logicalShape(rhs_phys_shape, adapters[1].permutation)
-      : std::vector<int64_t>(rhs_phys_shape.begin(), rhs_phys_shape.end());
+      : c10::SmallVector<int64_t, 6>(rhs_phys_shape.begin(), rhs_phys_shape.end());
   auto lhs_log = lhs_permuted
       ? concreteShapeStr(lhs_log_shape) : broadcastAwareShapeStr(lhs_log_shape);
   auto rhs_log = rhs_permuted
@@ -367,7 +367,7 @@ KernelSpec buildBinaryKernelSpec(
     c10::ArrayRef<int64_t> lhs_shape,
     c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters) {
+    c10::ArrayRef<ArgAdapter> adapters) {
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto info = resolveBinaryOp(linalg_op);
 
@@ -377,7 +377,7 @@ KernelSpec buildBinaryKernelSpec(
         dtype, lhs_shape, rhs_shape, out_shape, adapters);
   }
 
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"lhs_shape", broadcastAwareShapeStr(lhs_shape)},
       {"rhs_shape", broadcastAwareShapeStr(rhs_shape)},
@@ -396,7 +396,7 @@ std::string generateBinaryMlir(
     c10::ArrayRef<int64_t> lhs_shape,
     c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters) {
+    c10::ArrayRef<ArgAdapter> adapters) {
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto info = resolveBinaryOp(linalg_op);
 
@@ -406,7 +406,7 @@ std::string generateBinaryMlir(
         info.extra_arg_types, dtype, lhs_shape, rhs_shape, out_shape, adapters);
   }
 
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"lhs_shape", broadcastAwareShapeStr(lhs_shape)},
       {"rhs_shape", broadcastAwareShapeStr(rhs_shape)},
@@ -415,7 +415,7 @@ std::string generateBinaryMlir(
       {"extra_arg_decls", info.extra_arg_decls},
       {"extra_arg_types", info.extra_arg_types},
   };
-  return pyreSplice(kTemplate_elementwise_binary, vars);
+  return pyreSpliceRange(kTemplate_elementwise_binary, vars);
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +430,7 @@ KernelSpec buildBinaryAlphaKernelSpec(
     c10::ArrayRef<int64_t> lhs_shape,
     c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters) {
+    c10::ArrayRef<ArgAdapter> adapters) {
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto info = resolveAlphaOp(alpha_add_op, alpha_value);
 
@@ -440,7 +440,7 @@ KernelSpec buildBinaryAlphaKernelSpec(
         dtype, lhs_shape, rhs_shape, out_shape, adapters);
   }
 
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"lhs_shape", broadcastAwareShapeStr(lhs_shape)},
       {"rhs_shape", broadcastAwareShapeStr(rhs_shape)},
@@ -460,7 +460,7 @@ std::string generateBinaryAlphaMlir(
     c10::ArrayRef<int64_t> lhs_shape,
     c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters) {
+    c10::ArrayRef<ArgAdapter> adapters) {
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto info = resolveAlphaOp(alpha_add_op, alpha_value);
 
@@ -470,7 +470,7 @@ std::string generateBinaryAlphaMlir(
         ", !torch.int", dtype, lhs_shape, rhs_shape, out_shape, adapters);
   }
 
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"lhs_shape", broadcastAwareShapeStr(lhs_shape)},
       {"rhs_shape", broadcastAwareShapeStr(rhs_shape)},
@@ -479,7 +479,7 @@ std::string generateBinaryAlphaMlir(
       {"extra_arg_decls", info.alpha_decl},
       {"extra_arg_types", ", !torch.int"},
   };
-  return pyreSplice(kTemplate_elementwise_binary, vars);
+  return pyreSpliceRange(kTemplate_elementwise_binary, vars);
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +500,7 @@ KernelSpec buildUnaryKernelSpec(
     auto log_shape = logicalShape(input_shape, adapter.permutation);
     auto log_str = concreteShapeStr(log_shape);
 
-    std::vector<std::pair<std::string, std::string>> subs = {
+    SubstPairs subs = {
         {"element_type", elt}, {"func_name", func_name},
         {"input_phys_shape", phys_str}, {"input_log_shape", log_str},
         {"torch_op", scalar_op},
@@ -516,7 +516,7 @@ KernelSpec buildUnaryKernelSpec(
     if (i > 0) shape += ",";
     shape += "?";
   }
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"input_shape", shape}, {"out_shape", shape},
       {"torch_op", scalar_op},
@@ -566,12 +566,12 @@ std::string generateUnaryMlir(
     if (i > 0) shape += ",";
     shape += "?";
   }
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"input_shape", shape}, {"out_shape", shape},
       {"torch_op", scalar_op},
   };
-  return pyreSplice(kTemplate_elementwise_unary, vars);
+  return pyreSpliceRange(kTemplate_elementwise_unary, vars);
 }
 
 // ---------------------------------------------------------------------------
@@ -585,7 +585,7 @@ KernelSpec buildMmKernelSpec(
     c10::ArrayRef<int64_t> mat2_shape,
     c10::ArrayRef<int64_t> out_shape) {
   std::string elt = scalarTypeToTorchMlir(dtype);
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
       {"mat2_shape", broadcastAwareShapeStr(mat2_shape)},
@@ -601,13 +601,13 @@ std::string generateMmMlir(
     c10::ArrayRef<int64_t> mat2_shape,
     c10::ArrayRef<int64_t> out_shape) {
   std::string elt = scalarTypeToTorchMlir(dtype);
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
       {"mat2_shape", broadcastAwareShapeStr(mat2_shape)},
       {"out_shape", broadcastAwareShapeStr(out_shape)},
   };
-  return pyreSplice(kTemplate_mm, vars);
+  return pyreSpliceRange(kTemplate_mm, vars);
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +623,7 @@ KernelSpec buildAddmmKernelSpec(
     c10::ArrayRef<int64_t> out_shape,
     double beta, double alpha) {
   std::string elt = scalarTypeToTorchMlir(dtype);
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"bias_shape", broadcastAwareShapeStr(bias_shape)},
       {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
@@ -646,7 +646,7 @@ std::string generateAddmmMlir(
     c10::ArrayRef<int64_t> out_shape,
     double beta, double alpha) {
   std::string elt = scalarTypeToTorchMlir(dtype);
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"bias_shape", broadcastAwareShapeStr(bias_shape)},
       {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
@@ -657,7 +657,7 @@ std::string generateAddmmMlir(
       {"beta_type", scalarType(beta)},
       {"alpha_type", scalarType(alpha)},
   };
-  return pyreSplice(kTemplate_addmm, vars);
+  return pyreSpliceRange(kTemplate_addmm, vars);
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +675,7 @@ KernelSpec buildAddmmTransposedKernelSpec(
   std::string elt = scalarTypeToTorchMlir(dtype);
   std::string mat2_t = broadcastAwareShapeStr(
       {mat2_orig_shape[1], mat2_orig_shape[0]});
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"bias_shape", broadcastAwareShapeStr(bias_shape)},
       {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
@@ -701,7 +701,7 @@ std::string generateAddmmTransposedMlir(
   std::string elt = scalarTypeToTorchMlir(dtype);
   std::string mat2_t = broadcastAwareShapeStr(
       {mat2_orig_shape[1], mat2_orig_shape[0]});
-  std::vector<std::pair<std::string, std::string>> vars = {
+  SubstPairs vars = {
       {"element_type", elt}, {"func_name", func_name},
       {"bias_shape", broadcastAwareShapeStr(bias_shape)},
       {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
@@ -713,7 +713,43 @@ std::string generateAddmmTransposedMlir(
       {"beta_type", scalarType(beta)},
       {"alpha_type", scalarType(alpha)},
   };
-  return pyreSplice(kTemplate_addmm_transposed, vars);
+  return pyreSpliceRange(kTemplate_addmm_transposed, vars);
+}
+
+// ---------------------------------------------------------------------------
+// PyreKernelAsmFragments
+// ---------------------------------------------------------------------------
+
+PyreKernelAsmFragments::PyreKernelAsmFragments(
+    std::initializer_list<std::string_view> fragments)
+    : fragments_(fragments.begin(), fragments.end()) {
+  // Compute combined SHA1 of all fragment texts.
+  std::string all;
+  for (const auto& f : fragments_) {
+    all.append(f.data(), f.size());
+    all += '\0';
+  }
+  combined_digest_ = c10::sha1(all).str();
+}
+
+std::string PyreKernelAsmFragments::digest(
+    c10::ArrayRef<std::string> compiler_flags,
+    const std::function<void(PyreKernelAsmBuilder&)>& recipe) const {
+  PyreKernelAsmBuilder builder(*this, PyreKernelAsmBuilder::Mode::kDigest);
+  recipe(builder);
+  // Append compiler flags to the hash input.
+  for (const auto& flag : compiler_flags) {
+    builder.hash_input_ += flag;
+    builder.hash_input_ += '\0';
+  }
+  return builder.finish();
+}
+
+std::string PyreKernelAsmFragments::generateMlir(
+    const std::function<void(PyreKernelAsmBuilder&)>& recipe) const {
+  PyreKernelAsmBuilder builder(*this, PyreKernelAsmBuilder::Mode::kGenerate);
+  recipe(builder);
+  return builder.finish();
 }
 
 } // namespace at::pyre

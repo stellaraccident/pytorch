@@ -58,10 +58,12 @@ std::string buildUnaryMlir(
     const OpContext& ctx);
 
 // Compile-and-cache, returning the cached entry.
+// AbiConfig controls compiler flags and function resolution.
 CachedKernel* getOrCompile(
     const std::string& cache_key,
     const std::string& func_name,
-    const std::string& mlir);
+    const std::string& mlir,
+    const AbiConfig& abi = AbiConfig::kTorchTyped);
 
 // Invoke a kernel with the given inputs, producing an output tensor.
 at::Tensor invokeKernel(

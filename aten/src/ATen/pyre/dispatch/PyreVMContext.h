@@ -2,6 +2,7 @@
 
 // VM dispatch context: load compiled kernels and resolve entry points.
 
+#include <ATen/pyre/dispatch/PyreAbiConfig.h>
 #include <ATen/pyre/dispatch/PyreKernelCompiler.h>
 #include <c10/pyre/impl/PyreHelpers.h>
 
@@ -18,9 +19,9 @@ struct CachedKernel {
 };
 
 // Load a compiled VMFB into a ready-to-dispatch CachedKernel.
-// Takes ownership of the CompilerOutput.
 CachedKernel loadKernel(
     std::shared_ptr<CompilerOutput> vmfb,
-    const std::string& func_name);
+    const std::string& func_name,
+    const AbiConfig& abi = AbiConfig::kTorchTyped);
 
 } // namespace at::pyre

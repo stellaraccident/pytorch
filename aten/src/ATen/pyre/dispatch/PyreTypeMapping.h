@@ -61,4 +61,17 @@ inline bool isFloatDtype(c10::ScalarType dtype) {
   }
 }
 
+// Element size → native IREE signless integer type string.
+// For data movement kernels (copy, fill) that use opaque bit-width types.
+inline const char* elementSizeToNativeInt(int64_t element_size) {
+  switch (element_size) {
+    case 1: return "i8";
+    case 2: return "i16";
+    case 4: return "i32";
+    case 8: return "i64";
+    default:
+      TORCH_CHECK(false, "pyre: unsupported element size ", element_size);
+  }
+}
+
 } // namespace at::pyre

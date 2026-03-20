@@ -3,6 +3,7 @@
 // Three-tier kernel cache: in-memory → disk → system → compile.
 // Uses std::mutex (matching PyTorch convention).
 
+#include <ATen/pyre/dispatch/PyreAbiConfig.h>
 #include <ATen/pyre/dispatch/PyreKernelCompiler.h>
 #include <ATen/pyre/dispatch/PyreVMContext.h>
 
@@ -17,12 +18,14 @@ class PyreKernelCache {
  public:
   // Returns cached kernel or nullptr on miss.
   CachedKernel* lookup(const std::string& cache_key,
-                        const std::string& func_name);
+                        const std::string& func_name,
+                        const AbiConfig& abi = AbiConfig::kTorchTyped);
 
   // Store a compiled kernel. Returns pointer to stored entry.
   CachedKernel* store(const std::string& cache_key,
                        const std::string& func_name,
-                       std::shared_ptr<CompilerOutput> vmfb);
+                       std::shared_ptr<CompilerOutput> vmfb,
+                       const AbiConfig& abi = AbiConfig::kTorchTyped);
 
   // Disk cache operations.
   std::shared_ptr<CompilerOutput> loadFromDisk(const std::string& cache_key);

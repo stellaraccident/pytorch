@@ -52,6 +52,7 @@ list(APPEND ATen_CPU_TEST_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/xla_tensor_test.cpp
   # Fix this.
   # ${CMAKE_CURRENT_SOURCE_DIR}/xnnpack_test.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/pyre_strided_copy_plan_test.cpp
   )
 
 list(APPEND ATen_CUDA_TEST_SRCS

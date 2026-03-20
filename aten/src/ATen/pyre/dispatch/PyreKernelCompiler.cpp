@@ -348,26 +348,28 @@ CompilerResult PyreKernelCompiler::compileCAPI(
 // -------------------------------------------------------------------------- //
 
 std::shared_future<CompilerResult> PyreKernelCompiler::compile(
-    std::string mlir_asm,
-    std::vector<std::string> flags) {
+    const std::string& mlir_asm,
+    c10::ArrayRef<std::string> flags) {
   TORCH_CHECK(isAvailable(),
       "pyre: IREE compiler not available. "
       "Set PYRE_IREE_COMPILE or PYRE_IREE_COMPILER_LIB.");
 
-  // Epic 1: synchronous, wrapped in a future for API compatibility.
+  // compileCLI/compileCAPI take const vector<string>&.
+  std::vector<std::string> flag_vec(flags.begin(), flags.end());
+
   std::promise<CompilerResult> promise;
   if (use_cli_) {
-    promise.set_value(compileCLI(mlir_asm, flags));
+    promise.set_value(compileCLI(mlir_asm, flag_vec));
   } else {
-    promise.set_value(compileCAPI(mlir_asm, flags));
+    promise.set_value(compileCAPI(mlir_asm, flag_vec));
   }
   return promise.get_future().share();
 }
 
 std::shared_ptr<CompilerOutput> PyreKernelCompiler::compileSync(
-    std::string mlir_asm,
-    std::vector<std::string> flags) {
-  auto result = compile(std::move(mlir_asm), std::move(flags)).get();
+    const std::string& mlir_asm,
+    c10::ArrayRef<std::string> flags) {
+  auto result = compile(mlir_asm, flags).get();
   TORCH_CHECK(result.ok(), "pyre: compilation failed: ", result.error_message);
   return result.output;
 }

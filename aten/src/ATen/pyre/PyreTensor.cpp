@@ -129,6 +129,75 @@ void PyreTensor::readToHost(
 }
 
 // -------------------------------------------------------------------------- //
+// Batched copy plan execution (Tier 0 / Tier 1)
+// -------------------------------------------------------------------------- //
+
+void executeCopyPlan(
+    const CopyPlan& plan,
+    iree_hal_buffer_t* src_buffer,
+    iree_hal_buffer_t* dst_buffer,
+    c10::pyre::PyreDevice* device,
+    c10::pyre::PyreBufferContext* src_ctx,
+    c10::pyre::PyreBufferContext* dst_ctx) {
+  TORCH_CHECK(plan.tier == CopyPlan::kSingleCopy ||
+              plan.tier == CopyPlan::kDecomposed,
+      "pyre: executeCopyPlan only handles Tier 0/1 plans");
+  TORCH_CHECK(!plan.chunks.empty(), "pyre: empty copy plan");
+
+  PYRE_LOG(INFO) << "executeCopyPlan: " << plan.chunks.size()
+                 << " chunks, tier=" << static_cast<int>(plan.tier) << "\n";
+
+  // Build transfer commands from chunks.
+  std::vector<iree_hal_transfer_command_t> cmds;
+  cmds.reserve(plan.chunks.size());
+  for (const auto& chunk : plan.chunks) {
+    iree_hal_transfer_command_t cmd = {};
+    cmd.type = IREE_HAL_TRANSFER_COMMAND_TYPE_COPY;
+    cmd.copy.source_buffer = src_buffer;
+    cmd.copy.source_offset = static_cast<iree_device_size_t>(chunk.src_offset);
+    cmd.copy.target_buffer = dst_buffer;
+    cmd.copy.target_offset = static_cast<iree_device_size_t>(chunk.dst_offset);
+    cmd.copy.length = static_cast<iree_device_size_t>(chunk.length);
+    cmds.push_back(cmd);
+  }
+
+  // Create batched transfer command buffer.
+  auto* hal_device = device->halDevice();
+  iree_hal_command_buffer_t* cmd_buf = nullptr;
+  PYRE_CHECK_OK(iree_hal_create_transfer_command_buffer(
+      hal_device,
+      IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_QUEUE_AFFINITY_ANY,
+      static_cast<iree_host_size_t>(cmds.size()),
+      cmds.data(),
+      &cmd_buf));
+
+  // Submit with timeline semaphore.
+  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  auto& ctx = stream.context();
+  auto* sem = ctx.timeline.get();
+  uint64_t wait_value = ctx.timepoint;
+  uint64_t signal_value = stream.advance();
+
+  iree_hal_semaphore_list_t wait_list = {
+      .count = 1, .semaphores = &sem, .payload_values = &wait_value};
+  iree_hal_semaphore_list_t signal_list = {
+      .count = 1, .semaphores = &sem, .payload_values = &signal_value};
+
+  PYRE_CHECK_OK(iree_hal_device_queue_execute(
+      hal_device, IREE_HAL_QUEUE_AFFINITY_ANY,
+      wait_list, signal_list, cmd_buf,
+      iree_hal_buffer_binding_table_empty(),
+      IREE_HAL_EXECUTE_FLAG_NONE));
+
+  iree_hal_command_buffer_release(cmd_buf);
+
+  // Record timeline barriers.
+  src_ctx->recordUse(sem, signal_value);
+  dst_ctx->recordMutation(sem, signal_value);
+}
+
+// -------------------------------------------------------------------------- //
 // Buffer view bridge
 // -------------------------------------------------------------------------- //
 
@@ -148,12 +217,42 @@ c10::pyre::hal_buffer_view_ptr buildBufferView(const at::Tensor& tensor) {
       tensor.storage().data_ptr().get_context());
   auto iree_dtype = scalarTypeToHalElement(tensor.scalar_type());
   auto sizes = tensor.sizes();
-  std::vector<iree_hal_dim_t> shape(sizes.begin(), sizes.end());
+  c10::SmallVector<iree_hal_dim_t, 6> shape(sizes.begin(), sizes.end());
 
   iree_hal_buffer_view_t* view = nullptr;
   PYRE_CHECK_OK(iree_hal_buffer_view_create(
       ctx->buffer.get(), shape.size(), shape.data(),
       iree_dtype, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      c10::pyre::PyreRuntime::get().hostAllocator(), &view));
+
+  return c10::pyre::hal_buffer_view_ptr::steal(view);
+}
+
+c10::pyre::hal_buffer_view_ptr buildOpaqueBufferView(const at::Tensor& tensor) {
+  TORCH_CHECK(hasPyreBuffer(tensor),
+      "pyre: tensor has no IREE buffer (CPU fallback tensor?)");
+
+  auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+      tensor.storage().data_ptr().get_context());
+  auto sizes = tensor.sizes();
+  c10::SmallVector<iree_hal_dim_t, 6> shape(sizes.begin(), sizes.end());
+
+  // Map element size to opaque integer HAL element type.
+  iree_hal_element_type_t opaque_type;
+  switch (tensor.element_size()) {
+    case 1: opaque_type = IREE_HAL_ELEMENT_TYPE_SINT_8; break;
+    case 2: opaque_type = IREE_HAL_ELEMENT_TYPE_SINT_16; break;
+    case 4: opaque_type = IREE_HAL_ELEMENT_TYPE_SINT_32; break;
+    case 8: opaque_type = IREE_HAL_ELEMENT_TYPE_SINT_64; break;
+    default:
+      TORCH_CHECK(false, "pyre: unsupported element size for opaque view: ",
+                  tensor.element_size());
+  }
+
+  iree_hal_buffer_view_t* view = nullptr;
+  PYRE_CHECK_OK(iree_hal_buffer_view_create(
+      ctx->buffer.get(), shape.size(), shape.data(),
+      opaque_type, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
       c10::pyre::PyreRuntime::get().hostAllocator(), &view));
 
   return c10::pyre::hal_buffer_view_ptr::steal(view);

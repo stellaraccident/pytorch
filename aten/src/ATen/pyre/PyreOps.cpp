@@ -119,19 +119,17 @@ std::string buildUnaryMlir(
 CachedKernel* getOrCompile(
     const std::string& cache_key,
     const std::string& func_name,
-    const std::string& mlir) {
+    const std::string& mlir,
+    const AbiConfig& abi) {
   PYRE_LOG(INFO) << "cache MISS: " << cache_key << ", compiling\n";
   PYRE_LOG(DEBUG) << "MLIR:\n" << mlir << "\n";
 
   auto vmfb = PyreKernelCompiler::compileSync(
-      std::string(mlir),
-      std::vector<std::string>(
-          c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags().begin(),
-          c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags().end()));
+      std::string(mlir), abi.compilerFlags());
 
   PYRE_LOG(INFO) << "compiled " << vmfb->size() << " bytes\n";
   auto& cache = PyreKernelCache::get();
-  return cache.store(cache_key, func_name, std::move(vmfb));
+  return cache.store(cache_key, func_name, std::move(vmfb), abi);
 }
 
 at::Tensor invokeKernel(

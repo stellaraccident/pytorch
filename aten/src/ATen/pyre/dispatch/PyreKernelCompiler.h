@@ -13,6 +13,7 @@
 
 #include <c10/macros/Export.h>
 #include <c10/pyre/impl/PyreHelpers.h>
+#include <c10/util/ArrayRef.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -78,16 +79,15 @@ class TORCH_PYRE_API PyreKernelCompiler {
   static bool initialize();
   static bool isAvailable();
 
-  // Compile MLIR text to VMFB. Takes ownership of mlir_asm (move).
-  // Returns a future that resolves to CompilerResult.
+  // Compile MLIR text to VMFB. Returns a future (currently synchronous).
   static std::shared_future<CompilerResult> compile(
-      std::string mlir_asm,
-      std::vector<std::string> flags);
+      const std::string& mlir_asm,
+      c10::ArrayRef<std::string> flags);
 
   // Convenience: compile and block. TORCH_CHECK on failure.
   static std::shared_ptr<CompilerOutput> compileSync(
-      std::string mlir_asm,
-      std::vector<std::string> flags);
+      const std::string& mlir_asm,
+      c10::ArrayRef<std::string> flags);
 
  private:
   static std::once_flag init_flag_;

@@ -8,6 +8,7 @@
 #include <iree/hal/api.h>
 
 #include <ATen/core/Tensor.h>
+#include <ATen/pyre/dispatch/StridedCopyPlan.h>
 #include <c10/pyre/impl/PyreStorage.h>
 #include <c10/pyre/impl/PyreDevice.h>
 #include <c10/pyre/impl/PyreStream.h>
@@ -47,7 +48,20 @@ class PyreTensor {
 // Check if a tensor has a real pyre IREE buffer (vs CPU fallback backing).
 bool hasPyreBuffer(const at::Tensor& tensor);
 
+// Execute a Tier 0 or Tier 1 copy plan as batched HAL transfer commands.
+void executeCopyPlan(
+    const CopyPlan& plan,
+    iree_hal_buffer_t* src_buffer,
+    iree_hal_buffer_t* dst_buffer,
+    c10::pyre::PyreDevice* device,
+    c10::pyre::PyreBufferContext* src_ctx,
+    c10::pyre::PyreBufferContext* dst_ctx);
+
 // Build an IREE buffer view wrapping a tensor's HAL buffer (RAII).
 c10::pyre::hal_buffer_view_ptr buildBufferView(const at::Tensor& tensor);
+
+// Build a buffer view using opaque integer element types (by bitwidth).
+// For data movement kernels where the MLIR uses si8/si16/si32/si64.
+c10::pyre::hal_buffer_view_ptr buildOpaqueBufferView(const at::Tensor& tensor);
 
 } // namespace at::pyre

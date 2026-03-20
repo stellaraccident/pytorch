@@ -7,25 +7,32 @@
 //   generateMlir   — expensive, called only on cache miss
 
 #include <ATen/pyre/dispatch/PyreArgAdapter.h>
+#include <ATen/pyre/dispatch/PyreStringSplicer.h>
 #include <ATen/pyre/dispatch/PyreTypeMapping.h>
 #include <c10/util/ArrayRef.h>
+#include <c10/util/SmallVector.h>
+#include <c10/util/hash.h>
 
+#include <functional>
+#include <initializer_list>
 #include <string>
+#include <string_view>
 #include <utility>
-#include <vector>
 
 namespace at::pyre {
 
 // Substitution pairs + template identity — enough to compute cache key.
+using SubstPairs = c10::SmallVector<std::pair<std::string, std::string>, 16>;
+
 struct KernelSpec {
   const char* template_sha1;
-  std::vector<std::pair<std::string, std::string>> substitutions;
+  SubstPairs substitutions;
 };
 
 // Content-hash cache key: SHA1 of template digest + substitutions + flags.
 std::string contentHashCacheKey(
     const char* template_sha1,
-    const std::vector<std::pair<std::string, std::string>>& substitutions,
+    const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
 // --- Binary ops ---
@@ -35,14 +42,14 @@ KernelSpec buildBinaryKernelSpec(
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters);
+    c10::ArrayRef<ArgAdapter> adapters);
 
 std::string generateBinaryMlir(
     const std::string& func_name, const std::string& linalg_op,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters);
+    c10::ArrayRef<ArgAdapter> adapters);
 
 // --- Binary with alpha ---
 
@@ -51,14 +58,14 @@ KernelSpec buildBinaryAlphaKernelSpec(
     double alpha_value, c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters);
+    c10::ArrayRef<ArgAdapter> adapters);
 
 std::string generateBinaryAlphaMlir(
     const std::string& func_name, const std::string& alpha_add_op,
     double alpha_value, c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
     c10::ArrayRef<int64_t> out_shape,
-    const std::vector<ArgAdapter>& adapters);
+    c10::ArrayRef<ArgAdapter> adapters);
 
 // --- Unary ops ---
 
@@ -113,5 +120,82 @@ std::string generateAddmmTransposedMlir(
     c10::ArrayRef<int64_t> bias_shape, c10::ArrayRef<int64_t> mat1_shape,
     c10::ArrayRef<int64_t> mat2_orig_shape, c10::ArrayRef<int64_t> out_shape,
     double beta, double alpha);
+
+// ---------------------------------------------------------------------------
+// PyreKernelAsmFragments + PyreKernelAsmBuilder
+//
+// Two-mode builder for procedurally generated MLIR. Separates cache key
+// hashing (hot path, no string generation) from MLIR generation (miss path).
+// ---------------------------------------------------------------------------
+
+class PyreKernelAsmBuilder;
+
+class PyreKernelAsmFragments {
+ public:
+  PyreKernelAsmFragments(std::initializer_list<std::string_view> fragments);
+
+  std::string_view fragment(size_t index) const { return fragments_[index]; }
+
+  // SHA1 of all fragment texts concatenated. Computed once at construction.
+  const std::string& combinedDigest() const { return combined_digest_; }
+
+  // Hot path: replay recipe in digest mode. Returns cache key string.
+  std::string digest(
+      c10::ArrayRef<std::string> compiler_flags,
+      const std::function<void(PyreKernelAsmBuilder&)>& recipe) const;
+
+  // Miss path: replay recipe in generate mode. Returns full MLIR string.
+  std::string generateMlir(
+      const std::function<void(PyreKernelAsmBuilder&)>& recipe) const;
+
+ private:
+  c10::SmallVector<std::string_view, 8> fragments_;
+  std::string combined_digest_;
+};
+
+class PyreKernelAsmBuilder {
+ public:
+  enum class Mode { kDigest, kGenerate };
+
+  // Append a fragment with substitutions. Inline so the compiler can
+  // optimize out the mode branch and dead code per call site.
+  inline void appendFragment(
+      size_t index,
+      std::initializer_list<std::pair<std::string_view, std::string_view>> substs) {
+    if (mode_ == Mode::kDigest) {
+      // Accumulate only substitution values for hashing.
+      // Fragment identity is covered by the combined digest.
+      for (const auto& [key, value] : substs) {
+        hash_input_.append(value.data(), value.size());
+        hash_input_ += '\0';
+      }
+    } else {
+      // Splice fragment text with substitutions, append to output.
+      mlir_ += pyreSplice(fragments_->fragment(index), substs);
+    }
+  }
+
+ private:
+  friend class PyreKernelAsmFragments;
+  static constexpr size_t kHashInputReserve = 256;
+
+  PyreKernelAsmBuilder(const PyreKernelAsmFragments& frags, Mode mode)
+      : fragments_(&frags), mode_(mode) {
+    if (mode == Mode::kDigest) {
+      hash_input_.reserve(kHashInputReserve);
+      hash_input_ = frags.combinedDigest();
+    }
+  }
+
+  std::string finish() {
+    if (mode_ == Mode::kDigest) return c10::sha1(hash_input_).str();
+    return std::move(mlir_);
+  }
+
+  const PyreKernelAsmFragments* fragments_;
+  Mode mode_;
+  std::string hash_input_;  // kDigest: combined digest + substitution values
+  std::string mlir_;        // kGenerate: accumulated MLIR text
+};
 
 } // namespace at::pyre
