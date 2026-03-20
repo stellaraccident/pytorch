@@ -754,6 +754,74 @@ std::string generateReductionMlir(
 }
 
 // ---------------------------------------------------------------------------
+// Single-dim reduction ops — build + generate
+// ---------------------------------------------------------------------------
+
+KernelSpec buildSingleDimReductionKernelSpec(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    c10::ArrayRef<int64_t> out_shape,
+    int64_t dim,
+    bool keepdim,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) in_shape += ",";
+    in_shape += "?";
+  }
+  auto out_str = reducedShapeStr(input_shape, {dim}, keepdim);
+
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", in_shape}, {"out_shape", out_str},
+      {"torch_op", torch_op},
+      {"dim", std::to_string(dim)},
+      {"keepdim", keepdim ? "true" : "false"},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
+  };
+  return {kTemplate_reduction_single_dim_sha1, std::move(vars)};
+}
+
+std::string generateSingleDimReductionMlir(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    c10::ArrayRef<int64_t> out_shape,
+    int64_t dim,
+    bool keepdim,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) in_shape += ",";
+    in_shape += "?";
+  }
+  auto out_str = reducedShapeStr(input_shape, {dim}, keepdim);
+
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", in_shape}, {"out_shape", out_str},
+      {"torch_op", torch_op},
+      {"dim", std::to_string(dim)},
+      {"keepdim", keepdim ? "true" : "false"},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
+  };
+  return pyreSpliceRange(kTemplate_reduction_single_dim, vars);
+}
+
+// ---------------------------------------------------------------------------
 // Comparison ops (tensor-tensor) — build + generate
 // ---------------------------------------------------------------------------
 

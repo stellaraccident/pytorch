@@ -95,6 +95,26 @@ std::string generateReductionMlir(
     const std::string& extra_args = "",
     const std::string& extra_arg_types = "");
 
+// --- Single-dim reduction ops ---
+
+KernelSpec buildSingleDimReductionKernelSpec(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    int64_t dim, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+std::string generateSingleDimReductionMlir(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    int64_t dim, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
 // --- Comparison ops (tensor-tensor) ---
 
 KernelSpec buildComparisonKernelSpec(

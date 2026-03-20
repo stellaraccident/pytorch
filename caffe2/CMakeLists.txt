@@ -1251,6 +1251,7 @@ if(USE_PYRE)
     ${PYRE_TEMPLATE_DIR}/comparison.mlir
     ${PYRE_TEMPLATE_DIR}/comparison_scalar.mlir
     ${PYRE_TEMPLATE_DIR}/reduction.mlir
+    ${PYRE_TEMPLATE_DIR}/reduction_single_dim.mlir
     ${PYRE_TEMPLATE_DIR}/type_cast.mlir
     ${PYRE_TEMPLATE_DIR}/bmm.mlir
     ${PYRE_TEMPLATE_DIR}/where.mlir

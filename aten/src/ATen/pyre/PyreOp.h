@@ -110,21 +110,59 @@ struct PyreOp {
   static at::Tensor dispatch(
       c10::ArrayRef<at::Tensor> raw_inputs,
       c10::ArrayRef<at::Scalar> scalars) {
-    for (const auto& t : raw_inputs)
+    // Promote 0-dim CPU scalar tensors to the target device (matches CUDA).
+    c10::Device target_device = c10::kCPU;
+    for (const auto& t : raw_inputs) {
+      if (t.device().type() != c10::DeviceType::CPU) {
+        target_device = t.device();
+        break;
+      }
+    }
+    c10::SmallVector<at::Tensor, 4> promoted_storage;
+    auto effective_inputs = raw_inputs;
+    if (target_device.type() != c10::DeviceType::CPU) {
+      bool need_promote = false;
+      for (const auto& t : raw_inputs) {
+        if (t.dim() == 0 && t.device().type() == c10::DeviceType::CPU) {
+          need_promote = true;
+          break;
+        }
+      }
+      if (need_promote) {
+        // Find dtype from first device tensor for scalar casting
+        auto target_dtype = effective_inputs[0].scalar_type();
+        for (const auto& t : raw_inputs) {
+          if (t.device() == target_device) {
+            target_dtype = t.scalar_type();
+            break;
+          }
+        }
+        for (const auto& t : raw_inputs) {
+          if (t.dim() == 0 && t.device().type() == c10::DeviceType::CPU)
+            promoted_storage.push_back(
+                t.to(target_device, target_dtype));
+          else
+            promoted_storage.push_back(t);
+        }
+        effective_inputs = promoted_storage;
+      }
+    }
+
+    for (const auto& t : effective_inputs)
       TORCH_CHECK(hasPyreBuffer(t), "pyre: ", Derived::aten_name,
           " requires tensors with IREE buffers");
 
-    auto dtype = raw_inputs[0].scalar_type();
+    auto dtype = effective_inputs[0].scalar_type();
 
     auto decision = ArgShapeSpecializer().analyze(
-        Derived::aten_name, dtype, raw_inputs,
+        Derived::aten_name, dtype, effective_inputs,
         c10::pyre::PyreDevice::get(0)->capabilities());
 
     auto adapted = applyAdapters(
-        {raw_inputs.begin(), raw_inputs.end()},
+        {effective_inputs.begin(), effective_inputs.end()},
         decision.arg_adapters);
 
-    OpContext ctx{adapted, raw_inputs, scalars, dtype, decision};
+    OpContext ctx{adapted, effective_inputs, scalars, dtype, decision};
 
     auto out_shape  = Derived::inferShape(ctx);
     auto func_name  = Derived::buildFuncName(ctx);
@@ -873,14 +911,45 @@ struct AminOp : ReductionOp<AminOp> {
   }
 };
 
-struct ProdOp : ReductionOp<ProdOp> {
+struct ProdOp : PyreOp<ProdOp> {
   static constexpr const char* aten_name = "prod.dim_int";
   static constexpr const char* torch_op = "torch.aten.prod.dim_int";
-  static constexpr bool has_dtype_arg = true;
+
   static at::Tensor impl(
       const at::Tensor& self, int64_t dim,
-      bool keepdim, std::optional<at::ScalarType> dtype) {
-    return impl_single_dim(self, dim, keepdim, dtype);
+      bool keepdim, std::optional<at::ScalarType> /*dtype*/) {
+    TORCH_CHECK(hasPyreBuffer(self), "pyre: prod requires IREE buffers");
+
+    auto dtype = self.scalar_type();
+    if (dim < 0) dim += self.dim();
+
+    auto out_shape = inferReducedShape(self.sizes(), {dim}, keepdim);
+    auto func_name = funcNameDefault(aten_name);
+
+    std::string extra_decls = "    %none = torch.constant.none";
+    std::string extra_args = ", %none";
+    std::string extra_types = ", !torch.none";
+
+    auto spec = buildSingleDimReductionKernelSpec(
+        func_name, torch_op, dtype,
+        self.sizes(), out_shape, dim, keepdim,
+        extra_decls, extra_args, extra_types);
+
+    auto cache_key = contentHashCacheKey(
+        spec.template_sha1, spec.substitutions,
+        c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+    auto& cache = PyreKernelCache::get();
+    auto* kernel = cache.lookup(cache_key, func_name);
+    if (!kernel) {
+      auto mlir = generateSingleDimReductionMlir(
+          func_name, torch_op, dtype,
+          self.sizes(), out_shape, dim, keepdim,
+          extra_decls, extra_args, extra_types);
+      kernel = getOrCompile(cache_key, func_name, mlir);
+    }
+
+    return invokeKernel(kernel, {self}, out_shape, self.options());
   }
 };
 

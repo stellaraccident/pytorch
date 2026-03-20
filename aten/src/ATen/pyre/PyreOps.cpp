@@ -453,7 +453,7 @@ void registerCompiledOps(torch::Library& m) {
   MeanOp::register_impl(m);
   AmaxOp::register_impl(m);
   AminOp::register_impl(m);
-  // ProdOp skipped: prod.dim_int takes single int, not list — needs separate template
+  ProdOp::register_impl(m);
 
   // Type cast, bmm, where, cat
   TypeCastOp::register_impl(m);
