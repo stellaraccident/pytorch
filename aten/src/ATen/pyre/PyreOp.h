@@ -19,6 +19,11 @@
 #include <ATen/pyre/dispatch/PyreTypeMapping.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/Functions.h>
+#ifdef AT_PER_OPERATOR_HEADERS
+#include <ATen/ops/_to_copy_native.h>
+#else
+#include <ATen/NativeFunctions.h>
+#endif
 #include <c10/core/Scalar.h>
 #include <c10/pyre/impl/PyreDevice.h>
 
@@ -720,6 +725,278 @@ struct GtScalarOp : ComparisonScalarOp<GtScalarOp> {
 struct GeScalarOp : ComparisonScalarOp<GeScalarOp> {
   static constexpr const char* aten_name = "ge.Scalar";
   static constexpr const char* torch_op = "torch.aten.ge.Scalar";
+};
+
+// ---------------------------------------------------------------------------
+// Reduction ops — custom dispatch (dim list + keepdim in spec/cache key)
+// ---------------------------------------------------------------------------
+
+c10::DimVector inferReducedShape(
+    c10::IntArrayRef input_shape, c10::IntArrayRef dims, bool keepdim);
+
+// ReductionOp: sum.dim_IntList, mean.dim, amax, amin, prod.dim_int
+// Derived must define: aten_name, torch_op, has_dtype_arg (bool)
+template <typename Derived>
+struct ReductionOp : PyreOp<Derived> {
+  // sum/mean: (self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None)
+  static at::Tensor impl_with_dtype(
+      const at::Tensor& self,
+      at::OptionalIntArrayRef dim,
+      bool keepdim,
+      std::optional<at::ScalarType> /*dtype*/) {
+    c10::SmallVector<int64_t, 6> dims;
+    if (dim.has_value()) {
+      for (auto d : *dim) dims.push_back(d);
+    } else {
+      for (int64_t i = 0; i < self.dim(); ++i) dims.push_back(i);
+    }
+    return dispatchReduction(self, dims, keepdim);
+  }
+
+  // amax/amin: (self, int[1] dim=[], bool keepdim=False)
+  static at::Tensor impl_no_dtype(
+      const at::Tensor& self,
+      at::IntArrayRef dim,
+      bool keepdim) {
+    c10::SmallVector<int64_t, 6> dims(dim.begin(), dim.end());
+    if (dims.empty()) {
+      for (int64_t i = 0; i < self.dim(); ++i) dims.push_back(i);
+    }
+    return dispatchReduction(self, dims, keepdim);
+  }
+
+  // prod.dim_int: (self, int dim, bool keepdim=False, *, ScalarType? dtype=None)
+  static at::Tensor impl_single_dim(
+      const at::Tensor& self,
+      int64_t dim,
+      bool keepdim,
+      std::optional<at::ScalarType> /*dtype*/) {
+    c10::SmallVector<int64_t, 6> dims = {dim};
+    return dispatchReduction(self, dims, keepdim);
+  }
+
+  static at::Tensor dispatchReduction(
+      const at::Tensor& self,
+      c10::ArrayRef<int64_t> dims,
+      bool keepdim) {
+    TORCH_CHECK(hasPyreBuffer(self), "pyre: ", Derived::aten_name,
+        " requires tensors with IREE buffers");
+
+    auto dtype = self.scalar_type();
+    auto decision = ArgShapeSpecializer().analyze(
+        Derived::aten_name, dtype, {self},
+        c10::pyre::PyreDevice::get(0)->capabilities());
+    auto adapted = applyAdapters({self}, decision.arg_adapters);
+
+    // Normalize negative dims
+    c10::SmallVector<int64_t, 6> norm_dims;
+    for (auto d : dims) {
+      if (d < 0) d += self.dim();
+      norm_dims.push_back(d);
+    }
+
+    auto out_shape = inferReducedShape(self.sizes(), norm_dims, keepdim);
+    auto func_name = funcNameDefault(Derived::aten_name);
+
+    // Extra args for sum/mean: dtype=None
+    std::string extra_decls, extra_args, extra_types;
+    if constexpr (Derived::has_dtype_arg) {
+      extra_decls = "    %none = torch.constant.none";
+      extra_args = ", %none";
+      extra_types = ", !torch.none";
+    }
+
+    auto spec = buildReductionKernelSpec(
+        func_name, Derived::torch_op, dtype,
+        adapted[0].sizes(), out_shape, norm_dims, keepdim,
+        extra_decls, extra_args, extra_types);
+
+    auto cache_key = contentHashCacheKey(
+        spec.template_sha1, spec.substitutions,
+        c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+    auto& cache = PyreKernelCache::get();
+    auto* kernel = cache.lookup(cache_key, func_name);
+    if (!kernel) {
+      auto mlir = generateReductionMlir(
+          func_name, Derived::torch_op, dtype,
+          adapted[0].sizes(), out_shape, norm_dims, keepdim,
+          extra_decls, extra_args, extra_types);
+      kernel = getOrCompile(cache_key, func_name, mlir);
+    }
+
+    return invokeKernel(kernel, adapted, out_shape, self.options());
+  }
+};
+
+// --- Reduction ops (Epic 3) ---
+
+struct SumOp : ReductionOp<SumOp> {
+  static constexpr const char* aten_name = "sum.dim_IntList";
+  static constexpr const char* torch_op = "torch.aten.sum.dim_IntList";
+  static constexpr bool has_dtype_arg = true;
+  static at::Tensor impl(
+      const at::Tensor& self, at::OptionalIntArrayRef dim,
+      bool keepdim, std::optional<at::ScalarType> dtype) {
+    return impl_with_dtype(self, dim, keepdim, dtype);
+  }
+};
+
+struct MeanOp : ReductionOp<MeanOp> {
+  static constexpr const char* aten_name = "mean.dim";
+  static constexpr const char* torch_op = "torch.aten.mean.dim";
+  static constexpr bool has_dtype_arg = true;
+  static at::Tensor impl(
+      const at::Tensor& self, at::OptionalIntArrayRef dim,
+      bool keepdim, std::optional<at::ScalarType> dtype) {
+    return impl_with_dtype(self, dim, keepdim, dtype);
+  }
+};
+
+struct AmaxOp : ReductionOp<AmaxOp> {
+  static constexpr const char* aten_name = "amax";
+  static constexpr const char* torch_op = "torch.aten.amax";
+  static constexpr bool has_dtype_arg = false;
+  static at::Tensor impl(
+      const at::Tensor& self, at::IntArrayRef dim, bool keepdim) {
+    return impl_no_dtype(self, dim, keepdim);
+  }
+};
+
+struct AminOp : ReductionOp<AminOp> {
+  static constexpr const char* aten_name = "amin";
+  static constexpr const char* torch_op = "torch.aten.amin";
+  static constexpr bool has_dtype_arg = false;
+  static at::Tensor impl(
+      const at::Tensor& self, at::IntArrayRef dim, bool keepdim) {
+    return impl_no_dtype(self, dim, keepdim);
+  }
+};
+
+struct ProdOp : ReductionOp<ProdOp> {
+  static constexpr const char* aten_name = "prod.dim_int";
+  static constexpr const char* torch_op = "torch.aten.prod.dim_int";
+  static constexpr bool has_dtype_arg = true;
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim,
+      bool keepdim, std::optional<at::ScalarType> dtype) {
+    return impl_single_dim(self, dim, keepdim, dtype);
+  }
+};
+
+// --- TypeCastOp (_to_copy with dtype) ---
+
+struct TypeCastOp : PyreOp<TypeCastOp> {
+  static constexpr const char* aten_name = "_to_copy";
+
+  static at::Tensor impl(
+      const at::Tensor& self,
+      std::optional<at::ScalarType> dtype,
+      std::optional<at::Layout> layout,
+      std::optional<at::Device> device,
+      std::optional<bool> pin_memory,
+      bool non_blocking,
+      std::optional<at::MemoryFormat> memory_format) {
+    // Only handle dtype conversions. Fall through for layout/device/format.
+    if (!dtype.has_value() || *dtype == self.scalar_type())
+      return at::native::_to_copy(self, dtype, layout, device, pin_memory,
+                                   non_blocking, memory_format);
+    TORCH_CHECK(hasPyreBuffer(self), "pyre: _to_copy requires IREE buffers");
+
+    auto in_dtype = self.scalar_type();
+    auto out_dtype = *dtype;
+    auto func_name = funcNameDefault(aten_name);
+
+    auto spec = buildTypeCastKernelSpec(func_name, in_dtype, out_dtype, self.sizes());
+    auto cache_key = contentHashCacheKey(
+        spec.template_sha1, spec.substitutions,
+        c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+    auto& cache = PyreKernelCache::get();
+    auto* kernel = cache.lookup(cache_key, func_name);
+    if (!kernel) {
+      auto mlir = generateTypeCastMlir(func_name, in_dtype, out_dtype, self.sizes());
+      kernel = getOrCompile(cache_key, func_name, mlir);
+    }
+
+    return invokeKernel(kernel, {self}, c10::DimVector(self.sizes()),
+                        self.options().dtype(out_dtype));
+  }
+};
+
+// --- BmmOp ---
+
+struct BmmOp : PyreOp<BmmOp> {
+  static constexpr const char* aten_name = "bmm";
+
+  static at::Tensor impl(const at::Tensor& self, const at::Tensor& mat2) {
+    TORCH_CHECK(self.dim() == 3 && mat2.dim() == 3,
+        "pyre: bmm requires 3D tensors");
+    TORCH_CHECK(self.size(0) == mat2.size(0),
+        "pyre: bmm batch size mismatch");
+    TORCH_CHECK(self.size(2) == mat2.size(1),
+        "pyre: bmm inner dimension mismatch");
+    return dispatch({self, mat2}, {});
+  }
+
+  static c10::DimVector inferShape(const OpContext& ctx) {
+    return {ctx.inputs[0].size(0), ctx.inputs[0].size(1), ctx.inputs[1].size(2)};
+  }
+  static KernelSpec buildKernelSpec(
+      const std::string& func_name, const OpContext& ctx) {
+    return buildBmmKernelSpec(func_name, ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), inferShape(ctx));
+  }
+  static std::string generateMlir(
+      const std::string& func_name, const OpContext& ctx) {
+    return generateBmmMlir(func_name, ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), inferShape(ctx));
+  }
+  static std::string buildFuncName(const OpContext&) {
+    return funcNameDefault(aten_name);
+  }
+};
+
+// --- WhereOp ---
+
+struct WhereOp : PyreOp<WhereOp> {
+  static constexpr const char* aten_name = "where.self";
+
+  static at::Tensor impl(
+      const at::Tensor& condition,
+      const at::Tensor& self,
+      const at::Tensor& other) {
+    // dtype from self (not condition which is bool)
+    return dispatch({condition, self, other}, {});
+  }
+
+  static c10::DimVector inferShape(const OpContext& ctx) {
+    auto s = at::infer_size(ctx.raw_inputs[0].sizes(), ctx.raw_inputs[1].sizes());
+    return c10::DimVector(at::infer_size(s, ctx.raw_inputs[2].sizes()));
+  }
+
+  static at::TensorOptions outputOptions(const OpContext& ctx) {
+    // dtype from self (input[1]), not condition (input[0])
+    return ctx.raw_inputs[1].options();
+  }
+
+  static KernelSpec buildKernelSpec(
+      const std::string& func_name, const OpContext& ctx) {
+    auto out_shape = inferShape(ctx);
+    return buildWhereKernelSpec(func_name, ctx.raw_inputs[1].scalar_type(),
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
+        ctx.inputs[2].sizes(), out_shape);
+  }
+  static std::string generateMlir(
+      const std::string& func_name, const OpContext& ctx) {
+    auto out_shape = inferShape(ctx);
+    return generateWhereMlir(func_name, ctx.raw_inputs[1].scalar_type(),
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
+        ctx.inputs[2].sizes(), out_shape);
+  }
+  static std::string buildFuncName(const OpContext&) {
+    return funcNameDefault(aten_name);
+  }
 };
 
 // --- One-off: addmm ---

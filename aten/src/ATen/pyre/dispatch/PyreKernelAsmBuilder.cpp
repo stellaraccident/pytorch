@@ -2,6 +2,7 @@
 #include <ATen/pyre/dispatch/PyreStringSplicer.h>
 #include <c10/util/hash.h>
 
+#include <set>
 #include <sstream>
 
 // Generated template strings (build step: tools/embed_templates.py).
@@ -498,6 +499,258 @@ std::string generateBinaryAlphaMlir(
       {"extra_arg_types", ", !torch.int"},
   };
   return pyreSpliceRange(kTemplate_elementwise_binary, vars);
+}
+
+// ---------------------------------------------------------------------------
+// Type cast — build + generate
+// ---------------------------------------------------------------------------
+
+KernelSpec buildTypeCastKernelSpec(
+    const std::string& func_name,
+    c10::ScalarType in_dtype,
+    c10::ScalarType out_dtype,
+    c10::ArrayRef<int64_t> shape) {
+  std::string in_elt = scalarTypeToTorchMlir(in_dtype);
+  std::string out_elt = scalarTypeToTorchMlir(out_dtype);
+  std::string shape_str;
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) shape_str += ",";
+    shape_str += "?";
+  }
+  std::string dtype_const = "    %dtype = torch.constant.int " +
+      std::to_string(static_cast<int64_t>(out_dtype));
+  SubstPairs vars = {
+      {"in_element_type", in_elt}, {"out_element_type", out_elt},
+      {"func_name", func_name},
+      {"input_shape", shape_str}, {"out_shape", shape_str},
+      {"dtype_const", dtype_const},
+  };
+  return {kTemplate_type_cast_sha1, std::move(vars)};
+}
+
+std::string generateTypeCastMlir(
+    const std::string& func_name,
+    c10::ScalarType in_dtype,
+    c10::ScalarType out_dtype,
+    c10::ArrayRef<int64_t> shape) {
+  std::string in_elt = scalarTypeToTorchMlir(in_dtype);
+  std::string out_elt = scalarTypeToTorchMlir(out_dtype);
+  std::string shape_str;
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) shape_str += ",";
+    shape_str += "?";
+  }
+  std::string dtype_const = "    %dtype = torch.constant.int " +
+      std::to_string(static_cast<int64_t>(out_dtype));
+  SubstPairs vars = {
+      {"in_element_type", in_elt}, {"out_element_type", out_elt},
+      {"func_name", func_name},
+      {"input_shape", shape_str}, {"out_shape", shape_str},
+      {"dtype_const", dtype_const},
+  };
+  return pyreSpliceRange(kTemplate_type_cast, vars);
+}
+
+// ---------------------------------------------------------------------------
+// bmm — build + generate
+// ---------------------------------------------------------------------------
+
+KernelSpec buildBmmKernelSpec(
+    const std::string& func_name,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape,
+    c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
+      {"mat2_shape", broadcastAwareShapeStr(mat2_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+  };
+  return {kTemplate_bmm_sha1, std::move(vars)};
+}
+
+std::string generateBmmMlir(
+    const std::string& func_name,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape,
+    c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"mat1_shape", broadcastAwareShapeStr(mat1_shape)},
+      {"mat2_shape", broadcastAwareShapeStr(mat2_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+  };
+  return pyreSpliceRange(kTemplate_bmm, vars);
+}
+
+// ---------------------------------------------------------------------------
+// where — build + generate
+// ---------------------------------------------------------------------------
+
+KernelSpec buildWhereKernelSpec(
+    const std::string& func_name,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> cond_shape,
+    c10::ArrayRef<int64_t> self_shape,
+    c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"cond_shape", broadcastAwareShapeStr(cond_shape)},
+      {"self_shape", broadcastAwareShapeStr(self_shape)},
+      {"other_shape", broadcastAwareShapeStr(other_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+  };
+  return {kTemplate_where_sha1, std::move(vars)};
+}
+
+std::string generateWhereMlir(
+    const std::string& func_name,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> cond_shape,
+    c10::ArrayRef<int64_t> self_shape,
+    c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"cond_shape", broadcastAwareShapeStr(cond_shape)},
+      {"self_shape", broadcastAwareShapeStr(self_shape)},
+      {"other_shape", broadcastAwareShapeStr(other_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+  };
+  return pyreSpliceRange(kTemplate_where, vars);
+}
+
+// ---------------------------------------------------------------------------
+// Reduction ops — build + generate
+// ---------------------------------------------------------------------------
+
+static std::string dimDecls(c10::ArrayRef<int64_t> dims) {
+  std::string s;
+  for (size_t i = 0; i < dims.size(); ++i) {
+    s += "    %d" + std::to_string(i) + " = torch.constant.int " +
+         std::to_string(dims[i]) + "\n";
+  }
+  return s;
+}
+
+static std::string dimArgs(size_t n) {
+  std::string s;
+  for (size_t i = 0; i < n; ++i) {
+    if (i > 0) s += ", ";
+    s += "%d" + std::to_string(i);
+  }
+  return s;
+}
+
+static std::string dimTypes(size_t n) {
+  std::string s;
+  for (size_t i = 0; i < n; ++i) {
+    if (i > 0) s += ", ";
+    s += "!torch.int";
+  }
+  return s;
+}
+
+static std::string reducedShapeStr(
+    c10::ArrayRef<int64_t> input_shape,
+    c10::ArrayRef<int64_t> dims,
+    bool keepdim) {
+  std::set<int64_t> reduce_set;
+  for (int64_t d : dims) {
+    if (d < 0) d += static_cast<int64_t>(input_shape.size());
+    reduce_set.insert(d);
+  }
+  std::string s;
+  bool first = true;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (reduce_set.count(static_cast<int64_t>(i))) {
+      if (keepdim) {
+        if (!first) s += ",";
+        s += "1";
+        first = false;
+      }
+    } else {
+      if (!first) s += ",";
+      s += "?";
+      first = false;
+    }
+  }
+  return s;
+}
+
+KernelSpec buildReductionKernelSpec(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<int64_t> dims,
+    bool keepdim,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) in_shape += ",";
+    in_shape += "?";
+  }
+  auto out_str = reducedShapeStr(input_shape, dims, keepdim);
+
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", in_shape}, {"out_shape", out_str},
+      {"torch_op", torch_op},
+      {"dim_decls", dimDecls(dims)},
+      {"dim_args", dimArgs(dims.size())},
+      {"dim_types", dimTypes(dims.size())},
+      {"keepdim", keepdim ? "true" : "false"},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
+  };
+  return {kTemplate_reduction_sha1, std::move(vars)};
+}
+
+std::string generateReductionMlir(
+    const std::string& func_name,
+    const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape,
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<int64_t> dims,
+    bool keepdim,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_shape;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (i > 0) in_shape += ",";
+    in_shape += "?";
+  }
+  auto out_str = reducedShapeStr(input_shape, dims, keepdim);
+
+  SubstPairs vars = {
+      {"element_type", elt}, {"func_name", func_name},
+      {"input_shape", in_shape}, {"out_shape", out_str},
+      {"torch_op", torch_op},
+      {"dim_decls", dimDecls(dims)},
+      {"dim_args", dimArgs(dims.size())},
+      {"dim_types", dimTypes(dims.size())},
+      {"keepdim", keepdim ? "true" : "false"},
+      {"extra_arg_decls", extra_arg_decls},
+      {"extra_args", extra_args},
+      {"extra_arg_types", extra_arg_types},
+  };
+  return pyreSpliceRange(kTemplate_reduction, vars);
 }
 
 // ---------------------------------------------------------------------------

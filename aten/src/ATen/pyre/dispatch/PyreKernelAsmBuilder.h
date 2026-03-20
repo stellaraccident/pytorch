@@ -35,6 +35,66 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// --- Type cast ---
+
+KernelSpec buildTypeCastKernelSpec(
+    const std::string& func_name,
+    c10::ScalarType in_dtype, c10::ScalarType out_dtype,
+    c10::ArrayRef<int64_t> shape);
+
+std::string generateTypeCastMlir(
+    const std::string& func_name,
+    c10::ScalarType in_dtype, c10::ScalarType out_dtype,
+    c10::ArrayRef<int64_t> shape);
+
+// --- bmm ---
+
+KernelSpec buildBmmKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+std::string generateBmmMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+// --- where ---
+
+KernelSpec buildWhereKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> cond_shape,
+    c10::ArrayRef<int64_t> self_shape,
+    c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+std::string generateWhereMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> cond_shape,
+    c10::ArrayRef<int64_t> self_shape,
+    c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+// --- Reduction ops ---
+
+KernelSpec buildReductionKernelSpec(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<int64_t> dims, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+std::string generateReductionMlir(
+    const std::string& func_name, const std::string& torch_op,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<int64_t> dims, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
 // --- Comparison ops (tensor-tensor) ---
 
 KernelSpec buildComparisonKernelSpec(

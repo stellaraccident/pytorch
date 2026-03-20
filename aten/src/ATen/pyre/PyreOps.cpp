@@ -1,5 +1,7 @@
 #include <ATen/pyre/PyreOp.h>
 
+#include <set>
+
 namespace at::pyre {
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,28 @@ std::string buildUnaryMlir(
       func_name, torch_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
       extra_arg_decls, extra_args, extra_arg_types);
+}
+
+// ---------------------------------------------------------------------------
+// Reduction helpers
+// ---------------------------------------------------------------------------
+
+c10::DimVector inferReducedShape(
+    c10::IntArrayRef input_shape, c10::IntArrayRef dims, bool keepdim) {
+  std::set<int64_t> reduce_set;
+  for (int64_t d : dims) {
+    if (d < 0) d += static_cast<int64_t>(input_shape.size());
+    reduce_set.insert(d);
+  }
+  c10::DimVector out;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (reduce_set.count(static_cast<int64_t>(i))) {
+      if (keepdim) out.push_back(1);
+    } else {
+      out.push_back(input_shape[i]);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +338,18 @@ void registerCompiledOps(torch::Library& m) {
   LeScalarOp::register_impl(m);
   GtScalarOp::register_impl(m);
   GeScalarOp::register_impl(m);
+
+  // Reduction ops
+  SumOp::register_impl(m);
+  MeanOp::register_impl(m);
+  AmaxOp::register_impl(m);
+  AminOp::register_impl(m);
+  // ProdOp skipped: prod.dim_int takes single int, not list — needs separate template
+
+  // Type cast, bmm, where
+  TypeCastOp::register_impl(m);
+  BmmOp::register_impl(m);
+  WhereOp::register_impl(m);
 }
 
 } // namespace at::pyre
