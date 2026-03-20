@@ -897,11 +897,10 @@ struct TypeCastOp : PyreOp<TypeCastOp> {
       std::optional<bool> pin_memory,
       bool non_blocking,
       std::optional<at::MemoryFormat> memory_format) {
-    // Only handle dtype conversions. Fall through for layout/device/format.
-    if (!dtype.has_value() || *dtype == self.scalar_type())
+    // Only handle dtype-only conversions on pyre tensors. Fall through otherwise.
+    if (!hasPyreBuffer(self) || !dtype.has_value() || *dtype == self.scalar_type())
       return at::native::_to_copy(self, dtype, layout, device, pin_memory,
                                    non_blocking, memory_format);
-    TORCH_CHECK(hasPyreBuffer(self), "pyre: _to_copy requires IREE buffers");
 
     auto in_dtype = self.scalar_type();
     auto out_dtype = *dtype;
