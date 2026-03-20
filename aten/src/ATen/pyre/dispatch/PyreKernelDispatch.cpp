@@ -93,10 +93,71 @@ void PyreKernelDispatch::invoke(
   for (size_t i = 0; i < inputs.size(); ++i)
     push_view(inputs[i]);
 
-  // Torch convention: null workspace.
+  // Torch convention: workspace buffer for transients.
+  iree_hal_buffer_t* workspace_buf = nullptr;
   if (!native) {
-    iree_vm_ref_t null_ref = iree_vm_ref_null();
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &null_ref));
+    if (kernel->has_transients_size) {
+      // Query transient workspace size by calling the companion function.
+      // It takes the same buffer_view args as the main function.
+      iree_vm_list_t* size_args = nullptr;
+      PYRE_CHECK_OK(iree_vm_list_create(
+          iree_vm_make_undefined_type_def(),
+          1 + static_cast<iree_host_size_t>(inputs.size()) + 1 + 2,
+          alloc, &size_args));
+      // Push same buffer views: output, inputs
+      {
+        auto ov = abi.buildView(output);
+        iree_vm_ref_t ref = iree_hal_buffer_view_move_ref(ov.release());
+        PYRE_CHECK_OK(iree_vm_list_push_ref_move(size_args, &ref));
+      }
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        auto iv = abi.buildView(inputs[i]);
+        iree_vm_ref_t ref = iree_hal_buffer_view_move_ref(iv.release());
+        PYRE_CHECK_OK(iree_vm_list_push_ref_move(size_args, &ref));
+      }
+      // Null workspace, null fences for the size query
+      for (int i = 0; i < 3; ++i) {
+        iree_vm_ref_t null_ref = iree_vm_ref_null();
+        PYRE_CHECK_OK(iree_vm_list_push_ref_move(size_args, &null_ref));
+      }
+
+      iree_vm_list_t* size_rets = nullptr;
+      PYRE_CHECK_OK(iree_vm_list_create(
+          iree_vm_make_undefined_type_def(), 1, alloc, &size_rets));
+      PYRE_CHECK_OK(iree_vm_invoke(
+          kernel->context.get(), kernel->transients_size_fn,
+          IREE_VM_INVOCATION_FLAG_NONE, nullptr,
+          size_args, size_rets, alloc));
+
+      iree_vm_value_t size_val;
+      PYRE_CHECK_OK(iree_vm_list_get_value(size_rets, 0, &size_val));
+      int64_t transient_size = size_val.i64;
+      iree_vm_list_release(size_rets);
+      iree_vm_list_release(size_args);
+
+      if (transient_size > 0) {
+        PYRE_LOG(WARN) << "kernel requires " << transient_size
+                       << " bytes transient workspace\n";
+        auto* device = c10::pyre::PyreDevice::get(0);
+        iree_hal_buffer_params_t params = {};
+        params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE;
+        params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+        params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL
+                    | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+        PYRE_CHECK_OK(iree_hal_allocator_allocate_buffer(
+            device->allocator(), params,
+            static_cast<iree_device_size_t>(transient_size),
+            &workspace_buf));
+        iree_vm_ref_t ref = iree_hal_buffer_move_ref(workspace_buf);
+        PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+      } else {
+        iree_vm_ref_t null_ref = iree_vm_ref_null();
+        PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &null_ref));
+      }
+    } else {
+      iree_vm_ref_t null_ref = iree_vm_ref_null();
+      PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &null_ref));
+    }
   }
 
   // Wait fence.

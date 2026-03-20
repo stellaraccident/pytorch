@@ -262,13 +262,25 @@ class TestViewOps(TestCase):
         self.assertEqual(y.cpu(), x)
 
 
-@unittest.skip("TODO: cat dispatch fails — transient workspace buffer issue (pyre-workspace-3sh)")
 class TestCat(TestCase):
     def test_two_inputs(self):
         a = torch.randn(2, 3)
         b = torch.randn(2, 4)
         y = torch.cat([a.to("host:0"), b.to("host:0")], dim=1)
         self.assertTrue(torch.allclose(y.cpu(), torch.cat([a, b], dim=1), atol=1e-5))
+
+    def test_three_inputs(self):
+        a = torch.randn(2, 3)
+        b = torch.randn(2, 4)
+        c = torch.randn(2, 5)
+        y = torch.cat([a.to("host:0"), b.to("host:0"), c.to("host:0")], dim=1)
+        self.assertTrue(torch.allclose(y.cpu(), torch.cat([a, b, c], dim=1), atol=1e-5))
+
+    def test_dim0(self):
+        a = torch.randn(2, 4)
+        b = torch.randn(3, 4)
+        y = torch.cat([a.to("host:0"), b.to("host:0")], dim=0)
+        self.assertTrue(torch.allclose(y.cpu(), torch.cat([a, b], dim=0), atol=1e-5))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ struct CachedKernel {
   c10::pyre::vm_module_ptr module;
   c10::pyre::vm_context_ptr context;
   iree_vm_function_t function{};
+  iree_vm_function_t transients_size_fn{};
+  bool has_transients_size = false;
 };
 
 // Load a compiled VMFB into a ready-to-dispatch CachedKernel.
