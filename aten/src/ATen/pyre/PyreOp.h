@@ -999,6 +999,14 @@ struct WhereOp : PyreOp<WhereOp> {
   }
 };
 
+// --- CatOp (algorithmic MLIR generation) ---
+
+struct CatOp : PyreOp<CatOp> {
+  static constexpr const char* aten_name = "cat";
+
+  static at::Tensor impl(const at::ITensorListRef& tensors, int64_t dim = 0);
+};
+
 // --- One-off: addmm ---
 
 struct AddmmOp : PyreOp<AddmmOp> {

@@ -1,6 +1,7 @@
 #include <ATen/pyre/PyreOp.h>
 
 #include <set>
+#include <sstream>
 
 namespace at::pyre {
 
@@ -267,6 +268,114 @@ std::string AddmmOp::generateMlir(
 }
 
 // ---------------------------------------------------------------------------
+// CatOp — algorithmic MLIR generation for variable-length tensor list
+// ---------------------------------------------------------------------------
+
+at::Tensor CatOp::impl(const at::ITensorListRef& tensors, int64_t dim) {
+  auto materialized = tensors.materialize();
+  TORCH_CHECK(!materialized.empty(), "pyre: cat requires at least one tensor");
+
+  for (const auto& t : materialized)
+    TORCH_CHECK(hasPyreBuffer(t.get()), "pyre: cat requires IREE buffers");
+
+  auto dtype = materialized[0].get().scalar_type();
+  int64_t ndim = materialized[0].get().dim();
+  if (dim < 0) dim += ndim;
+
+  // Compute output shape
+  c10::DimVector out_shape(materialized[0].get().sizes().begin(),
+                           materialized[0].get().sizes().end());
+  out_shape[dim] = 0;
+  for (const auto& t : materialized)
+    out_shape[dim] += t.get().size(dim);
+
+  auto func_name = funcNameDefault(aten_name);
+  std::string elt = scalarTypeToTorchMlir(dtype);
+
+  // Build cache key from shapes + dim
+  std::string to_hash = "cat:";
+  to_hash += elt;
+  to_hash += ":dim=" + std::to_string(dim);
+  for (const auto& t : materialized) {
+    to_hash += ":";
+    for (int64_t i = 0; i < t.get().dim(); ++i) {
+      if (i > 0) to_hash += ",";
+      to_hash += (t.get().size(i) == 1) ? "1" : "?";
+    }
+  }
+  for (const auto& flag :
+       c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags()) {
+    to_hash += '\0';
+    to_hash += flag;
+  }
+  auto cache_key = c10::sha1(to_hash).str();
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    // Generate MLIR with torch.prim.ListConstruct + torch.aten.cat
+    auto dynShape = [](const at::Tensor& t) {
+      std::string s;
+      for (int64_t i = 0; i < t.dim(); ++i) {
+        if (i > 0) s += ",";
+        s += (t.size(i) == 1) ? "1" : "?";
+      }
+      return s;
+    };
+
+    std::string out_s;
+    for (size_t i = 0; i < out_shape.size(); ++i) {
+      if (i > 0) out_s += ",";
+      out_s += (out_shape[i] == 1) ? "1" : "?";
+    }
+
+    std::ostringstream ss;
+    ss << "module @module {\n"
+       << "  func.func @" << func_name << "(\n"
+       << "      %out_: !torch.tensor<[" << out_s << "], " << elt << ">";
+
+    for (size_t i = 0; i < materialized.size(); ++i) {
+      auto is = dynShape(materialized[i].get());
+      ss << ",\n      %input" << i << ": !torch.vtensor<[" << is << "], " << elt << ">";
+    }
+
+    ss << "\n  ) attributes {torch.assume_strict_symbolic_shapes} {\n";
+
+    // Build list
+    ss << "    %inputs = torch.prim.ListConstruct ";
+    for (size_t i = 0; i < materialized.size(); ++i) {
+      if (i > 0) ss << ", ";
+      ss << "%input" << i;
+    }
+    ss << " : (";
+    for (size_t i = 0; i < materialized.size(); ++i) {
+      if (i > 0) ss << ", ";
+      ss << "!torch.vtensor<[" << dynShape(materialized[i].get()) << "], " << elt << ">";
+    }
+    ss << ") -> !torch.list<vtensor>\n";
+
+    ss << "    %dim = torch.constant.int " << dim << "\n"
+       << "    %result = torch.aten.cat %inputs, %dim : !torch.list<vtensor>, !torch.int -> !torch.vtensor<[" << out_s << "], " << elt << ">\n"
+       << "    torch.overwrite.tensor.contents %result overwrites %out_ : !torch.vtensor<[" << out_s << "], " << elt << ">, !torch.tensor<[" << out_s << "], " << elt << ">\n"
+       << "    return\n"
+       << "  }\n"
+       << "}\n";
+
+    auto mlir = ss.str();
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  // Build input vector
+  std::vector<at::Tensor> inputs;
+  inputs.reserve(materialized.size());
+  for (const auto& t : materialized)
+    inputs.push_back(t.get());
+
+  return invokeKernel(kernel, inputs, out_shape,
+                      materialized[0].get().options());
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -346,10 +455,11 @@ void registerCompiledOps(torch::Library& m) {
   AminOp::register_impl(m);
   // ProdOp skipped: prod.dim_int takes single int, not list — needs separate template
 
-  // Type cast, bmm, where
+  // Type cast, bmm, where, cat
   TypeCastOp::register_impl(m);
   BmmOp::register_impl(m);
   WhereOp::register_impl(m);
+  CatOp::register_impl(m);
 }
 
 } // namespace at::pyre

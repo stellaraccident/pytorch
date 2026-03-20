@@ -15,12 +15,21 @@
 
 #ifdef AT_PER_OPERATOR_HEADERS
 #include <ATen/ops/as_strided_native.h>
+#include <ATen/ops/chunk_native.h>
+#include <ATen/ops/clone_native.h>
+#include <ATen/ops/empty.h>
 #include <ATen/ops/expand_native.h>
+#include <ATen/ops/narrow_native.h>
 #include <ATen/ops/permute_native.h>
 #include <ATen/ops/reshape_native.h>
 #include <ATen/ops/resize_native.h>
+#include <ATen/ops/select_native.h>
 #include <ATen/ops/slice_native.h>
+#include <ATen/ops/split_native.h>
+#include <ATen/ops/split_with_sizes_native.h>
 #include <ATen/ops/t_native.h>
+#include <ATen/ops/transpose_native.h>
+#include <ATen/ops/unfold_native.h>
 #include <ATen/ops/unsqueeze_native.h>
 #include <ATen/ops/view_native.h>
 #else
@@ -248,6 +257,43 @@ const at::Tensor& pyre_resize_(
     std::optional<at::MemoryFormat> memory_format) {
   return at::native::resize__symint(self, size, memory_format);
 }
+// --- Additional view ops (Epic 3) ---
+
+at::Tensor pyre_select(const at::Tensor& self, int64_t dim, c10::SymInt index) {
+  return at::native::select_symint(self, dim, index);
+}
+at::Tensor pyre_narrow_symint(
+    const at::Tensor& self, int64_t dim,
+    c10::SymInt start, c10::SymInt length) {
+  return at::native::narrow_symint(self, dim, start, length);
+}
+at::Tensor pyre_transpose(const at::Tensor& self, int64_t dim0, int64_t dim1) {
+  return at::native::transpose(self, dim0, dim1);
+}
+at::Tensor pyre_unfold(const at::Tensor& self, int64_t dim, int64_t size, int64_t step) {
+  return at::native::unfold(self, dim, size, step);
+}
+std::vector<at::Tensor> pyre_split_with_sizes(
+    const at::Tensor& self, at::IntArrayRef split_sizes, int64_t dim) {
+  return at::native::split_with_sizes(self, split_sizes, dim);
+}
+std::vector<at::Tensor> pyre_split(
+    const at::Tensor& self, int64_t split_size, int64_t dim) {
+  return at::native::split(self, split_size, dim);
+}
+std::vector<at::Tensor> pyre_chunk(const at::Tensor& self, int64_t chunks, int64_t dim) {
+  return at::native::chunk(self, chunks, dim);
+}
+
+// clone: allocate new storage + copy
+at::Tensor pyre_clone(
+    const at::Tensor& self,
+    std::optional<at::MemoryFormat> memory_format) {
+  auto output = at::empty(self.sizes(), self.options());
+  output.copy_(self);
+  return output;
+}
+
 // --- CPU fallback ---
 
 void cpu_fallback(
@@ -275,6 +321,14 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("unsqueeze", pyre_unsqueeze);
   m.impl("slice.Tensor", pyre_slice);
   m.impl("resize_", pyre_resize_);
+  m.impl("select.int", pyre_select);
+  m.impl("narrow", pyre_narrow_symint);
+  m.impl("transpose.int", pyre_transpose);
+  m.impl("unfold", pyre_unfold);
+  m.impl("split_with_sizes", pyre_split_with_sizes);
+  m.impl("split.Tensor", pyre_split);
+  m.impl("chunk", pyre_chunk);
+  m.impl("clone", pyre_clone);
 
   // Compiled ops (CRTP registry)
   registerCompiledOps(m);
