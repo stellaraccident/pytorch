@@ -1253,6 +1253,7 @@ if(USE_PYRE)
     ${PYRE_TEMPLATE_DIR}/mm.mlir
     ${PYRE_TEMPLATE_DIR}/scatter_add.mlir
     ${PYRE_TEMPLATE_DIR}/scatter_src.mlir
+    ${PYRE_TEMPLATE_DIR}/softmax.mlir
     ${PYRE_TEMPLATE_DIR}/scalar_binary.mlir
     ${PYRE_TEMPLATE_DIR}/comparison.mlir
     ${PYRE_TEMPLATE_DIR}/comparison_scalar.mlir

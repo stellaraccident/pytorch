@@ -42,7 +42,9 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace at::pyre {
 namespace {
@@ -99,8 +101,8 @@ at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
   if (self.is_contiguous() && self.element_size() <= 4) {
     PyreTensor pt(self);
     uint8_t pattern[4] = {};
-    AT_DISPATCH_ALL_TYPES_AND2(
-        at::kHalf, at::kBFloat16, self.scalar_type(), "pyre_fill", [&] {
+    AT_DISPATCH_ALL_TYPES_AND3(
+        at::kHalf, at::kBFloat16, at::kBool, self.scalar_type(), "pyre_fill", [&] {
           if constexpr (sizeof(scalar_t) <= 4) {
             scalar_t val = value.to<scalar_t>();
             std::memcpy(pattern, &val, sizeof(scalar_t));
@@ -291,8 +293,102 @@ at::Tensor pyre_unfold(const at::Tensor& self, int64_t dim, int64_t size, int64_
 at::Tensor pyre_unsqueeze(const at::Tensor& self, int64_t dim) {
   return at::native::unsqueeze(self, dim);
 }
+at::Tensor pyre_reshape_alias(
+    const at::Tensor& self, c10::SymIntArrayRef size,
+    c10::SymIntArrayRef /*stride*/) {
+  return at::native::view(self, C10_AS_INTARRAYREF_SLOW(size));
+}
 at::Tensor pyre_view(const at::Tensor& self, c10::SymIntArrayRef size) {
   return at::native::view(self, C10_AS_INTARRAYREF_SLOW(size));
+}
+
+// --- dropout (no-op in eval mode) ---
+
+at::Tensor pyre_dropout(const at::Tensor& self, double /*p*/, bool train) {
+  TORCH_CHECK(!train,
+      "pyre: dropout training mode not supported (requires device-side RNG)");
+  return self;
+}
+
+// --- matmul (delegation to mm/bmm) ---
+
+at::Tensor pyre_matmul(const at::Tensor& self, const at::Tensor& other) {
+  if (self.dim() == 1 && other.dim() == 1)
+    return at::dot(self, other);
+  if (self.dim() == 2 && other.dim() == 2)
+    return at::mm(self, other);
+  if (self.dim() == 1 && other.dim() == 2)
+    return at::mm(self.unsqueeze(0), other).squeeze(0);
+  if (self.dim() == 2 && other.dim() == 1)
+    return at::mv(self, other);
+  if (self.dim() == 3 && other.dim() == 3)
+    return at::bmm(self, other);
+  if (self.dim() >= 3 && other.dim() == 2) {
+    auto batch_shape = self.sizes().slice(0, self.dim() - 2);
+    auto m = self.size(-2), k = self.size(-1);
+    auto n = other.size(-1);
+    auto flat = self.reshape({-1, k});
+    auto result = at::mm(flat, other);
+    c10::SmallVector<int64_t, 8> out_shape(batch_shape.begin(), batch_shape.end());
+    out_shape.push_back(m);
+    out_shape.push_back(n);
+    return result.reshape(out_shape);
+  }
+  if (self.dim() >= 3 && other.dim() >= 3) {
+    // Broadcast batch dims, flatten to 3D for bmm, reshape back.
+    auto self_batch = self.sizes().slice(0, self.dim() - 2);
+    auto other_batch = other.sizes().slice(0, other.dim() - 2);
+    auto bcast = at::infer_size(
+        c10::IntArrayRef(self_batch.data(), self_batch.size()),
+        c10::IntArrayRef(other_batch.data(), other_batch.size()));
+    auto m = self.size(-2), k = self.size(-1), n = other.size(-1);
+    int64_t batch = 1;
+    for (auto s : bcast) batch *= s;
+    // Expand then flatten batch dims to single dim for bmm.
+    c10::SmallVector<int64_t, 8> self_expand(bcast.begin(), bcast.end());
+    self_expand.push_back(m);
+    self_expand.push_back(k);
+    c10::SmallVector<int64_t, 8> other_expand(bcast.begin(), bcast.end());
+    other_expand.push_back(k);
+    other_expand.push_back(n);
+    auto a3 = self.expand(self_expand).contiguous().reshape({batch, m, k});
+    auto b3 = other.expand(other_expand).contiguous().reshape({batch, k, n});
+    auto result = at::bmm(a3, b3);
+    c10::SmallVector<int64_t, 8> out_shape(bcast.begin(), bcast.end());
+    out_shape.push_back(m);
+    out_shape.push_back(n);
+    return result.reshape(out_shape);
+  }
+  TORCH_CHECK(false, "pyre: matmul not yet supported for ",
+              self.dim(), "D x ", other.dim(), "D");
+}
+
+// --- decomposed SDPA ---
+
+at::Tensor pyre_sdpa(
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const std::optional<at::Tensor>& attn_mask,
+    double dropout_p, bool is_causal, std::optional<double> scale,
+    bool /*enable_gqa*/) {
+  double s = scale.value_or(1.0 / std::sqrt(static_cast<double>(query.size(-1))));
+  auto attn = at::matmul(query, key.transpose(-2, -1)).mul_(s);
+  if (is_causal) {
+    auto mask = at::ones({query.size(-2), key.size(-2)},
+                         query.options().dtype(at::kBool)).tril();
+    attn = attn.masked_fill(mask.logical_not(),
+                            -std::numeric_limits<float>::infinity());
+  } else if (attn_mask.has_value()) {
+    if (attn_mask->dtype() == at::kBool) {
+      attn = attn.masked_fill(attn_mask->logical_not(),
+                              -std::numeric_limits<float>::infinity());
+    } else {
+      attn = at::add(attn, *attn_mask);
+    }
+  }
+  attn = at::softmax(attn, -1);
+  if (dropout_p > 0.0)
+    attn = at::dropout(attn, dropout_p, /*train=*/false);
+  return at::matmul(attn, value);
 }
 
 // --- arange overload forwarding ---
@@ -327,6 +423,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("arange", pyre_arange);
   m.impl("arange.start", pyre_arange_start);
 
+  // Delegation ops
+  m.impl("dropout", pyre_dropout);
+  m.impl("matmul", pyre_matmul);
+  m.impl("scaled_dot_product_attention", pyre_sdpa);
+
   // Storage and data movement
   m.impl("_copy_from", pyre_copy_from);
   m.impl("_copy_from_and_resize", pyre_copy_from_and_resize);
@@ -352,6 +453,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("transpose.int", pyre_transpose);
   m.impl("unfold", pyre_unfold);
   m.impl("unsqueeze", pyre_unsqueeze);
+  m.impl("_reshape_alias", pyre_reshape_alias);
   m.impl("view", pyre_view);
 
   // Compiled ops (CRTP registry)

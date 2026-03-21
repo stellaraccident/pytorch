@@ -1021,6 +1021,20 @@ struct GatherOp : PyreOp<GatherOp> {
       bool sparse_grad);
 };
 
+// --- SoftmaxOp / LogSoftmaxOp ---
+
+struct SoftmaxOp : PyreOp<SoftmaxOp> {
+  static constexpr const char* aten_name = "_softmax";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, bool half_to_float);
+};
+
+struct LogSoftmaxOp : PyreOp<LogSoftmaxOp> {
+  static constexpr const char* aten_name = "_log_softmax";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, bool half_to_float);
+};
+
 // --- ScatterSrcOp ---
 
 struct ScatterSrcOp : PyreOp<ScatterSrcOp> {

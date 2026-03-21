@@ -35,6 +35,16 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// --- softmax ---
+
+KernelSpec buildSoftmaxKernelSpec(
+    const std::string& func_name, const std::string& softmax_op,
+    c10::ScalarType dtype, c10::ArrayRef<int64_t> shape, int64_t dim);
+
+std::string generateSoftmaxMlir(
+    const std::string& func_name, const std::string& softmax_op,
+    c10::ScalarType dtype, c10::ArrayRef<int64_t> shape, int64_t dim);
+
 // --- scatter_src ---
 
 KernelSpec buildScatterSrcKernelSpec(

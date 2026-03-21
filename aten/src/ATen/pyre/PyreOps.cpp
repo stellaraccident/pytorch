@@ -526,6 +526,43 @@ at::Tensor GatherOp::impl(
 }
 
 // ---------------------------------------------------------------------------
+// SoftmaxOp / LogSoftmaxOp — compiled kernel with first-class _softmax
+// ---------------------------------------------------------------------------
+
+static at::Tensor dispatchSoftmax(
+    const char* aten_name, const std::string& softmax_op,
+    const at::Tensor& self, int64_t dim) {
+  TORCH_CHECK(hasPyreBuffer(self), "pyre: ", aten_name,
+      " requires IREE buffers");
+  if (dim < 0) dim += self.dim();
+  auto dtype = self.scalar_type();
+  auto func_name = funcNameDefault(aten_name);
+
+  auto spec = buildSoftmaxKernelSpec(func_name, softmax_op, dtype, self.sizes(), dim);
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateSoftmaxMlir(func_name, softmax_op, dtype, self.sizes(), dim);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+  return invokeKernel(kernel, {self}, c10::DimVector(self.sizes()), self.options());
+}
+
+at::Tensor SoftmaxOp::impl(
+    const at::Tensor& self, int64_t dim, bool /*half_to_float*/) {
+  return dispatchSoftmax(aten_name, "_softmax", self, dim);
+}
+
+at::Tensor LogSoftmaxOp::impl(
+    const at::Tensor& self, int64_t dim, bool /*half_to_float*/) {
+  return dispatchSoftmax(aten_name, "_log_softmax", self, dim);
+}
+
+// ---------------------------------------------------------------------------
 // ScatterSrcOp
 // ---------------------------------------------------------------------------
 
@@ -1230,6 +1267,8 @@ void registerCompiledOps(torch::Library& m) {
   GatherOp::register_impl(m);
   IndexSelectOp::register_impl(m);
   IndexTensorOp::register_impl(m);
+  LogSoftmaxOp::register_impl(m);
+  SoftmaxOp::register_impl(m);
   m.impl("index_put", &IndexPutOp::impl);
   m.impl("index_put_", &IndexPutOp::impl_inplace);
   m.impl("scatter.src", &ScatterSrcOp::impl);

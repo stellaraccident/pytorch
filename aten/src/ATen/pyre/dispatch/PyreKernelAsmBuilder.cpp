@@ -1257,6 +1257,37 @@ std::string PyreKernelAsmFragments::generateMlir(
 }
 
 // ---------------------------------------------------------------------------
+// softmax — build + generate
+// ---------------------------------------------------------------------------
+
+static SubstPairs softmaxVars(
+    const std::string& func_name, const std::string& softmax_op,
+    c10::ScalarType dtype, c10::ArrayRef<int64_t> shape, int64_t dim) {
+  return {
+      {"func_name", func_name},
+      {"element_type", scalarTypeToTorchMlir(dtype)},
+      {"input_shape", broadcastAwareShapeStr(shape)},
+      {"out_shape", broadcastAwareShapeStr(shape)},
+      {"dim", std::to_string(dim)},
+      {"softmax_op", softmax_op},
+  };
+}
+
+KernelSpec buildSoftmaxKernelSpec(
+    const std::string& func_name, const std::string& softmax_op,
+    c10::ScalarType dtype, c10::ArrayRef<int64_t> shape, int64_t dim) {
+  return {kTemplate_softmax_sha1,
+          softmaxVars(func_name, softmax_op, dtype, shape, dim)};
+}
+
+std::string generateSoftmaxMlir(
+    const std::string& func_name, const std::string& softmax_op,
+    c10::ScalarType dtype, c10::ArrayRef<int64_t> shape, int64_t dim) {
+  return pyreSpliceRange(kTemplate_softmax,
+      softmaxVars(func_name, softmax_op, dtype, shape, dim));
+}
+
+// ---------------------------------------------------------------------------
 // scatter_src — build + generate
 // ---------------------------------------------------------------------------
 
