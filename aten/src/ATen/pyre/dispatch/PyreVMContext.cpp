@@ -63,6 +63,21 @@ CachedKernel loadKernel(
 
   PYRE_LOG(INFO) << "kernel loaded: " << full_name
                  << " ordinal=" << kernel.function.ordinal << "\n";
+
+  // Try to resolve the transients_size companion function.
+  std::string size_fn_name = full_name + "_transients_size";
+  iree_string_view_t snv = {
+      size_fn_name.c_str(),
+      static_cast<iree_host_size_t>(size_fn_name.size())};
+  iree_status_t status = iree_vm_context_resolve_function(
+      context, snv, &kernel.transients_size_fn);
+  if (iree_status_is_ok(status)) {
+    kernel.has_transients_size = true;
+    PYRE_LOG(DEBUG) << "resolved transients_size: " << size_fn_name << "\n";
+  } else {
+    iree_status_ignore(status);
+  }
+
   return kernel;
 }
 

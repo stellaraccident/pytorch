@@ -1,4 +1,4 @@
-// Matrix multiply: out = mat1 @ mat2
+// Batched matrix multiply template.
 //
 // Placeholders: element_type, func_name, mat1_shape, mat2_shape, out_shape
 
@@ -10,7 +10,7 @@
 module @module {
   func.func @$$func_name$$(%out_: !out_t, %mat1: !mat1, %mat2: !mat2)
       attributes {torch.assume_strict_symbolic_shapes} {
-    %result = torch.aten.mm %mat1, %mat2 : !mat1, !mat2 -> !out_v
+    %result = torch.aten.bmm %mat1, %mat2 : !mat1, !mat2 -> !out_v
     torch.overwrite.tensor.contents %result overwrites %out_ : !out_v, !out_t
     return
   }

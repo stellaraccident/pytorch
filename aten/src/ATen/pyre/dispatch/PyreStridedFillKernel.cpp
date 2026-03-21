@@ -2,7 +2,7 @@
 #include <ATen/pyre/dispatch/PyreKernelAsmBuilder.h>
 #include <ATen/pyre/dispatch/PyreKernelCache.h>
 #include <ATen/pyre/dispatch/PyreKernelDispatch.h>
-#include <ATen/pyre/PyreOp.h>
+#include <ATen/pyre/PyreOps.h>
 #include <ATen/pyre/PyreTensor.h>
 
 #include <ATen/Dispatch.h>

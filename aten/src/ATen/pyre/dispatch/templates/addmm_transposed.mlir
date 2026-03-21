@@ -2,26 +2,25 @@
 // mat2 is passed in its original (un-transposed) layout.
 // The transpose happens inside the kernel via torch.aten.t.
 //
-// Placeholders:
-//   $$element_type$$    — torch-mlir element type
-//   $$func_name$$       — entry point name
-//   $$bias_shape$$      — bias shape
-//   $$mat1_shape$$      — mat1 shape [M,K]
-//   $$mat2_orig_shape$$ — mat2 original shape [N,K] (before transpose)
-//   $$out_shape$$       — output shape [M,N]
+// Placeholders: element_type, func_name, bias_shape, mat1_shape,
+//   mat2_orig_shape, mat2_t_shape, out_shape,
+//   beta_decl, alpha_decl, beta_type, alpha_type
+
+!out_t = !torch.tensor<[$$out_shape$$], $$element_type$$>
+!out_v = !torch.vtensor<[$$out_shape$$], $$element_type$$>
+!bias = !torch.vtensor<[$$bias_shape$$], $$element_type$$>
+!mat1 = !torch.vtensor<[$$mat1_shape$$], $$element_type$$>
+!mat2_orig = !torch.vtensor<[$$mat2_orig_shape$$], $$element_type$$>
+!mat2_t = !torch.vtensor<[$$mat2_t_shape$$], $$element_type$$>
 
 module @module {
-  func.func @$$func_name$$(
-      %out_: !torch.tensor<[$$out_shape$$], $$element_type$$>,
-      %bias: !torch.vtensor<[$$bias_shape$$], $$element_type$$>,
-      %mat1: !torch.vtensor<[$$mat1_shape$$], $$element_type$$>,
-      %mat2_orig: !torch.vtensor<[$$mat2_orig_shape$$], $$element_type$$>
-  ) attributes {torch.assume_strict_symbolic_shapes} {
-    %mat2 = torch.aten.t %mat2_orig : !torch.vtensor<[$$mat2_orig_shape$$], $$element_type$$> -> !torch.vtensor<[$$mat2_t_shape$$], $$element_type$$>
+  func.func @$$func_name$$(%out_: !out_t, %bias: !bias, %mat1: !mat1, %mat2_orig: !mat2_orig)
+      attributes {torch.assume_strict_symbolic_shapes} {
+    %mat2 = torch.aten.t %mat2_orig : !mat2_orig -> !mat2_t
     $$beta_decl$$
     $$alpha_decl$$
-    %result = torch.aten.addmm %bias, %mat1, %mat2, %beta, %alpha : !torch.vtensor<[$$bias_shape$$], $$element_type$$>, !torch.vtensor<[$$mat1_shape$$], $$element_type$$>, !torch.vtensor<[$$mat2_t_shape$$], $$element_type$$>, $$beta_type$$, $$alpha_type$$ -> !torch.vtensor<[$$out_shape$$], $$element_type$$>
-    torch.overwrite.tensor.contents %result overwrites %out_ : !torch.vtensor<[$$out_shape$$], $$element_type$$>, !torch.tensor<[$$out_shape$$], $$element_type$$>
+    %result = torch.aten.addmm %bias, %mat1, %mat2, %beta, %alpha : !bias, !mat1, !mat2_t, $$beta_type$$, $$alpha_type$$ -> !out_v
+    torch.overwrite.tensor.contents %result overwrites %out_ : !out_v, !out_t
     return
   }
 }

@@ -1,4 +1,12 @@
-#include <ATen/pyre/PyreOp.h>
+#include <ATen/pyre/PyreOps.h>
+
+#ifdef AT_PER_OPERATOR_HEADERS
+#include <ATen/ops/_to_copy_native.h>
+#else
+#include <ATen/NativeFunctions.h>
+#endif
+
+#include <set>
 
 namespace at::pyre {
 
@@ -14,6 +22,49 @@ c10::DimVector inferShapeBroadcast(const OpContext& ctx) {
 
 c10::DimVector inferShapeIdentity(const OpContext& ctx) {
   return c10::DimVector(ctx.raw_inputs[0].sizes());
+}
+
+bool promoteScalarTensors(
+    c10::ArrayRef<at::Tensor> raw_inputs,
+    c10::SmallVector<at::Tensor, 4>& out,
+    c10::ArrayRef<at::Tensor>& effective) {
+  c10::Device target_device = c10::kCPU;
+  for (const auto& t : raw_inputs) {
+    if (t.device().type() != c10::DeviceType::CPU) {
+      target_device = t.device();
+      break;
+    }
+  }
+  if (target_device.type() == c10::DeviceType::CPU) {
+    effective = raw_inputs;
+    return false;
+  }
+  bool need_promote = false;
+  for (const auto& t : raw_inputs) {
+    if (t.dim() == 0 && t.device().type() == c10::DeviceType::CPU) {
+      need_promote = true;
+      break;
+    }
+  }
+  if (!need_promote) {
+    effective = raw_inputs;
+    return false;
+  }
+  auto target_dtype = raw_inputs[0].scalar_type();
+  for (const auto& t : raw_inputs) {
+    if (t.device() == target_device) {
+      target_dtype = t.scalar_type();
+      break;
+    }
+  }
+  for (const auto& t : raw_inputs) {
+    if (t.dim() == 0 && t.device().type() == c10::DeviceType::CPU)
+      out.push_back(t.to(target_device, target_dtype));
+    else
+      out.push_back(t);
+  }
+  effective = out;
+  return true;
 }
 
 std::string funcNameDefault(const char* aten_name) {
@@ -92,24 +143,82 @@ std::string buildBinaryMlir(
 
 KernelSpec buildUnarySpec(
     const char* torch_op, const std::string& func_name,
-    const OpContext& ctx) {
+    const OpContext& ctx,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
   ArgAdapter adapter = ctx.decision.arg_adapters.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
       : ctx.decision.arg_adapters[0];
   return buildUnaryKernelSpec(
       func_name, torch_op, ctx.dtype,
-      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter);
+      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
+      extra_arg_decls, extra_args, extra_arg_types);
 }
 
 std::string buildUnaryMlir(
     const char* torch_op, const std::string& func_name,
-    const OpContext& ctx) {
+    const OpContext& ctx,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
   ArgAdapter adapter = ctx.decision.arg_adapters.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
       : ctx.decision.arg_adapters[0];
   return generateUnaryMlir(
       func_name, torch_op, ctx.dtype,
-      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter);
+      ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
+      extra_arg_decls, extra_args, extra_arg_types);
+}
+
+// ---------------------------------------------------------------------------
+// Reduction helpers
+// ---------------------------------------------------------------------------
+
+c10::DimVector inferReducedShape(
+    c10::IntArrayRef input_shape, c10::IntArrayRef dims, bool keepdim) {
+  std::set<int64_t> reduce_set;
+  for (int64_t d : dims) {
+    if (d < 0) d += static_cast<int64_t>(input_shape.size());
+    reduce_set.insert(d);
+  }
+  c10::DimVector out;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (reduce_set.count(static_cast<int64_t>(i))) {
+      if (keepdim) out.push_back(1);
+    } else {
+      out.push_back(input_shape[i]);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Scalar binary helpers
+// ---------------------------------------------------------------------------
+
+KernelSpec buildScalarBinarySpec(
+    const char* torch_op, const std::string& func_name,
+    const OpContext& ctx, double scalar_value,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  return buildScalarBinaryKernelSpec(
+      func_name, torch_op, ctx.dtype,
+      ctx.inputs[0].sizes(), scalar_value,
+      extra_arg_decls, extra_args, extra_arg_types);
+}
+
+std::string buildScalarBinaryMlirHelper(
+    const char* torch_op, const std::string& func_name,
+    const OpContext& ctx, double scalar_value,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  return generateScalarBinaryMlir(
+      func_name, torch_op, ctx.dtype,
+      ctx.inputs[0].sizes(), scalar_value,
+      extra_arg_decls, extra_args, extra_arg_types);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,19 +316,332 @@ std::string AddmmOp::generateMlir(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-dim reduction dispatch helper
+// ---------------------------------------------------------------------------
+
+at::Tensor dispatchMultiDimReduction(
+    const char* aten_name, const char* torch_op,
+    const at::Tensor& self, c10::ArrayRef<int64_t> dims, bool keepdim,
+    bool has_dtype_arg) {
+  TORCH_CHECK(hasPyreBuffer(self), "pyre: ", aten_name,
+      " requires IREE buffers");
+
+  auto dtype = self.scalar_type();
+  auto decision = ArgShapeSpecializer().analyze(
+      aten_name, dtype, {self},
+      c10::pyre::PyreDevice::get(0)->capabilities());
+  auto adapted = applyAdapters({self}, decision.arg_adapters);
+
+  c10::SmallVector<int64_t, 6> norm_dims;
+  for (auto d : dims) {
+    if (d < 0) d += self.dim();
+    norm_dims.push_back(d);
+  }
+
+  auto out_shape = inferReducedShape(self.sizes(), norm_dims, keepdim);
+  auto func_name = funcNameDefault(aten_name);
+
+  std::string extra_decls, extra_args, extra_types;
+  if (has_dtype_arg) {
+    extra_decls = "    %none = torch.constant.none";
+    extra_args = ", %none";
+    extra_types = ", !torch.none";
+  }
+
+  auto spec = buildReductionKernelSpec(
+      func_name, torch_op, dtype,
+      adapted[0].sizes(), out_shape, norm_dims, keepdim,
+      extra_decls, extra_args, extra_types);
+
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateReductionMlir(
+        func_name, torch_op, dtype,
+        adapted[0].sizes(), out_shape, norm_dims, keepdim,
+        extra_decls, extra_args, extra_types);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  return invokeKernel(kernel, adapted, out_shape, self.options());
+}
+
+// ---------------------------------------------------------------------------
+// Single-dim reduction dispatch helper
+// ---------------------------------------------------------------------------
+
+at::Tensor dispatchSingleDimReduction(
+    const char* aten_name, const char* torch_op,
+    const at::Tensor& self, int64_t dim, bool keepdim,
+    const std::string& extra_decls,
+    const std::string& extra_args,
+    const std::string& extra_types) {
+  TORCH_CHECK(hasPyreBuffer(self), "pyre: ", aten_name,
+      " requires IREE buffers");
+
+  auto dtype = self.scalar_type();
+  if (dim < 0) dim += self.dim();
+
+  auto out_shape = inferReducedShape(self.sizes(), {dim}, keepdim);
+  auto func_name = funcNameDefault(aten_name);
+
+  auto spec = buildSingleDimReductionKernelSpec(
+      func_name, torch_op, dtype,
+      self.sizes(), out_shape, dim, keepdim,
+      extra_decls, extra_args, extra_types);
+
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateSingleDimReductionMlir(
+        func_name, torch_op, dtype,
+        self.sizes(), out_shape, dim, keepdim,
+        extra_decls, extra_args, extra_types);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  return invokeKernel(kernel, {self}, out_shape, self.options());
+}
+
+// ---------------------------------------------------------------------------
+// TypeCastOp
+// ---------------------------------------------------------------------------
+
+at::Tensor TypeCastOp::impl(
+    const at::Tensor& self,
+    std::optional<at::ScalarType> dtype,
+    std::optional<at::Layout> layout,
+    std::optional<at::Device> device,
+    std::optional<bool> pin_memory,
+    bool non_blocking,
+    std::optional<at::MemoryFormat> memory_format) {
+  if (!hasPyreBuffer(self) || !dtype.has_value() || *dtype == self.scalar_type())
+    return at::native::_to_copy(self, dtype, layout, device, pin_memory,
+                                 non_blocking, memory_format);
+
+  auto in_dtype = self.scalar_type();
+  auto out_dtype = *dtype;
+  auto func_name = funcNameDefault(aten_name);
+
+  auto spec = buildTypeCastKernelSpec(func_name, in_dtype, out_dtype, self.sizes());
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateTypeCastMlir(func_name, in_dtype, out_dtype, self.sizes());
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  return invokeKernel(kernel, {self}, c10::DimVector(self.sizes()),
+                      self.options().dtype(out_dtype));
+}
+
+// ---------------------------------------------------------------------------
+// CatOp — algorithmic MLIR generation using PyreKernelAsmFragments
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::string_view kCatHeader = R"(
+module @module {
+  func.func @$$FUNC$$(
+      %out_: !torch.tensor<[$$OUT_SHAPE$$], $$ELT$$>)";
+
+constexpr std::string_view kCatInput = R"(,
+      %input$$IDX$$: !torch.vtensor<[$$INPUT_SHAPE$$], $$ELT$$>)";
+
+constexpr std::string_view kCatBody = R"(
+  ) attributes {torch.assume_strict_symbolic_shapes} {
+    %inputs = torch.prim.ListConstruct $$INPUT_NAMES$$ : ($$INPUT_TYPES$$) -> !torch.list<vtensor>
+    %dim = torch.constant.int $$DIM$$
+    %result = torch.aten.cat %inputs, %dim : !torch.list<vtensor>, !torch.int -> !torch.vtensor<[$$OUT_SHAPE$$], $$ELT$$>
+    torch.overwrite.tensor.contents %result overwrites %out_ : !torch.vtensor<[$$OUT_SHAPE$$], $$ELT$$>, !torch.tensor<[$$OUT_SHAPE$$], $$ELT$$>
+    return
+  }
+}
+)";
+
+static PyreKernelAsmFragments& catFragments() {
+  static PyreKernelAsmFragments frags({kCatHeader, kCatInput, kCatBody});
+  return frags;
+}
+
+} // namespace
+
+at::Tensor CatOp::impl(const at::ITensorListRef& tensors, int64_t dim) {
+  auto materialized = tensors.materialize();
+  TORCH_CHECK(!materialized.empty(), "pyre: cat requires at least one tensor");
+
+  for (const auto& t : materialized)
+    TORCH_CHECK(hasPyreBuffer(t.get()), "pyre: cat requires IREE buffers");
+
+  auto dtype = materialized[0].get().scalar_type();
+  if (dim < 0) dim += materialized[0].get().dim();
+
+  c10::DimVector out_shape(materialized[0].get().sizes().begin(),
+                           materialized[0].get().sizes().end());
+  out_shape[dim] = 0;
+  for (const auto& t : materialized)
+    out_shape[dim] += t.get().size(dim);
+
+  auto func_name = funcNameDefault(aten_name);
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string dim_str = std::to_string(dim);
+
+  auto dynShape = [](const at::Tensor& t) {
+    std::string s;
+    for (int64_t i = 0; i < t.dim(); ++i) {
+      if (i > 0) s += ",";
+      s += (t.size(i) == 1) ? "1" : "?";
+    }
+    return s;
+  };
+
+  std::string out_s;
+  for (size_t i = 0; i < out_shape.size(); ++i) {
+    if (i > 0) out_s += ",";
+    out_s += (out_shape[i] == 1) ? "1" : "?";
+  }
+
+  // Pre-compute per-input shape strings
+  c10::SmallVector<std::string, 8> input_shapes;
+  for (const auto& t : materialized)
+    input_shapes.push_back(dynShape(t.get()));
+
+  // Build input_names and input_types strings
+  std::string input_names, input_types;
+  for (size_t i = 0; i < materialized.size(); ++i) {
+    if (i > 0) { input_names += ", "; input_types += ", "; }
+    input_names += "%input" + std::to_string(i);
+    input_types += "!torch.vtensor<[" + input_shapes[i] + "], " + elt + ">";
+  }
+
+  // Recipe lambda: replayed in both digest and generate modes
+  auto recipe = [&](PyreKernelAsmBuilder& b) {
+    b.appendFragment(0, {{"FUNC", func_name}, {"OUT_SHAPE", out_s}, {"ELT", elt}});
+    for (size_t i = 0; i < materialized.size(); ++i) {
+      b.appendFragment(1, {
+          {"IDX", std::to_string(i)},
+          {"INPUT_SHAPE", input_shapes[i]},
+          {"ELT", elt}});
+    }
+    b.appendFragment(2, {
+        {"INPUT_NAMES", input_names}, {"INPUT_TYPES", input_types},
+        {"DIM", dim_str}, {"OUT_SHAPE", out_s}, {"ELT", elt}});
+  };
+
+  auto& frags = catFragments();
+  auto cache_key = frags.digest(
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags(), recipe);
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = frags.generateMlir(recipe);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  std::vector<at::Tensor> inputs;
+  inputs.reserve(materialized.size());
+  for (const auto& t : materialized)
+    inputs.push_back(t.get());
+
+  return invokeKernel(kernel, inputs, out_shape,
+                      materialized[0].get().options());
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
 void registerCompiledOps(torch::Library& m) {
+  // Binary ops (sorted by aten_name)
   AddOp::register_impl(m);
-  SubOp::register_impl(m);
-  MulOp::register_impl(m);
-  DivOp::register_impl(m);
-  MmOp::register_impl(m);
   AddmmOp::register_impl(m);
-  NegOp::register_impl(m);
-  ReluOp::register_impl(m);
+  Atan2Op::register_impl(m);
+  BitwiseAndOp::register_impl(m);
+  BitwiseOrOp::register_impl(m);
+  BitwiseXorOp::register_impl(m);
+  DivOp::register_impl(m);
+  FmodOp::register_impl(m);
+  MaximumOp::register_impl(m);
+  MinimumOp::register_impl(m);
+  MmOp::register_impl(m);
+  MulOp::register_impl(m);
+  PowTensorOp::register_impl(m);
+  RemainderOp::register_impl(m);
+  SubOp::register_impl(m);
+
+  // Unary ops
   AbsOp::register_impl(m);
+  BitwiseNotOp::register_impl(m);
+  CeilOp::register_impl(m);
+  CosOp::register_impl(m);
+  EluOp::register_impl(m);
+  ErfOp::register_impl(m);
+  ExpOp::register_impl(m);
+  FloorOp::register_impl(m);
+  GeluOp::register_impl(m);
+  HardtanhOp::register_impl(m);
+  LeakyReluOp::register_impl(m);
+  LogOp::register_impl(m);
+  LogicalNotOp::register_impl(m);
+  NegOp::register_impl(m);
+  ReciprocalOp::register_impl(m);
+  ReluOp::register_impl(m);
+  RoundOp::register_impl(m);
+  RsqrtOp::register_impl(m);
+  SigmoidOp::register_impl(m);
+  SignOp::register_impl(m);
+  SiluOp::register_impl(m);
+  SinOp::register_impl(m);
+  SqrtOp::register_impl(m);
+  TanhOp::register_impl(m);
+
+  // Scalar binary ops
+  AddScalarOp::register_impl(m);
+  DivScalarOp::register_impl(m);
+  MulScalarOp::register_impl(m);
+  PowScalarOp::register_impl(m);
+  SubScalarOp::register_impl(m);
+
+  // Comparison ops
+  EqScalarOp::register_impl(m);
+  EqTensorOp::register_impl(m);
+  GeScalarOp::register_impl(m);
+  GeTensorOp::register_impl(m);
+  GtScalarOp::register_impl(m);
+  GtTensorOp::register_impl(m);
+  LeScalarOp::register_impl(m);
+  LeTensorOp::register_impl(m);
+  LtScalarOp::register_impl(m);
+  LtTensorOp::register_impl(m);
+  NeScalarOp::register_impl(m);
+  NeTensorOp::register_impl(m);
+
+  // Reduction ops
+  AmaxOp::register_impl(m);
+  AminOp::register_impl(m);
+  MeanOp::register_impl(m);
+  ProdOp::register_impl(m);
+  SumOp::register_impl(m);
+
+  // Custom ops
+  BmmOp::register_impl(m);
+  CatOp::register_impl(m);
+  TypeCastOp::register_impl(m);
+  WhereOp::register_impl(m);
 }
 
 } // namespace at::pyre

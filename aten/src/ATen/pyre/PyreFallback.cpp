@@ -1,7 +1,7 @@
 // Pyre kernel registrations for PrivateUse1 (host device).
 //
 // Non-compiled ops (empty, fill, copy, view) live here.
-// Compiled ops are registered via PyreOp.h / PyreOps.cpp.
+// Compiled ops are registered via PyreOps.h / PyreOps.cpp.
 
 #include <ATen/core/Tensor.h>
 #include <ATen/EmptyTensor.h>
@@ -9,18 +9,27 @@
 #include <ATen/native/Resize.h>
 #include <ATen/native/TensorShape.h>
 #include <ATen/pyre/PyreTensor.h>
-#include <ATen/pyre/PyreOp.h>
+#include <ATen/pyre/PyreOps.h>
 #include <ATen/pyre/dispatch/PyreKernels.h>
 #include <ATen/pyre/dispatch/StridedCopyPlan.h>
 
 #ifdef AT_PER_OPERATOR_HEADERS
 #include <ATen/ops/as_strided_native.h>
+#include <ATen/ops/chunk_native.h>
+#include <ATen/ops/clone_native.h>
+#include <ATen/ops/empty.h>
 #include <ATen/ops/expand_native.h>
+#include <ATen/ops/narrow_native.h>
 #include <ATen/ops/permute_native.h>
 #include <ATen/ops/reshape_native.h>
 #include <ATen/ops/resize_native.h>
+#include <ATen/ops/select_native.h>
 #include <ATen/ops/slice_native.h>
+#include <ATen/ops/split_native.h>
+#include <ATen/ops/split_with_sizes_native.h>
 #include <ATen/ops/t_native.h>
+#include <ATen/ops/transpose_native.h>
+#include <ATen/ops/unfold_native.h>
 #include <ATen/ops/unsqueeze_native.h>
 #include <ATen/ops/view_native.h>
 #else
@@ -212,42 +221,80 @@ at::Scalar pyre_local_scalar_dense(const at::Tensor& self) {
       });
 }
 
-// --- View ops ---
+// --- View ops and clone (sorted by op name) ---
 
 at::Tensor pyre_as_strided(
     const at::Tensor& self, c10::IntArrayRef size,
     c10::IntArrayRef stride, std::optional<int64_t> storage_offset) {
   return at::native::as_strided_tensorimpl(self, size, stride, storage_offset);
 }
-at::Tensor pyre_view(const at::Tensor& self, c10::SymIntArrayRef size) {
-  return at::native::view(self, C10_AS_INTARRAYREF_SLOW(size));
+std::vector<at::Tensor> pyre_chunk(
+    const at::Tensor& self, int64_t chunks, int64_t dim) {
+  return at::native::chunk(self, chunks, dim);
 }
-at::Tensor pyre_reshape(const at::Tensor& self, c10::SymIntArrayRef shape) {
-  return at::native::reshape_symint(self, shape);
+at::Tensor pyre_clone(
+    const at::Tensor& self,
+    std::optional<at::MemoryFormat> memory_format) {
+  TORCH_CHECK(!memory_format.has_value() ||
+              *memory_format == at::MemoryFormat::Contiguous ||
+              *memory_format == at::MemoryFormat::Preserve,
+      "pyre: clone only supports Contiguous/Preserve memory format");
+  auto output = at::empty(self.sizes(), self.options());
+  output.copy_(self);
+  return output;
 }
 at::Tensor pyre_expand(
     const at::Tensor& self, c10::IntArrayRef size, bool implicit) {
   return at::native::expand(self, size, implicit);
 }
+at::Tensor pyre_narrow_symint(
+    const at::Tensor& self, int64_t dim,
+    c10::SymInt start, c10::SymInt length) {
+  return at::native::narrow_symint(self, dim, start, length);
+}
 at::Tensor pyre_permute(const at::Tensor& self, c10::IntArrayRef dims) {
   return at::native::permute(self, dims);
 }
-at::Tensor pyre_t(const at::Tensor& self) {
-  return at::native::t(self);
-}
-at::Tensor pyre_unsqueeze(const at::Tensor& self, int64_t dim) {
-  return at::native::unsqueeze(self, dim);
-}
-at::Tensor pyre_slice(
-    const at::Tensor& self, int64_t dim,
-    std::optional<int64_t> start, std::optional<int64_t> end, int64_t step) {
-  return at::native::slice(self, dim, start, end, step);
+at::Tensor pyre_reshape(const at::Tensor& self, c10::SymIntArrayRef shape) {
+  return at::native::reshape_symint(self, shape);
 }
 const at::Tensor& pyre_resize_(
     const at::Tensor& self, c10::SymIntArrayRef size,
     std::optional<at::MemoryFormat> memory_format) {
   return at::native::resize__symint(self, size, memory_format);
 }
+at::Tensor pyre_select(const at::Tensor& self, int64_t dim, c10::SymInt index) {
+  return at::native::select_symint(self, dim, index);
+}
+at::Tensor pyre_slice(
+    const at::Tensor& self, int64_t dim,
+    std::optional<int64_t> start, std::optional<int64_t> end, int64_t step) {
+  return at::native::slice(self, dim, start, end, step);
+}
+std::vector<at::Tensor> pyre_split(
+    const at::Tensor& self, int64_t split_size, int64_t dim) {
+  return at::native::split(self, split_size, dim);
+}
+std::vector<at::Tensor> pyre_split_with_sizes(
+    const at::Tensor& self, at::IntArrayRef split_sizes, int64_t dim) {
+  return at::native::split_with_sizes(self, split_sizes, dim);
+}
+at::Tensor pyre_t(const at::Tensor& self) {
+  return at::native::t(self);
+}
+at::Tensor pyre_transpose(const at::Tensor& self, int64_t dim0, int64_t dim1) {
+  return at::native::transpose(self, dim0, dim1);
+}
+at::Tensor pyre_unfold(const at::Tensor& self, int64_t dim, int64_t size, int64_t step) {
+  return at::native::unfold(self, dim, size, step);
+}
+at::Tensor pyre_unsqueeze(const at::Tensor& self, int64_t dim) {
+  return at::native::unsqueeze(self, dim);
+}
+at::Tensor pyre_view(const at::Tensor& self, c10::SymIntArrayRef size) {
+  return at::native::view(self, C10_AS_INTARRAYREF_SLOW(size));
+}
+
 // --- CPU fallback ---
 
 void cpu_fallback(
@@ -258,23 +305,32 @@ void cpu_fallback(
 } // namespace
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
-  m.impl("empty.memory_format", empty_memory_format);
-  m.impl("empty_strided", empty_strided);
-  m.impl("fill_.Scalar", fill_scalar);
+  // Storage and data movement
   m.impl("_copy_from", pyre_copy_from);
   m.impl("_copy_from_and_resize", pyre_copy_from_and_resize);
   m.impl("_local_scalar_dense", pyre_local_scalar_dense);
-
-  // View ops
-  m.impl("as_strided", pyre_as_strided);
-  m.impl("view", pyre_view);
-  m.impl("reshape", pyre_reshape);
-  m.impl("expand", pyre_expand);
-  m.impl("permute", pyre_permute);
-  m.impl("t", pyre_t);
-  m.impl("unsqueeze", pyre_unsqueeze);
-  m.impl("slice.Tensor", pyre_slice);
+  m.impl("empty.memory_format", empty_memory_format);
+  m.impl("empty_strided", empty_strided);
+  m.impl("fill_.Scalar", fill_scalar);
   m.impl("resize_", pyre_resize_);
+
+  // View ops and clone (sorted by op name)
+  m.impl("as_strided", pyre_as_strided);
+  m.impl("chunk", pyre_chunk);
+  m.impl("clone", pyre_clone);
+  m.impl("expand", pyre_expand);
+  m.impl("narrow", pyre_narrow_symint);
+  m.impl("permute", pyre_permute);
+  m.impl("reshape", pyre_reshape);
+  m.impl("select.int", pyre_select);
+  m.impl("slice.Tensor", pyre_slice);
+  m.impl("split.Tensor", pyre_split);
+  m.impl("split_with_sizes", pyre_split_with_sizes);
+  m.impl("t", pyre_t);
+  m.impl("transpose.int", pyre_transpose);
+  m.impl("unfold", pyre_unfold);
+  m.impl("unsqueeze", pyre_unsqueeze);
+  m.impl("view", pyre_view);
 
   // Compiled ops (CRTP registry)
   registerCompiledOps(m);
