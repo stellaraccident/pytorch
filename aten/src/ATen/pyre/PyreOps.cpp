@@ -6,6 +6,7 @@
 #include <ATen/NativeFunctions.h>
 #endif
 
+#include <cmath>
 #include <set>
 
 namespace at::pyre {
@@ -427,6 +428,52 @@ at::Tensor dispatchSingleDimReduction(
 }
 
 // ---------------------------------------------------------------------------
+// ArangeOp
+// ---------------------------------------------------------------------------
+
+at::Tensor ArangeOp::impl(
+    const at::Scalar& start, const at::Scalar& end, const at::Scalar& step,
+    std::optional<at::ScalarType> dtype,
+    std::optional<at::Layout>,
+    std::optional<at::Device> device,
+    std::optional<bool>) {
+  double start_d = start.toDouble();
+  double end_d = end.toDouble();
+  double step_d = step.toDouble();
+  TORCH_CHECK(step_d != 0, "pyre: arange step must be non-zero");
+  TORCH_CHECK((end_d - start_d) / step_d >= 0,
+      "pyre: arange upper bound and step mismatch");
+
+  int64_t out_size = static_cast<int64_t>(
+      std::ceil((end_d - start_d) / step_d));
+  if (out_size < 0) out_size = 0;
+
+  auto out_dtype = dtype.value_or(
+      start.isFloatingPoint() || end.isFloatingPoint() || step.isFloatingPoint()
+          ? at::kFloat : at::kLong);
+  auto out_device = c10::device_or_default(device);
+
+  auto func_name = funcNameDefault(aten_name);
+  auto spec = buildArangeKernelSpec(
+      func_name, out_dtype, out_size, start_d, end_d, step_d);
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateArangeMlir(
+        func_name, out_dtype, out_size, start_d, end_d, step_d);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  // Zero tensor inputs — invoke with empty input list.
+  return invokeKernel(kernel, {}, {out_size},
+                      at::TensorOptions().dtype(out_dtype).device(out_device));
+}
+
+// ---------------------------------------------------------------------------
 // TypeCastOp
 // ---------------------------------------------------------------------------
 
@@ -699,6 +746,7 @@ void registerCompiledOps(torch::Library& m) {
   SumOp::register_impl(m);
 
   // --- Custom ops ---
+  ArangeOp::register_impl(m);
   BmmOp::register_impl(m);
   CatOp::register_impl(m);
   TypeCastOp::register_impl(m);

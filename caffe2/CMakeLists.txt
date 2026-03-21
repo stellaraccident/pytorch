@@ -1244,6 +1244,7 @@ if(USE_PYRE)
   set(PYRE_TEMPLATES
     ${PYRE_TEMPLATE_DIR}/addmm.mlir
     ${PYRE_TEMPLATE_DIR}/addmm_transposed.mlir
+    ${PYRE_TEMPLATE_DIR}/arange.mlir
     ${PYRE_TEMPLATE_DIR}/elementwise_binary.mlir
     ${PYRE_TEMPLATE_DIR}/elementwise_unary.mlir
     ${PYRE_TEMPLATE_DIR}/mm.mlir

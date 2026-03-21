@@ -295,6 +295,24 @@ at::Tensor pyre_view(const at::Tensor& self, c10::SymIntArrayRef size) {
   return at::native::view(self, C10_AS_INTARRAYREF_SLOW(size));
 }
 
+// --- arange overload forwarding ---
+
+at::Tensor pyre_arange(
+    const at::Scalar& end,
+    std::optional<at::ScalarType> dtype, std::optional<at::Layout> layout,
+    std::optional<at::Device> device, std::optional<bool> pin_memory) {
+  return at::arange(at::Scalar(0), end, at::Scalar(1),
+                    dtype, layout, device, pin_memory);
+}
+
+at::Tensor pyre_arange_start(
+    const at::Scalar& start, const at::Scalar& end,
+    std::optional<at::ScalarType> dtype, std::optional<at::Layout> layout,
+    std::optional<at::Device> device, std::optional<bool> pin_memory) {
+  return at::arange(start, end, at::Scalar(1),
+                    dtype, layout, device, pin_memory);
+}
+
 // --- CPU fallback ---
 
 void cpu_fallback(
@@ -305,6 +323,10 @@ void cpu_fallback(
 } // namespace
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  // Factory ops
+  m.impl("arange", pyre_arange);
+  m.impl("arange.start", pyre_arange_start);
+
   // Storage and data movement
   m.impl("_copy_from", pyre_copy_from);
   m.impl("_copy_from_and_resize", pyre_copy_from_and_resize);

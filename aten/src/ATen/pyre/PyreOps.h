@@ -995,6 +995,18 @@ struct ProdOp : PyreOp<ProdOp> {
   }
 };
 
+// --- ArangeOp (zero tensor inputs — scalar-only kernel) ---
+
+struct ArangeOp : PyreOp<ArangeOp> {
+  static constexpr const char* aten_name = "arange.start_step";
+  static at::Tensor impl(
+      const at::Scalar& start, const at::Scalar& end, const at::Scalar& step,
+      std::optional<at::ScalarType> dtype,
+      std::optional<at::Layout> layout,
+      std::optional<at::Device> device,
+      std::optional<bool> pin_memory);
+};
+
 // --- TypeCastOp (_to_copy with dtype) ---
 
 struct TypeCastOp : PyreOp<TypeCastOp> {

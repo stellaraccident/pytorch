@@ -35,6 +35,16 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// --- arange ---
+
+KernelSpec buildArangeKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step);
+
+std::string generateArangeMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step);
+
 // --- Type cast ---
 
 KernelSpec buildTypeCastKernelSpec(

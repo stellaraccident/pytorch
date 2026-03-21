@@ -1256,4 +1256,57 @@ std::string PyreKernelAsmFragments::generateMlir(
   return builder.finish();
 }
 
+// ---------------------------------------------------------------------------
+// arange — build + generate
+// ---------------------------------------------------------------------------
+
+static SubstPairs arangeVars(
+    const std::string& func_name, c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  bool is_float = isFloatDtype(dtype);
+  std::string scalar_type = is_float ? "!torch.float" : "!torch.int";
+  std::string size_str = std::to_string(out_size);
+
+  std::ostringstream ss;
+  ss << std::fixed;
+  std::string start_decl, end_decl, step_decl;
+  if (is_float) {
+    ss.str(""); ss << "    %start = torch.constant.float " << start;
+    start_decl = ss.str();
+    ss.str(""); ss << "    %end = torch.constant.float " << end;
+    end_decl = ss.str();
+    ss.str(""); ss << "    %step = torch.constant.float " << step;
+    step_decl = ss.str();
+  } else {
+    start_decl = "    %start = torch.constant.int " +
+        std::to_string(static_cast<int64_t>(start));
+    end_decl = "    %end = torch.constant.int " +
+        std::to_string(static_cast<int64_t>(end));
+    step_decl = "    %step = torch.constant.int " +
+        std::to_string(static_cast<int64_t>(step));
+  }
+
+  return {
+      {"func_name", func_name}, {"element_type", elt},
+      {"out_size", size_str}, {"scalar_type", scalar_type},
+      {"start_decl", start_decl}, {"end_decl", end_decl},
+      {"step_decl", step_decl},
+  };
+}
+
+KernelSpec buildArangeKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step) {
+  return {kTemplate_arange_sha1,
+          arangeVars(func_name, dtype, out_size, start, end, step)};
+}
+
+std::string generateArangeMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step) {
+  return pyreSpliceRange(kTemplate_arange,
+      arangeVars(func_name, dtype, out_size, start, end, step));
+}
+
 } // namespace at::pyre
