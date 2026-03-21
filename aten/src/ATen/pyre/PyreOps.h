@@ -1021,6 +1021,44 @@ struct GatherOp : PyreOp<GatherOp> {
       bool sparse_grad);
 };
 
+// --- ScatterSrcOp ---
+
+struct ScatterSrcOp : PyreOp<ScatterSrcOp> {
+  static constexpr const char* aten_name = "scatter.src";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+  static at::Tensor& impl_inplace(
+      at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+};
+
+// --- ScatterAddOp ---
+
+struct ScatterAddOp : PyreOp<ScatterAddOp> {
+  static constexpr const char* aten_name = "scatter_add";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+  static at::Tensor& impl_inplace(
+      at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+};
+
+// --- IndexPutOp ---
+
+struct IndexPutOp : PyreOp<IndexPutOp> {
+  static constexpr const char* aten_name = "index_put";
+  static at::Tensor impl(
+      const at::Tensor& self,
+      const c10::List<std::optional<at::Tensor>>& indices,
+      const at::Tensor& values, bool accumulate);
+  static at::Tensor& impl_inplace(
+      at::Tensor& self,
+      const c10::List<std::optional<at::Tensor>>& indices,
+      const at::Tensor& values, bool accumulate);
+};
+
 // --- IndexTensorOp (advanced indexing with variable index list) ---
 
 struct IndexTensorOp : PyreOp<IndexTensorOp> {

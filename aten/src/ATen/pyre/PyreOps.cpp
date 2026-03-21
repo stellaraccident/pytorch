@@ -526,6 +526,225 @@ at::Tensor GatherOp::impl(
 }
 
 // ---------------------------------------------------------------------------
+// ScatterSrcOp
+// ---------------------------------------------------------------------------
+
+static at::Tensor dispatchScatterSrc(
+    const at::Tensor& self, int64_t dim,
+    const at::Tensor& index, const at::Tensor& src) {
+  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(index) && hasPyreBuffer(src),
+      "pyre: scatter.src requires IREE buffers");
+  if (dim < 0) dim += self.dim();
+  auto dtype = self.scalar_type();
+  auto func_name = funcNameDefault("scatter_src");
+
+  auto spec = buildScatterSrcKernelSpec(
+      func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateScatterSrcMlir(
+        func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+  return invokeKernel(kernel, {self, index, src},
+                      c10::DimVector(self.sizes()), self.options());
+}
+
+at::Tensor ScatterSrcOp::impl(
+    const at::Tensor& self, int64_t dim,
+    const at::Tensor& index, const at::Tensor& src) {
+  return dispatchScatterSrc(self, dim, index, src);
+}
+
+at::Tensor& ScatterSrcOp::impl_inplace(
+    at::Tensor& self, int64_t dim,
+    const at::Tensor& index, const at::Tensor& src) {
+  auto result = dispatchScatterSrc(self, dim, index, src);
+  self.copy_(result);
+  return self;
+}
+
+// ---------------------------------------------------------------------------
+// ScatterAddOp
+// ---------------------------------------------------------------------------
+
+static at::Tensor dispatchScatterAdd(
+    const at::Tensor& self, int64_t dim,
+    const at::Tensor& index, const at::Tensor& src) {
+  TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(index) && hasPyreBuffer(src),
+      "pyre: scatter_add requires IREE buffers");
+  if (dim < 0) dim += self.dim();
+  auto dtype = self.scalar_type();
+  auto func_name = funcNameDefault("scatter_add");
+
+  auto spec = buildScatterAddKernelSpec(
+      func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateScatterAddMlir(
+        func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+  return invokeKernel(kernel, {self, index, src},
+                      c10::DimVector(self.sizes()), self.options());
+}
+
+at::Tensor ScatterAddOp::impl(
+    const at::Tensor& self, int64_t dim,
+    const at::Tensor& index, const at::Tensor& src) {
+  return dispatchScatterAdd(self, dim, index, src);
+}
+
+at::Tensor& ScatterAddOp::impl_inplace(
+    at::Tensor& self, int64_t dim,
+    const at::Tensor& index, const at::Tensor& src) {
+  auto result = dispatchScatterAdd(self, dim, index, src);
+  self.copy_(result);
+  return self;
+}
+
+// ---------------------------------------------------------------------------
+// IndexPutOp — algorithmic MLIR for variable-length index list
+// ---------------------------------------------------------------------------
+
+static at::Tensor dispatchIndexPut(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices,
+    const at::Tensor& values, bool accumulate) {
+  TORCH_CHECK(hasPyreBuffer(self), "pyre: index_put requires IREE self");
+  TORCH_CHECK(hasPyreBuffer(values), "pyre: index_put requires IREE values");
+
+  // Collect non-None indices, promoting CPU to device.
+  c10::SmallVector<std::pair<int64_t, at::Tensor>, 4> non_none;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (indices[i].has_value() && indices[i]->defined()) {
+      auto idx = *indices[i];
+      if (!hasPyreBuffer(idx))
+        idx = idx.to(self.device());
+      non_none.push_back({i, idx});
+    }
+  }
+  TORCH_CHECK(!non_none.empty(),
+      "pyre: index_put requires at least one index tensor");
+
+  auto dtype = self.scalar_type();
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  auto func_name = funcNameDefault("index_put");
+
+  auto dynShape = [](c10::IntArrayRef sizes) {
+    std::string s;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      if (i > 0) s += ",";
+      s += (sizes[i] == 1) ? "1" : "?";
+    }
+    return s;
+  };
+
+  std::string self_s = dynShape(self.sizes());
+  std::string vals_s = dynShape(values.sizes());
+
+  c10::SmallVector<std::string, 8> idx_shapes;
+  for (const auto& [dim, idx] : non_none)
+    idx_shapes.push_back(dynShape(idx.sizes()));
+
+  // Build opt decls, names, types for the index list
+  std::string opt_decls, opt_names, opt_types;
+  int tensor_counter = 0;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (i > 0) { opt_names += ", "; opt_types += ", "; }
+    opt_names += "%opt" + std::to_string(i);
+    opt_types += "!torch.optional<vtensor>";
+
+    if (indices[i].has_value() && indices[i]->defined()) {
+      std::string tidx = std::to_string(tensor_counter);
+      std::string ish = idx_shapes[tensor_counter];
+      opt_decls += "\n    %opt" + std::to_string(i) +
+          " = torch.derefine %idx" + tidx +
+          " : !torch.vtensor<[" + ish + "], si64> to !torch.optional<vtensor>";
+      tensor_counter++;
+    } else {
+      opt_decls += "\n    %none" + std::to_string(i) + " = torch.constant.none" +
+          "\n    %opt" + std::to_string(i) +
+          " = torch.derefine %none" + std::to_string(i) +
+          " : !torch.none to !torch.optional<vtensor>";
+    }
+  }
+
+  std::string accum_str = accumulate ? "true" : "false";
+
+  // Generate MLIR algorithmically
+  std::string mlir_text = "\nmodule @module {\n  func.func @" + func_name + "(\n"
+      "      %out_: !torch.tensor<[" + self_s + "], " + elt + ">,\n"
+      "      %self: !torch.vtensor<[" + self_s + "], " + elt + ">";
+  for (size_t i = 0; i < non_none.size(); ++i) {
+    mlir_text += ",\n      %idx" + std::to_string(i) +
+        ": !torch.vtensor<[" + idx_shapes[i] + "], si64>";
+  }
+  mlir_text += ",\n      %values: !torch.vtensor<[" + vals_s + "], " + elt + ">"
+      "\n  ) attributes {torch.assume_strict_symbolic_shapes} {" +
+      opt_decls +
+      "\n    %accum = torch.constant.bool " + accum_str +
+      "\n    %list = torch.prim.ListConstruct " + opt_names +
+      " : (" + opt_types + ") -> !torch.list<optional<vtensor>>"
+      "\n    %result = torch.aten.index_put %self, %list, %values, %accum"
+      " : !torch.vtensor<[" + self_s + "], " + elt + ">, "
+      "!torch.list<optional<vtensor>>, "
+      "!torch.vtensor<[" + vals_s + "], " + elt + ">, !torch.bool"
+      " -> !torch.vtensor<[" + self_s + "], " + elt + ">"
+      "\n    torch.overwrite.tensor.contents %result overwrites %out_"
+      " : !torch.vtensor<[" + self_s + "], " + elt + ">, "
+      "!torch.tensor<[" + self_s + "], " + elt + ">"
+      "\n    return\n  }\n}\n";
+
+  // Hash for cache key
+  c10::sha1 hasher(mlir_text);
+  std::string extra = "";
+  for (const auto& f : c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags())
+    extra += f + "\0";
+  auto cache_key = c10::sha1(mlir_text + extra).str();
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    kernel = getOrCompile(cache_key, func_name, mlir_text);
+  }
+
+  std::vector<at::Tensor> inputs;
+  inputs.push_back(self);
+  for (const auto& [dim, idx] : non_none)
+    inputs.push_back(idx);
+  inputs.push_back(values);
+
+  return invokeKernel(kernel, inputs, c10::DimVector(self.sizes()), self.options());
+}
+
+at::Tensor IndexPutOp::impl(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices,
+    const at::Tensor& values, bool accumulate) {
+  return dispatchIndexPut(self, indices, values, accumulate);
+}
+
+at::Tensor& IndexPutOp::impl_inplace(
+    at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices,
+    const at::Tensor& values, bool accumulate) {
+  auto result = dispatchIndexPut(self, indices, values, accumulate);
+  self.copy_(result);
+  return self;
+}
+
+// ---------------------------------------------------------------------------
 // IndexTensorOp — algorithmic MLIR generation for variable index lists
 // ---------------------------------------------------------------------------
 
@@ -1011,6 +1230,12 @@ void registerCompiledOps(torch::Library& m) {
   GatherOp::register_impl(m);
   IndexSelectOp::register_impl(m);
   IndexTensorOp::register_impl(m);
+  m.impl("index_put", &IndexPutOp::impl);
+  m.impl("index_put_", &IndexPutOp::impl_inplace);
+  m.impl("scatter.src", &ScatterSrcOp::impl);
+  m.impl("scatter_.src", &ScatterSrcOp::impl_inplace);
+  m.impl("scatter_add", &ScatterAddOp::impl);
+  m.impl("scatter_add_", &ScatterAddOp::impl_inplace);
   TypeCastOp::register_impl(m);
   WhereOp::register_impl(m);
 }

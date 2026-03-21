@@ -1257,6 +1257,76 @@ std::string PyreKernelAsmFragments::generateMlir(
 }
 
 // ---------------------------------------------------------------------------
+// scatter_src — build + generate
+// ---------------------------------------------------------------------------
+
+static SubstPairs scatterSrcVars(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  return {
+      {"func_name", func_name},
+      {"element_type", scalarTypeToTorchMlir(dtype)},
+      {"input_shape", broadcastAwareShapeStr(input_shape)},
+      {"out_shape", broadcastAwareShapeStr(input_shape)},
+      {"index_shape", broadcastAwareShapeStr(index_shape)},
+      {"src_shape", broadcastAwareShapeStr(src_shape)},
+      {"dim", std::to_string(dim)},
+  };
+}
+
+KernelSpec buildScatterSrcKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  return {kTemplate_scatter_src_sha1,
+          scatterSrcVars(func_name, dtype, input_shape, index_shape, src_shape, dim)};
+}
+
+std::string generateScatterSrcMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  return pyreSpliceRange(kTemplate_scatter_src,
+      scatterSrcVars(func_name, dtype, input_shape, index_shape, src_shape, dim));
+}
+
+// ---------------------------------------------------------------------------
+// scatter_add — build + generate
+// ---------------------------------------------------------------------------
+
+static SubstPairs scatterAddVars(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  return {
+      {"func_name", func_name},
+      {"element_type", scalarTypeToTorchMlir(dtype)},
+      {"input_shape", broadcastAwareShapeStr(input_shape)},
+      {"out_shape", broadcastAwareShapeStr(input_shape)},
+      {"index_shape", broadcastAwareShapeStr(index_shape)},
+      {"src_shape", broadcastAwareShapeStr(src_shape)},
+      {"dim", std::to_string(dim)},
+  };
+}
+
+KernelSpec buildScatterAddKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  return {kTemplate_scatter_add_sha1,
+          scatterAddVars(func_name, dtype, input_shape, index_shape, src_shape, dim)};
+}
+
+std::string generateScatterAddMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  return pyreSpliceRange(kTemplate_scatter_add,
+      scatterAddVars(func_name, dtype, input_shape, index_shape, src_shape, dim));
+}
+
+// ---------------------------------------------------------------------------
 // embedding — build + generate
 // ---------------------------------------------------------------------------
 

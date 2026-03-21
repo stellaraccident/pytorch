@@ -35,6 +35,30 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// --- scatter_src ---
+
+KernelSpec buildScatterSrcKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+std::string generateScatterSrcMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+// --- scatter_add ---
+
+KernelSpec buildScatterAddKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+std::string generateScatterAddMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
 // --- embedding ---
 
 KernelSpec buildEmbeddingKernelSpec(
