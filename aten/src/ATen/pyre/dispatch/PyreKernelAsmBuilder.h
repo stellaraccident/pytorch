@@ -201,13 +201,15 @@ KernelSpec buildComparisonKernelSpec(
     const std::string& func_name, const std::string& torch_op,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 std::string generateComparisonMlir(
     const std::string& func_name, const std::string& torch_op,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 // --- Comparison ops (tensor-scalar) ---
 
@@ -300,12 +302,14 @@ std::string generateUnaryMlir(
 KernelSpec buildMmKernelSpec(
     const std::string& func_name, c10::ScalarType dtype,
     c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 std::string generateMmMlir(
     const std::string& func_name, c10::ScalarType dtype,
     c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 // --- addmm ---
 

@@ -428,7 +428,8 @@ struct MmOp : PyreOp<MmOp> {
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
-    return {ctx.inputs[0].size(0), ctx.inputs[1].size(1)};
+    // Use raw_inputs for output shape — adapted inputs may be permuted.
+    return {ctx.raw_inputs[0].size(0), ctx.raw_inputs[1].size(1)};
   }
   static KernelSpec buildKernelSpec(
       const std::string& func_name, const OpContext& ctx);
@@ -788,14 +789,16 @@ struct ComparisonBinaryOp : PyreOp<Derived> {
     auto out_shape = inferShapeBroadcast(ctx);
     return buildComparisonKernelSpec(
         func_name, Derived::torch_op, ctx.dtype,
-        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
+        ctx.decision.arg_adapters);
   }
   static std::string generateMlir(
       const std::string& func_name, const OpContext& ctx) {
     auto out_shape = inferShapeBroadcast(ctx);
     return generateComparisonMlir(
         func_name, Derived::torch_op, ctx.dtype,
-        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
+        ctx.decision.arg_adapters);
   }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
@@ -1124,7 +1127,9 @@ struct BmmOp : PyreOp<BmmOp> {
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
-    return {ctx.inputs[0].size(0), ctx.inputs[0].size(1), ctx.inputs[1].size(2)};
+    // Use raw_inputs for output shape — adapted inputs may be permuted.
+    return {ctx.raw_inputs[0].size(0), ctx.raw_inputs[0].size(1),
+            ctx.raw_inputs[1].size(2)};
   }
   static KernelSpec buildKernelSpec(
       const std::string& func_name, const OpContext& ctx) {

@@ -278,7 +278,8 @@ KernelSpec MmOp::buildKernelSpec(
   auto out_shape = inferShape(ctx);
   return buildMmKernelSpec(
       func_name, ctx.dtype,
-      ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+      ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
+      ctx.decision.arg_adapters);
 }
 
 std::string MmOp::generateMlir(
@@ -286,7 +287,8 @@ std::string MmOp::generateMlir(
   auto out_shape = inferShape(ctx);
   return generateMmMlir(
       func_name, ctx.dtype,
-      ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+      ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
+      ctx.decision.arg_adapters);
 }
 
 // ---------------------------------------------------------------------------
