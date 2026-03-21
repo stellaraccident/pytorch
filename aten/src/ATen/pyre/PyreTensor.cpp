@@ -85,8 +85,8 @@ void PyreTensor::updateFromHost(
   // command buffer arena can't handle allocations near the 64KB limit
   // (overflows the arena block). Cap at 32KB or the IREE-defined max,
   // whichever is smaller.
-  static const iree_device_size_t kInlineUpdateMax =
-      std::min<iree_device_size_t>(32 * 1024, IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE);
+  // TODO: restore inline path after root-causing arena corruption
+  static const iree_device_size_t kInlineUpdateMax = 0;
   if (length <= kInlineUpdateMax) {
     auto target_ref = iree_hal_make_buffer_ref(buffer(), offset, length);
     submitTransfer([&](iree_hal_command_buffer_t* cmd) {

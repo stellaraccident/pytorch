@@ -824,7 +824,22 @@ static PyreKernelAsmFragments& indexFragments() {
 at::Tensor IndexTensorOp::impl(
     const at::Tensor& self,
     const c10::List<std::optional<at::Tensor>>& indices) {
-  TORCH_CHECK(hasPyreBuffer(self),
+  // Promote CPU self to device if indices are on device (common for
+  // model attributes that aren't registered buffers, e.g. causal_mask).
+  at::Tensor self_effective = self;
+  if (!hasPyreBuffer(self) && self.is_cpu()) {
+    c10::Device target = c10::kCPU;
+    for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+      if (indices[i].has_value() && indices[i]->defined() &&
+          indices[i]->is_privateuseone()) {
+        target = indices[i]->device();
+        break;
+      }
+    }
+    if (target.type() != c10::DeviceType::CPU)
+      self_effective = self.to(target);
+  }
+  TORCH_CHECK(hasPyreBuffer(self_effective),
       "pyre: index.Tensor requires IREE self");
 
   // Collect non-None indices, promoting CPU indices to device.
@@ -834,7 +849,7 @@ at::Tensor IndexTensorOp::impl(
     if (indices[i].has_value() && indices[i]->defined()) {
       auto idx = *indices[i];
       if (!hasPyreBuffer(idx))
-        idx = idx.to(self.device());
+        idx = idx.to(self_effective.device());
       non_none.push_back({i, idx});
     }
   }
@@ -843,11 +858,11 @@ at::Tensor IndexTensorOp::impl(
 
   // Fast path: single 1D index → decompose to index_select.
   if (non_none.size() == 1 && non_none[0].second.dim() == 1) {
-    return at::index_select(self, non_none[0].first, non_none[0].second);
+    return at::index_select(self_effective, non_none[0].first, non_none[0].second);
   }
 
   // General case: algorithmic MLIR generation.
-  auto dtype = self.scalar_type();
+  auto dtype = self_effective.scalar_type();
   std::string elt = scalarTypeToTorchMlir(dtype);
 
   // Compute output shape: broadcast index shapes + trailing self dims.
@@ -864,8 +879,8 @@ at::Tensor IndexTensorOp::impl(
   // Result shape: broadcast_shape + trailing dims after last indexed dim.
   int64_t last_indexed = non_none.back().first;
   c10::DimVector out_shape(bcast_shape.begin(), bcast_shape.end());
-  for (int64_t d = last_indexed + 1; d < self.dim(); ++d)
-    out_shape.push_back(self.size(d));
+  for (int64_t d = last_indexed + 1; d < self_effective.dim(); ++d)
+    out_shape.push_back(self_effective.size(d));
 
   auto func_name = funcNameDefault(aten_name);
 
@@ -878,7 +893,7 @@ at::Tensor IndexTensorOp::impl(
     return s;
   };
 
-  std::string self_s = dynShape(self.sizes());
+  std::string self_s = dynShape(self_effective.sizes());
   std::string out_s = dynShape(out_shape);
 
   // Build per-index shape strings and the opt decls/names/types.
@@ -934,11 +949,11 @@ at::Tensor IndexTensorOp::impl(
   }
 
   std::vector<at::Tensor> inputs;
-  inputs.push_back(self);
+  inputs.push_back(self_effective);
   for (const auto& [dim, idx] : non_none)
     inputs.push_back(idx);
 
-  return invokeKernel(kernel, inputs, out_shape, self.options());
+  return invokeKernel(kernel, inputs, out_shape, self_effective.options());
 }
 
 // ---------------------------------------------------------------------------
