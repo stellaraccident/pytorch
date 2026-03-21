@@ -253,6 +253,21 @@ at::Tensor invokeKernel(
   return output;
 }
 
+void invokeKernelInplace(
+    CachedKernel* kernel,
+    const std::vector<at::Tensor>& inputs,
+    at::Tensor& self) {
+  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  auto& ctx = stream.context();
+  if (self.is_contiguous()) {
+    PyreKernelDispatch::invoke(kernel, inputs, self, ctx);
+  } else {
+    auto tmp = at::empty(self.sizes(), self.options());
+    PyreKernelDispatch::invoke(kernel, inputs, tmp, ctx);
+    self.copy_(tmp);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // MmOp
 // ---------------------------------------------------------------------------
@@ -566,7 +581,7 @@ at::Tensor CatOp::impl(const at::ITensorListRef& tensors, int64_t dim) {
 // ---------------------------------------------------------------------------
 
 void registerCompiledOps(torch::Library& m) {
-  // Binary ops (sorted by aten_name)
+  // --- Binary ops (functional, sorted) ---
   AddOp::register_impl(m);
   AddmmOp::register_impl(m);
   Atan2Op::register_impl(m);
@@ -583,7 +598,20 @@ void registerCompiledOps(torch::Library& m) {
   RemainderOp::register_impl(m);
   SubOp::register_impl(m);
 
-  // Unary ops
+  // --- Binary ops (in-place, sorted) ---
+  AddOp::register_inplace(m);
+  Atan2Op::register_inplace(m);
+  BitwiseAndOp::register_inplace(m);
+  BitwiseOrOp::register_inplace(m);
+  BitwiseXorOp::register_inplace(m);
+  DivOp::register_inplace(m);
+  FmodOp::register_inplace(m);
+  MulOp::register_inplace(m);
+  PowTensorOp::register_inplace(m);
+  RemainderOp::register_inplace(m);
+  SubOp::register_inplace(m);
+
+  // --- Unary ops (functional, sorted) ---
   AbsOp::register_impl(m);
   BitwiseNotOp::register_impl(m);
   CeilOp::register_impl(m);
@@ -609,14 +637,47 @@ void registerCompiledOps(torch::Library& m) {
   SqrtOp::register_impl(m);
   TanhOp::register_impl(m);
 
-  // Scalar binary ops
+  // --- Unary ops (in-place, sorted) ---
+  AbsOp::register_inplace(m);
+  BitwiseNotOp::register_inplace(m);
+  CeilOp::register_inplace(m);
+  CosOp::register_inplace(m);
+  EluOp::register_inplace(m);
+  ErfOp::register_inplace(m);
+  ExpOp::register_inplace(m);
+  FloorOp::register_inplace(m);
+  GeluOp::register_inplace(m);
+  HardtanhOp::register_inplace(m);
+  LeakyReluOp::register_inplace(m);
+  LogOp::register_inplace(m);
+  LogicalNotOp::register_inplace(m);
+  NegOp::register_inplace(m);
+  ReciprocalOp::register_inplace(m);
+  ReluOp::register_inplace(m);
+  RoundOp::register_inplace(m);
+  RsqrtOp::register_inplace(m);
+  SigmoidOp::register_inplace(m);
+  SignOp::register_inplace(m);
+  SiluOp::register_inplace(m);
+  SinOp::register_inplace(m);
+  SqrtOp::register_inplace(m);
+  TanhOp::register_inplace(m);
+
+  // --- Scalar binary ops (functional, sorted) ---
   AddScalarOp::register_impl(m);
   DivScalarOp::register_impl(m);
   MulScalarOp::register_impl(m);
   PowScalarOp::register_impl(m);
   SubScalarOp::register_impl(m);
 
-  // Comparison ops
+  // --- Scalar binary ops (in-place, sorted) ---
+  AddScalarOp::register_inplace(m);
+  DivScalarOp::register_inplace(m);
+  MulScalarOp::register_inplace(m);
+  PowScalarOp::register_inplace(m);
+  SubScalarOp::register_inplace(m);
+
+  // --- Comparison ops (no in-place — output dtype differs) ---
   EqScalarOp::register_impl(m);
   EqTensorOp::register_impl(m);
   GeScalarOp::register_impl(m);
@@ -630,14 +691,14 @@ void registerCompiledOps(torch::Library& m) {
   NeScalarOp::register_impl(m);
   NeTensorOp::register_impl(m);
 
-  // Reduction ops
+  // --- Reduction ops (no in-place — output shape differs) ---
   AmaxOp::register_impl(m);
   AminOp::register_impl(m);
   MeanOp::register_impl(m);
   ProdOp::register_impl(m);
   SumOp::register_impl(m);
 
-  // Custom ops
+  // --- Custom ops ---
   BmmOp::register_impl(m);
   CatOp::register_impl(m);
   TypeCastOp::register_impl(m);
