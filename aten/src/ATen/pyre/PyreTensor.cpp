@@ -2,6 +2,7 @@
 #include <ATen/pyre/dispatch/PyreTypeMapping.h>
 #include <c10/pyre/impl/PyreRuntime.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace at::pyre {
@@ -80,7 +81,13 @@ void PyreTensor::copyFrom(
 
 void PyreTensor::updateFromHost(
     const void* data, iree_device_size_t offset, iree_device_size_t length) {
-  if (length <= IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE) {
+  // Use inline update_buffer only for small transfers. The IREE task
+  // command buffer arena can't handle allocations near the 64KB limit
+  // (overflows the arena block). Cap at 32KB or the IREE-defined max,
+  // whichever is smaller.
+  static const iree_device_size_t kInlineUpdateMax =
+      std::min<iree_device_size_t>(32 * 1024, IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE);
+  if (length <= kInlineUpdateMax) {
     auto target_ref = iree_hal_make_buffer_ref(buffer(), offset, length);
     submitTransfer([&](iree_hal_command_buffer_t* cmd) {
       PYRE_CHECK_OK(iree_hal_command_buffer_update_buffer(
