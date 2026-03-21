@@ -1257,6 +1257,107 @@ std::string PyreKernelAsmFragments::generateMlir(
 }
 
 // ---------------------------------------------------------------------------
+// embedding — build + generate
+// ---------------------------------------------------------------------------
+
+static SubstPairs embeddingVars(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  return {
+      {"func_name", func_name},
+      {"element_type", scalarTypeToTorchMlir(dtype)},
+      {"weight_shape", broadcastAwareShapeStr(weight_shape)},
+      {"indices_shape", broadcastAwareShapeStr(indices_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+  };
+}
+
+KernelSpec buildEmbeddingKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  return {kTemplate_embedding_sha1,
+          embeddingVars(func_name, dtype, weight_shape, indices_shape, out_shape)};
+}
+
+std::string generateEmbeddingMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  return pyreSpliceRange(kTemplate_embedding,
+      embeddingVars(func_name, dtype, weight_shape, indices_shape, out_shape));
+}
+
+// ---------------------------------------------------------------------------
+// index_select — build + generate
+// ---------------------------------------------------------------------------
+
+static SubstPairs indexSelectVars(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  return {
+      {"func_name", func_name},
+      {"element_type", scalarTypeToTorchMlir(dtype)},
+      {"input_shape", broadcastAwareShapeStr(input_shape)},
+      {"index_shape", broadcastAwareShapeStr(index_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+      {"dim", std::to_string(dim)},
+  };
+}
+
+KernelSpec buildIndexSelectKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  return {kTemplate_index_select_sha1,
+          indexSelectVars(func_name, dtype, input_shape, index_shape, out_shape, dim)};
+}
+
+std::string generateIndexSelectMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  return pyreSpliceRange(kTemplate_index_select,
+      indexSelectVars(func_name, dtype, input_shape, index_shape, out_shape, dim));
+}
+
+// ---------------------------------------------------------------------------
+// gather — build + generate
+// ---------------------------------------------------------------------------
+
+static SubstPairs gatherVars(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  return {
+      {"func_name", func_name},
+      {"element_type", scalarTypeToTorchMlir(dtype)},
+      {"input_shape", broadcastAwareShapeStr(input_shape)},
+      {"index_shape", broadcastAwareShapeStr(index_shape)},
+      {"out_shape", broadcastAwareShapeStr(out_shape)},
+      {"dim", std::to_string(dim)},
+  };
+}
+
+KernelSpec buildGatherKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  return {kTemplate_gather_sha1,
+          gatherVars(func_name, dtype, input_shape, index_shape, out_shape, dim)};
+}
+
+std::string generateGatherMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  return pyreSpliceRange(kTemplate_gather,
+      gatherVars(func_name, dtype, input_shape, index_shape, out_shape, dim));
+}
+
+// ---------------------------------------------------------------------------
 // arange — build + generate
 // ---------------------------------------------------------------------------
 

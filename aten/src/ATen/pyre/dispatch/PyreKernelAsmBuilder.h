@@ -35,6 +35,42 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// --- embedding ---
+
+KernelSpec buildEmbeddingKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+std::string generateEmbeddingMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+// --- index_select ---
+
+KernelSpec buildIndexSelectKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+std::string generateIndexSelectMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+// --- gather ---
+
+KernelSpec buildGatherKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+std::string generateGatherMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
 // --- arange ---
 
 KernelSpec buildArangeKernelSpec(

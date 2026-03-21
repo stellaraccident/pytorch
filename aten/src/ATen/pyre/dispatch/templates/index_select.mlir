@@ -1,0 +1,17 @@
+!out_t = !torch.tensor<[$$out_shape$$], $$element_type$$>
+!out_v = !torch.vtensor<[$$out_shape$$], $$element_type$$>
+!input = !torch.vtensor<[$$input_shape$$], $$element_type$$>
+!index = !torch.vtensor<[$$index_shape$$], si64>
+
+module @module {
+  func.func @$$func_name$$(
+      %out_: !out_t,
+      %input: !input,
+      %index: !index
+  ) attributes {torch.assume_strict_symbolic_shapes} {
+    %dim = torch.constant.int $$dim$$
+    %result = torch.aten.index_select %input, %dim, %index : !input, !torch.int, !index -> !out_v
+    torch.overwrite.tensor.contents %result overwrites %out_ : !out_v, !out_t
+    return
+  }
+}

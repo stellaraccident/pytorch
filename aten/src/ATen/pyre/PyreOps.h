@@ -995,6 +995,41 @@ struct ProdOp : PyreOp<ProdOp> {
   }
 };
 
+// --- EmbeddingOp (mixed-dtype: float weight + int64 indices) ---
+
+struct EmbeddingOp : PyreOp<EmbeddingOp> {
+  static constexpr const char* aten_name = "embedding";
+  static at::Tensor impl(
+      const at::Tensor& weight, const at::Tensor& indices,
+      int64_t padding_idx, bool scale_grad_by_freq, bool sparse);
+};
+
+// --- IndexSelectOp ---
+
+struct IndexSelectOp : PyreOp<IndexSelectOp> {
+  static constexpr const char* aten_name = "index_select";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, const at::Tensor& index);
+};
+
+// --- GatherOp ---
+
+struct GatherOp : PyreOp<GatherOp> {
+  static constexpr const char* aten_name = "gather";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, const at::Tensor& index,
+      bool sparse_grad);
+};
+
+// --- IndexTensorOp (advanced indexing with variable index list) ---
+
+struct IndexTensorOp : PyreOp<IndexTensorOp> {
+  static constexpr const char* aten_name = "index.Tensor";
+  static at::Tensor impl(
+      const at::Tensor& self,
+      const c10::List<std::optional<at::Tensor>>& indices);
+};
+
 // --- ArangeOp (zero tensor inputs — scalar-only kernel) ---
 
 struct ArangeOp : PyreOp<ArangeOp> {

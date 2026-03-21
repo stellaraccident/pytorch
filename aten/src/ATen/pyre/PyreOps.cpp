@@ -428,6 +428,264 @@ at::Tensor dispatchSingleDimReduction(
 }
 
 // ---------------------------------------------------------------------------
+// EmbeddingOp
+// ---------------------------------------------------------------------------
+
+at::Tensor EmbeddingOp::impl(
+    const at::Tensor& weight, const at::Tensor& indices,
+    int64_t /*padding_idx*/, bool /*scale_grad_by_freq*/, bool /*sparse*/) {
+  TORCH_CHECK(hasPyreBuffer(weight), "pyre: embedding requires IREE weight");
+  TORCH_CHECK(hasPyreBuffer(indices), "pyre: embedding requires IREE indices");
+  TORCH_CHECK(weight.dim() == 2, "pyre: embedding weight must be 2D");
+
+  auto dtype = weight.scalar_type();
+  c10::DimVector out_shape(indices.sizes().begin(), indices.sizes().end());
+  out_shape.push_back(weight.size(1));
+
+  auto func_name = funcNameDefault(aten_name);
+  auto spec = buildEmbeddingKernelSpec(
+      func_name, dtype, weight.sizes(), indices.sizes(), out_shape);
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateEmbeddingMlir(
+        func_name, dtype, weight.sizes(), indices.sizes(), out_shape);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  return invokeKernel(kernel, {weight, indices}, out_shape, weight.options());
+}
+
+// ---------------------------------------------------------------------------
+// IndexSelectOp
+// ---------------------------------------------------------------------------
+
+at::Tensor IndexSelectOp::impl(
+    const at::Tensor& self, int64_t dim, const at::Tensor& index) {
+  TORCH_CHECK(hasPyreBuffer(self), "pyre: index_select requires IREE self");
+  TORCH_CHECK(hasPyreBuffer(index), "pyre: index_select requires IREE index");
+
+  if (dim < 0) dim += self.dim();
+  auto dtype = self.scalar_type();
+
+  c10::DimVector out_shape(self.sizes().begin(), self.sizes().end());
+  out_shape[dim] = index.size(0);
+
+  auto func_name = funcNameDefault(aten_name);
+  auto spec = buildIndexSelectKernelSpec(
+      func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateIndexSelectMlir(
+        func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  return invokeKernel(kernel, {self, index}, out_shape, self.options());
+}
+
+// ---------------------------------------------------------------------------
+// GatherOp
+// ---------------------------------------------------------------------------
+
+at::Tensor GatherOp::impl(
+    const at::Tensor& self, int64_t dim, const at::Tensor& index,
+    bool /*sparse_grad*/) {
+  TORCH_CHECK(hasPyreBuffer(self), "pyre: gather requires IREE self");
+  TORCH_CHECK(hasPyreBuffer(index), "pyre: gather requires IREE index");
+
+  if (dim < 0) dim += self.dim();
+  auto dtype = self.scalar_type();
+  c10::DimVector out_shape(index.sizes().begin(), index.sizes().end());
+
+  auto func_name = funcNameDefault(aten_name);
+  auto spec = buildGatherKernelSpec(
+      func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
+  auto cache_key = contentHashCacheKey(
+      spec.template_sha1, spec.substitutions,
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = generateGatherMlir(
+        func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  return invokeKernel(kernel, {self, index}, out_shape, self.options());
+}
+
+// ---------------------------------------------------------------------------
+// IndexTensorOp — algorithmic MLIR generation for variable index lists
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::string_view kIndexHeader = R"(
+module @module {
+  func.func @$$FUNC$$(
+      %out_: !torch.tensor<[$$OUT_SHAPE$$], $$ELT$$>,
+      %self: !torch.vtensor<[$$SELF_SHAPE$$], $$ELT$$>)";
+
+constexpr std::string_view kIndexInput = R"(,
+      %idx$$IDX$$: !torch.vtensor<[$$IDX_SHAPE$$], si64>)";
+
+constexpr std::string_view kIndexNoneDecl = R"(
+    %none$$IDX$$ = torch.constant.none
+    %opt$$IDX$$ = torch.derefine %none$$IDX$$ : !torch.none to !torch.optional<vtensor>)";
+
+constexpr std::string_view kIndexTensorDecl = R"(
+    %opt$$IDX$$ = torch.derefine %idx$$TIDX$$ : !torch.vtensor<[$$IDX_SHAPE$$], si64> to !torch.optional<vtensor>)";
+
+constexpr std::string_view kIndexBody = R"(
+  ) attributes {torch.assume_strict_symbolic_shapes} {$$OPT_DECLS$$
+    %list = torch.prim.ListConstruct $$OPT_NAMES$$ : ($$OPT_TYPES$$) -> !torch.list<optional<vtensor>>
+    %result = torch.aten.index.Tensor %self, %list : !torch.vtensor<[$$SELF_SHAPE$$], $$ELT$$>, !torch.list<optional<vtensor>> -> !torch.vtensor<[$$OUT_SHAPE$$], $$ELT$$>
+    torch.overwrite.tensor.contents %result overwrites %out_ : !torch.vtensor<[$$OUT_SHAPE$$], $$ELT$$>, !torch.tensor<[$$OUT_SHAPE$$], $$ELT$$>
+    return
+  }
+}
+)";
+
+static PyreKernelAsmFragments& indexFragments() {
+  static PyreKernelAsmFragments frags(
+      {kIndexHeader, kIndexInput, kIndexNoneDecl, kIndexTensorDecl, kIndexBody});
+  return frags;
+}
+
+} // namespace
+
+at::Tensor IndexTensorOp::impl(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices) {
+  TORCH_CHECK(hasPyreBuffer(self),
+      "pyre: index.Tensor requires IREE self");
+
+  // Collect non-None indices, promoting CPU indices to device.
+  // Note: __getitem__ passes undefined tensors for None positions.
+  c10::SmallVector<std::pair<int64_t, at::Tensor>, 4> non_none;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (indices[i].has_value() && indices[i]->defined()) {
+      auto idx = *indices[i];
+      if (!hasPyreBuffer(idx))
+        idx = idx.to(self.device());
+      non_none.push_back({i, idx});
+    }
+  }
+  TORCH_CHECK(!non_none.empty(),
+      "pyre: index.Tensor requires at least one index tensor");
+
+  // Fast path: single 1D index → decompose to index_select.
+  if (non_none.size() == 1 && non_none[0].second.dim() == 1) {
+    return at::index_select(self, non_none[0].first, non_none[0].second);
+  }
+
+  // General case: algorithmic MLIR generation.
+  auto dtype = self.scalar_type();
+  std::string elt = scalarTypeToTorchMlir(dtype);
+
+  // Compute output shape: broadcast index shapes + trailing self dims.
+  // Broadcast all index tensor shapes together.
+  c10::DimVector bcast_shape;
+  for (const auto& [dim, idx] : non_none) {
+    if (bcast_shape.empty()) {
+      bcast_shape.assign(idx.sizes().begin(), idx.sizes().end());
+    } else {
+      bcast_shape = c10::DimVector(
+          at::infer_size(bcast_shape, idx.sizes()));
+    }
+  }
+  // Result shape: broadcast_shape + trailing dims after last indexed dim.
+  int64_t last_indexed = non_none.back().first;
+  c10::DimVector out_shape(bcast_shape.begin(), bcast_shape.end());
+  for (int64_t d = last_indexed + 1; d < self.dim(); ++d)
+    out_shape.push_back(self.size(d));
+
+  auto func_name = funcNameDefault(aten_name);
+
+  auto dynShape = [](c10::IntArrayRef sizes) {
+    std::string s;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      if (i > 0) s += ",";
+      s += (sizes[i] == 1) ? "1" : "?";
+    }
+    return s;
+  };
+
+  std::string self_s = dynShape(self.sizes());
+  std::string out_s = dynShape(out_shape);
+
+  // Build per-index shape strings and the opt decls/names/types.
+  c10::SmallVector<std::string, 8> idx_shapes;
+  for (const auto& [dim, idx] : non_none)
+    idx_shapes.push_back(dynShape(idx.sizes()));
+
+  std::string opt_decls, opt_names, opt_types;
+  int tensor_counter = 0;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (i > 0) { opt_names += ", "; opt_types += ", "; }
+    opt_names += "%opt" + std::to_string(i);
+    opt_types += "!torch.optional<vtensor>";
+
+    if (indices[i].has_value()) {
+      // Find index into non_none
+      std::string tidx = std::to_string(tensor_counter);
+      std::string ish = idx_shapes[tensor_counter];
+      opt_decls += "\n    %opt" + std::to_string(i) +
+          " = torch.derefine %idx" + tidx +
+          " : !torch.vtensor<[" + ish + "], si64> to !torch.optional<vtensor>";
+      tensor_counter++;
+    } else {
+      opt_decls += "\n    %none" + std::to_string(i) + " = torch.constant.none" +
+          "\n    %opt" + std::to_string(i) +
+          " = torch.derefine %none" + std::to_string(i) +
+          " : !torch.none to !torch.optional<vtensor>";
+    }
+  }
+
+  auto recipe = [&](PyreKernelAsmBuilder& b) {
+    b.appendFragment(0, {{"FUNC", func_name}, {"OUT_SHAPE", out_s},
+                         {"ELT", elt}, {"SELF_SHAPE", self_s}});
+    for (size_t i = 0; i < non_none.size(); ++i) {
+      b.appendFragment(1, {{"IDX", std::to_string(i)},
+                           {"IDX_SHAPE", idx_shapes[i]}});
+    }
+    b.appendFragment(4, {{"OPT_DECLS", opt_decls},
+                         {"OPT_NAMES", opt_names}, {"OPT_TYPES", opt_types},
+                         {"SELF_SHAPE", self_s}, {"ELT", elt},
+                         {"OUT_SHAPE", out_s}});
+  };
+
+  auto& frags = indexFragments();
+  auto cache_key = frags.digest(
+      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags(), recipe);
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name);
+  if (!kernel) {
+    auto mlir = frags.generateMlir(recipe);
+    kernel = getOrCompile(cache_key, func_name, mlir);
+  }
+
+  std::vector<at::Tensor> inputs;
+  inputs.push_back(self);
+  for (const auto& [dim, idx] : non_none)
+    inputs.push_back(idx);
+
+  return invokeKernel(kernel, inputs, out_shape, self.options());
+}
+
+// ---------------------------------------------------------------------------
 // ArangeOp
 // ---------------------------------------------------------------------------
 
@@ -749,6 +1007,10 @@ void registerCompiledOps(torch::Library& m) {
   ArangeOp::register_impl(m);
   BmmOp::register_impl(m);
   CatOp::register_impl(m);
+  EmbeddingOp::register_impl(m);
+  GatherOp::register_impl(m);
+  IndexSelectOp::register_impl(m);
+  IndexTensorOp::register_impl(m);
   TypeCastOp::register_impl(m);
   WhereOp::register_impl(m);
 }

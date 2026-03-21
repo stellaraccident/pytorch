@@ -1247,6 +1247,9 @@ if(USE_PYRE)
     ${PYRE_TEMPLATE_DIR}/arange.mlir
     ${PYRE_TEMPLATE_DIR}/elementwise_binary.mlir
     ${PYRE_TEMPLATE_DIR}/elementwise_unary.mlir
+    ${PYRE_TEMPLATE_DIR}/embedding.mlir
+    ${PYRE_TEMPLATE_DIR}/gather.mlir
+    ${PYRE_TEMPLATE_DIR}/index_select.mlir
     ${PYRE_TEMPLATE_DIR}/mm.mlir
     ${PYRE_TEMPLATE_DIR}/scalar_binary.mlir
     ${PYRE_TEMPLATE_DIR}/comparison.mlir
