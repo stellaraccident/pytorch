@@ -6,8 +6,33 @@
 namespace at::pyre {
 
 ArgAdapter ArgAdapter::analyze(const at::Tensor& tensor) {
-  if (tensor.is_contiguous())
-    return {kIdentity, {}};
+  // HACK(pyre-workspace-blp): Non-zero storage offset (from split/narrow)
+  // means the tensor's data doesn't start at byte 0 of the IREE buffer.
+  // Force clone into a fresh buffer at offset 0. The proper fix is
+  // iree_hal_buffer_subspan, but compiled kernels crash with non-zero
+  // binding offsets (see ticket for details).
+  if (tensor.storage_offset() != 0)
+    return {kContiguous, {}};
+
+  // PyTorch is_contiguous() can return true for tensors with non-standard
+  // strides when size-1 dims are involved (e.g. [1,2,1,32] strides
+  // (64,32,64,1) from transpose). We need strict row-major verification
+  // because IREE buffer views are always DENSE_ROW_MAJOR.
+  if (tensor.is_contiguous()) {
+    bool strict_row_major = true;
+    int64_t expected = 1;
+    for (int64_t i = tensor.dim() - 1; i >= 0; --i) {
+      if (tensor.size(i) > 1 && tensor.stride(i) != expected) {
+        strict_row_major = false;
+        break;
+      }
+      expected *= tensor.size(i);
+    }
+    if (strict_row_major)
+      return {kIdentity, {}};
+    // Fall through to permutation detection for "contiguous" tensors
+    // with non-standard strides.
+  }
 
   int64_t ndim = tensor.dim();
   if (ndim < 2)
@@ -67,9 +92,17 @@ std::vector<at::Tensor> applyAdapters(
         result.push_back(inputs[i].permute(adapter.permutation));
         break;
       }
-      case ArgAdapter::kContiguous:
-        result.push_back(inputs[i].contiguous());
+      case ArgAdapter::kContiguous: {
+        // HACK(pyre-workspace-blp): .contiguous() is a no-op when strides
+        // are contiguous, even if storage_offset != 0. Use .clone() to
+        // ensure the data starts at byte 0 in a fresh buffer.
+        if (inputs[i].storage_offset() != 0) {
+          result.push_back(inputs[i].clone());
+        } else {
+          result.push_back(inputs[i].contiguous());
+        }
         break;
+      }
       default:
         result.push_back(inputs[i]);
         break;

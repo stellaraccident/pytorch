@@ -689,8 +689,27 @@ static at::Tensor dispatchIndexPut(
     return s;
   };
 
-  std::string self_s = dynShape(self.sizes());
-  std::string vals_s = dynShape(values.sizes());
+  // Adapt self and values for non-standard layouts (permuted strides,
+  // storage offsets).
+  auto self_adapter = ArgAdapter::analyze(self);
+  auto vals_adapter = ArgAdapter::analyze(values);
+  at::Tensor self_phys = self;
+  at::Tensor vals_phys = values;
+  if (self_adapter.kind == ArgAdapter::kPermute) {
+    self_phys = self.permute(self_adapter.permutation);
+  } else if (self_adapter.kind == ArgAdapter::kContiguous) {
+    // HACK(pyre-workspace-blp): clone to get offset-0 buffer.
+    self_phys = self.storage_offset() != 0 ? self.clone() : self.contiguous();
+  }
+  if (vals_adapter.kind == ArgAdapter::kPermute) {
+    vals_phys = values.permute(vals_adapter.permutation);
+  } else if (vals_adapter.kind == ArgAdapter::kContiguous) {
+    // HACK(pyre-workspace-blp): clone to get offset-0 buffer.
+    vals_phys = values.storage_offset() != 0 ? values.clone() : values.contiguous();
+  }
+
+  std::string self_s = dynShape(self_phys.sizes());
+  std::string vals_s = dynShape(vals_phys.sizes());
 
   c10::SmallVector<std::string, 8> idx_shapes;
   for (const auto& [dim, idx] : non_none)
@@ -721,28 +740,52 @@ static at::Tensor dispatchIndexPut(
 
   std::string accum_str = accumulate ? "true" : "false";
 
+  // Logical shapes for the index_put op (what the op operates on).
+  std::string self_log_s = dynShape(self.sizes());
+  std::string vals_log_s = dynShape(values.sizes());
+  std::string self_log_t = "!torch.vtensor<[" + self_log_s + "], " + elt + ">";
+  std::string vals_log_t = "!torch.vtensor<[" + vals_log_s + "], " + elt + ">";
+
+  // Physical shapes for function signature (what the buffer view has).
+  std::string self_phys_t = "!torch.vtensor<[" + self_s + "], " + elt + ">";
+  std::string vals_phys_t = "!torch.vtensor<[" + vals_s + "], " + elt + ">";
+
   // Generate MLIR algorithmically
   std::string mlir_text = "\nmodule @module {\n  func.func @" + func_name + "(\n"
-      "      %out_: !torch.tensor<[" + self_s + "], " + elt + ">,\n"
-      "      %self: !torch.vtensor<[" + self_s + "], " + elt + ">";
+      "      %out_: !torch.tensor<[" + self_log_s + "], " + elt + ">,\n"
+      "      %self_raw: " + self_phys_t;
   for (size_t i = 0; i < non_none.size(); ++i) {
     mlir_text += ",\n      %idx" + std::to_string(i) +
         ": !torch.vtensor<[" + idx_shapes[i] + "], si64>";
   }
-  mlir_text += ",\n      %values: !torch.vtensor<[" + vals_s + "], " + elt + ">"
-      "\n  ) attributes {torch.assume_strict_symbolic_shapes} {" +
-      opt_decls +
+  mlir_text += ",\n      %values_raw: " + vals_phys_t +
+      "\n  ) attributes {torch.assume_strict_symbolic_shapes} {\n";
+
+  // Emit permute adapters for self and values if needed.
+  std::string self_name = "self_raw", vals_name = "values_raw";
+  if (self_adapter.kind == ArgAdapter::kPermute) {
+    auto inv = inversePerm(self_adapter.permutation);
+    mlir_text += emitPermuteLines("self", "self_raw", inv, self_phys_t, self_log_t) + "\n";
+    self_name = "self";
+  }
+  if (vals_adapter.kind == ArgAdapter::kPermute) {
+    auto inv = inversePerm(vals_adapter.permutation);
+    mlir_text += emitPermuteLines("values", "values_raw", inv, vals_phys_t, vals_log_t) + "\n";
+    vals_name = "values";
+  }
+
+  mlir_text += opt_decls +
       "\n    %accum = torch.constant.bool " + accum_str +
       "\n    %list = torch.prim.ListConstruct " + opt_names +
       " : (" + opt_types + ") -> !torch.list<optional<vtensor>>"
-      "\n    %result = torch.aten.index_put %self, %list, %values, %accum"
-      " : !torch.vtensor<[" + self_s + "], " + elt + ">, "
+      "\n    %result = torch.aten.index_put %" + self_name + ", %list, %" + vals_name + ", %accum"
+      " : " + self_log_t + ", "
       "!torch.list<optional<vtensor>>, "
-      "!torch.vtensor<[" + vals_s + "], " + elt + ">, !torch.bool"
-      " -> !torch.vtensor<[" + self_s + "], " + elt + ">"
+      + vals_log_t + ", !torch.bool"
+      " -> " + self_log_t +
       "\n    torch.overwrite.tensor.contents %result overwrites %out_"
-      " : !torch.vtensor<[" + self_s + "], " + elt + ">, "
-      "!torch.tensor<[" + self_s + "], " + elt + ">"
+      " : " + self_log_t + ", "
+      "!torch.tensor<[" + self_log_s + "], " + elt + ">"
       "\n    return\n  }\n}\n";
 
   // Hash for cache key
@@ -759,10 +802,10 @@ static at::Tensor dispatchIndexPut(
   }
 
   std::vector<at::Tensor> inputs;
-  inputs.push_back(self);
+  inputs.push_back(self_phys);
   for (const auto& [dim, idx] : non_none)
     inputs.push_back(idx);
-  inputs.push_back(values);
+  inputs.push_back(vals_phys);
 
   return invokeKernel(kernel, inputs, c10::DimVector(self.sizes()), self.options());
 }

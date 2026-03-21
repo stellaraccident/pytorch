@@ -59,7 +59,7 @@ static std::string concreteShapeStr(c10::ArrayRef<int64_t> sizes) {
 // Check if any adapter in the list is kPermute.
 // Emit torch.aten.permute MLIR: builds a prim.ListConstruct for the perm,
 // then calls torch.aten.permute.
-static std::string emitPermuteLines(
+std::string emitPermuteLines(
     const std::string& dst_name,
     const std::string& src_name,
     c10::ArrayRef<int64_t> perm,
@@ -90,8 +90,7 @@ static std::string emitPermuteLines(
   return ss.str();
 }
 
-// Compute inverse permutation.
-static c10::SmallVector<int64_t, 6> inversePerm(c10::ArrayRef<int64_t> perm) {
+c10::SmallVector<int64_t, 6> inversePerm(c10::ArrayRef<int64_t> perm) {
   c10::SmallVector<int64_t, 6> inv(perm.size());
   for (size_t i = 0; i < perm.size(); ++i)
     inv[perm[i]] = static_cast<int64_t>(i);

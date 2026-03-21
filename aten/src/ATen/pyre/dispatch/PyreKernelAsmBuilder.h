@@ -21,6 +21,17 @@
 
 namespace at::pyre {
 
+// Compute inverse permutation.
+c10::SmallVector<int64_t, 6> inversePerm(c10::ArrayRef<int64_t> perm);
+
+// Emit torch.aten.permute MLIR lines for an arg adapter.
+std::string emitPermuteLines(
+    const std::string& dst_name,
+    const std::string& src_name,
+    c10::ArrayRef<int64_t> perm,
+    const std::string& src_type,
+    const std::string& dst_type);
+
 // Substitution pairs + template identity — enough to compute cache key.
 using SubstPairs = c10::SmallVector<std::pair<std::string, std::string>, 16>;
 
