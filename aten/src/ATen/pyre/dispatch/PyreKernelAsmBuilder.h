@@ -21,6 +21,17 @@
 
 namespace at::pyre {
 
+// Compute inverse permutation.
+c10::SmallVector<int64_t, 6> inversePerm(c10::ArrayRef<int64_t> perm);
+
+// Emit torch.aten.permute MLIR lines for an arg adapter.
+std::string emitPermuteLines(
+    const std::string& dst_name,
+    const std::string& src_name,
+    c10::ArrayRef<int64_t> perm,
+    const std::string& src_type,
+    const std::string& dst_type);
+
 // Substitution pairs + template identity — enough to compute cache key.
 using SubstPairs = c10::SmallVector<std::pair<std::string, std::string>, 16>;
 
@@ -34,6 +45,108 @@ std::string contentHashCacheKey(
     const char* template_sha1,
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
+
+// --- softmax ---
+
+KernelSpec buildSoftmaxKernelSpec(
+    const std::string& func_name, const std::string& softmax_op,
+    c10::ScalarType dtype, c10::ArrayRef<int64_t> shape, int64_t dim);
+
+std::string generateSoftmaxMlir(
+    const std::string& func_name, const std::string& softmax_op,
+    c10::ScalarType dtype, c10::ArrayRef<int64_t> shape, int64_t dim);
+
+// --- scatter_src ---
+
+KernelSpec buildScatterSrcKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+std::string generateScatterSrcMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+// --- scatter_add ---
+
+KernelSpec buildScatterAddKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+std::string generateScatterAddMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+// --- scatter_src_inplace / scatter_add_inplace ---
+
+KernelSpec buildScatterSrcInplaceKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> out_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+std::string generateScatterSrcInplaceMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> out_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+KernelSpec buildScatterAddInplaceKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> out_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+std::string generateScatterAddInplaceMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> out_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+// --- embedding ---
+
+KernelSpec buildEmbeddingKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+std::string generateEmbeddingMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+// --- index_select ---
+
+KernelSpec buildIndexSelectKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+std::string generateIndexSelectMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+// --- gather ---
+
+KernelSpec buildGatherKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+std::string generateGatherMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+// --- arange ---
+
+KernelSpec buildArangeKernelSpec(
+    const std::string& func_name, c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step);
+
+std::string generateArangeMlir(
+    const std::string& func_name, c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step);
 
 // --- Type cast ---
 
@@ -121,13 +234,15 @@ KernelSpec buildComparisonKernelSpec(
     const std::string& func_name, const std::string& torch_op,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 std::string generateComparisonMlir(
     const std::string& func_name, const std::string& torch_op,
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 // --- Comparison ops (tensor-scalar) ---
 
@@ -220,12 +335,14 @@ std::string generateUnaryMlir(
 KernelSpec buildMmKernelSpec(
     const std::string& func_name, c10::ScalarType dtype,
     c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 std::string generateMmMlir(
     const std::string& func_name, c10::ScalarType dtype,
     c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
-    c10::ArrayRef<int64_t> out_shape);
+    c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<ArgAdapter> adapters = {});
 
 // --- addmm ---
 

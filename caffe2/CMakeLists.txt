@@ -1229,6 +1229,8 @@ if(USE_PYRE)
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreTensor.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreAbiConfig.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgAdapter.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreCatKernel.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreIndexKernels.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgShapeSpecializer.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelAsmBuilder.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCache.cpp
@@ -1244,9 +1246,18 @@ if(USE_PYRE)
   set(PYRE_TEMPLATES
     ${PYRE_TEMPLATE_DIR}/addmm.mlir
     ${PYRE_TEMPLATE_DIR}/addmm_transposed.mlir
+    ${PYRE_TEMPLATE_DIR}/arange.mlir
     ${PYRE_TEMPLATE_DIR}/elementwise_binary.mlir
     ${PYRE_TEMPLATE_DIR}/elementwise_unary.mlir
+    ${PYRE_TEMPLATE_DIR}/embedding.mlir
+    ${PYRE_TEMPLATE_DIR}/gather.mlir
+    ${PYRE_TEMPLATE_DIR}/index_select.mlir
     ${PYRE_TEMPLATE_DIR}/mm.mlir
+    ${PYRE_TEMPLATE_DIR}/scatter_add.mlir
+    ${PYRE_TEMPLATE_DIR}/scatter_add_inplace.mlir
+    ${PYRE_TEMPLATE_DIR}/scatter_src.mlir
+    ${PYRE_TEMPLATE_DIR}/scatter_src_inplace.mlir
+    ${PYRE_TEMPLATE_DIR}/softmax.mlir
     ${PYRE_TEMPLATE_DIR}/scalar_binary.mlir
     ${PYRE_TEMPLATE_DIR}/comparison.mlir
     ${PYRE_TEMPLATE_DIR}/comparison_scalar.mlir

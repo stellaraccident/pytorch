@@ -2,6 +2,7 @@
 #include <ATen/pyre/dispatch/PyreTypeMapping.h>
 #include <c10/pyre/impl/PyreRuntime.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace at::pyre {
@@ -80,7 +81,11 @@ void PyreTensor::copyFrom(
 
 void PyreTensor::updateFromHost(
     const void* data, iree_device_size_t offset, iree_device_size_t length) {
-  if (length <= IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE) {
+  // HACK(pyre-workspace-k2y): Inline update_buffer disabled — the IREE
+  // task command buffer arena overflows for allocations near 64KB.
+  // Restore with min(32KB, IREE max) after root-causing the arena issue.
+  static const iree_device_size_t kInlineUpdateMax = 0;
+  if (length <= kInlineUpdateMax) {
     auto target_ref = iree_hal_make_buffer_ref(buffer(), offset, length);
     submitTransfer([&](iree_hal_command_buffer_t* cmd) {
       PYRE_CHECK_OK(iree_hal_command_buffer_update_buffer(
@@ -216,14 +221,27 @@ c10::pyre::hal_buffer_view_ptr buildBufferView(const at::Tensor& tensor) {
   auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
       tensor.storage().data_ptr().get_context());
   auto iree_dtype = scalarTypeToHalElement(tensor.scalar_type());
+  auto alloc = c10::pyre::PyreRuntime::get().hostAllocator();
+
   auto sizes = tensor.sizes();
   c10::SmallVector<iree_hal_dim_t, 6> shape(sizes.begin(), sizes.end());
 
+  iree_hal_buffer_t* buf = ctx->buffer.get();
+
+  // HACK(pyre-workspace-blp): log if we see a non-zero offset here.
+  // All dispatch paths should clone offset tensors before reaching this
+  // point, so this warning indicates a missing clone.
+  if (tensor.storage_offset() != 0) {
+    PYRE_LOG(WARN) << "buildBufferView: tensor has storage_offset="
+        << tensor.storage_offset() << " shape=" << tensor.sizes()
+        << " — buffer view will be wrong (offset not reflected)\n";
+  }
+
   iree_hal_buffer_view_t* view = nullptr;
   PYRE_CHECK_OK(iree_hal_buffer_view_create(
-      ctx->buffer.get(), shape.size(), shape.data(),
+      buf, shape.size(), shape.data(),
       iree_dtype, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
-      c10::pyre::PyreRuntime::get().hostAllocator(), &view));
+      alloc, &view));
 
   return c10::pyre::hal_buffer_view_ptr::steal(view);
 }
@@ -231,6 +249,15 @@ c10::pyre::hal_buffer_view_ptr buildBufferView(const at::Tensor& tensor) {
 c10::pyre::hal_buffer_view_ptr buildOpaqueBufferView(const at::Tensor& tensor) {
   TORCH_CHECK(hasPyreBuffer(tensor),
       "pyre: tensor has no IREE buffer (CPU fallback tensor?)");
+
+  // HACK(pyre-workspace-blp): log if we see a non-zero offset here.
+  // Copy kernels (clone/copy_) may legitimately pass offset tensors
+  // through this path — the copy plan handles offsets separately.
+  if (tensor.storage_offset() != 0) {
+    PYRE_LOG(WARN) << "buildOpaqueBufferView: tensor has storage_offset="
+        << tensor.storage_offset() << " shape=" << tensor.sizes()
+        << " — buffer view will be wrong (offset not reflected)\n";
+  }
 
   auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
       tensor.storage().data_ptr().get_context());

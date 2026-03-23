@@ -102,6 +102,13 @@ at::Tensor invokeKernel(
     c10::IntArrayRef out_shape,
     const at::TensorOptions& opts);
 
+// Invoke a kernel in-place: writes result into self's buffer (contiguous fast
+// path) or into a contiguous temp then copies back (non-contiguous slow path).
+void invokeKernelInplace(
+    CachedKernel* kernel,
+    const std::vector<at::Tensor>& inputs,
+    at::Tensor& self);
+
 // ---------------------------------------------------------------------------
 // CRTP base
 // ---------------------------------------------------------------------------
@@ -110,6 +117,56 @@ template <typename Derived>
 struct PyreOp {
   static void register_impl(torch::Library& m) {
     m.impl(Derived::aten_name, &Derived::impl);
+  }
+
+  static void register_inplace(torch::Library& m) {
+    m.impl(Derived::aten_name_inplace, &Derived::impl_inplace);
+  }
+
+  static at::Tensor& dispatch_inplace(
+      at::Tensor& self,
+      c10::ArrayRef<at::Tensor> other_inputs,
+      c10::ArrayRef<at::Scalar> scalars) {
+    c10::SmallVector<at::Tensor, 4> all_inputs;
+    all_inputs.push_back(self);
+    all_inputs.insert(all_inputs.end(),
+                      other_inputs.begin(), other_inputs.end());
+
+    c10::SmallVector<at::Tensor, 4> promoted_storage;
+    c10::ArrayRef<at::Tensor> effective_inputs;
+    promoteScalarTensors(all_inputs, promoted_storage, effective_inputs);
+
+    for (const auto& t : effective_inputs)
+      TORCH_CHECK(hasPyreBuffer(t), "pyre: ", Derived::aten_name,
+          " (in-place) requires tensors with IREE buffers");
+
+    auto dtype = effective_inputs[0].scalar_type();
+
+    auto decision = ArgShapeSpecializer().analyze(
+        Derived::aten_name, dtype, effective_inputs,
+        c10::pyre::PyreDevice::get(0)->capabilities());
+
+    auto adapted = applyAdapters(
+        {effective_inputs.begin(), effective_inputs.end()},
+        decision.arg_adapters);
+
+    OpContext ctx{adapted, effective_inputs, scalars, dtype, decision};
+
+    auto func_name = Derived::buildFuncName(ctx);
+    auto spec = Derived::buildKernelSpec(func_name, ctx);
+    auto cache_key = contentHashCacheKey(
+        spec.template_sha1, spec.substitutions,
+        c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+
+    auto& cache = PyreKernelCache::get();
+    auto* kernel = cache.lookup(cache_key, func_name);
+    if (!kernel) {
+      auto mlir = Derived::generateMlir(func_name, ctx);
+      kernel = getOrCompile(cache_key, func_name, mlir);
+    }
+
+    invokeKernelInplace(kernel, adapted, self);
+    return self;
   }
 
   static at::Tensor dispatch(
@@ -171,6 +228,9 @@ struct RegularBinaryOp : PyreOp<Derived> {
   static at::Tensor impl(const at::Tensor& self, const at::Tensor& other) {
     return PyreOp<Derived>::dispatch({self, other}, {});
   }
+  static at::Tensor& impl_inplace(at::Tensor& self, const at::Tensor& other) {
+    return PyreOp<Derived>::dispatch_inplace(self, {other}, {});
+  }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
     return inferShapeBroadcast(ctx);
@@ -198,6 +258,11 @@ struct AlphaBinaryOp : PyreOp<Derived> {
       const at::Tensor& self, const at::Tensor& other,
       const at::Scalar& alpha) {
     return PyreOp<Derived>::dispatch({self, other}, {alpha});
+  }
+  static at::Tensor& impl_inplace(
+      at::Tensor& self, const at::Tensor& other,
+      const at::Scalar& alpha) {
+    return PyreOp<Derived>::dispatch_inplace(self, {other}, {alpha});
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
@@ -228,6 +293,9 @@ template <typename Derived>
 struct RegularUnaryOp : PyreOp<Derived> {
   static at::Tensor impl(const at::Tensor& self) {
     return PyreOp<Derived>::dispatch({self}, {});
+  }
+  static at::Tensor& impl_inplace(at::Tensor& self) {
+    return PyreOp<Derived>::dispatch_inplace(self, {}, {});
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
@@ -286,30 +354,37 @@ struct ParameterizedUnaryOp : PyreOp<Derived> {
 
 struct AddOp : AlphaBinaryOp<AddOp> {
   static constexpr const char* aten_name = "add.Tensor";
+  static constexpr const char* aten_name_inplace = "add_.Tensor";
   static constexpr const char* torch_op = "add";
 };
 struct Atan2Op : RegularBinaryOp<Atan2Op> {
   static constexpr const char* aten_name = "atan2";
+  static constexpr const char* aten_name_inplace = "atan2_";
   static constexpr const char* torch_op = "atan2";
 };
 struct BitwiseAndOp : RegularBinaryOp<BitwiseAndOp> {
   static constexpr const char* aten_name = "bitwise_and.Tensor";
+  static constexpr const char* aten_name_inplace = "bitwise_and_.Tensor";
   static constexpr const char* torch_op = "bitwise_and";
 };
 struct BitwiseOrOp : RegularBinaryOp<BitwiseOrOp> {
   static constexpr const char* aten_name = "bitwise_or.Tensor";
+  static constexpr const char* aten_name_inplace = "bitwise_or_.Tensor";
   static constexpr const char* torch_op = "bitwise_or";
 };
 struct BitwiseXorOp : RegularBinaryOp<BitwiseXorOp> {
   static constexpr const char* aten_name = "bitwise_xor.Tensor";
+  static constexpr const char* aten_name_inplace = "bitwise_xor_.Tensor";
   static constexpr const char* torch_op = "bitwise_xor";
 };
 struct DivOp : RegularBinaryOp<DivOp> {
   static constexpr const char* aten_name = "div.Tensor";
+  static constexpr const char* aten_name_inplace = "div_.Tensor";
   static constexpr const char* torch_op = "div";
 };
 struct FmodOp : RegularBinaryOp<FmodOp> {
   static constexpr const char* aten_name = "fmod.Tensor";
+  static constexpr const char* aten_name_inplace = "fmod_.Tensor";
   static constexpr const char* torch_op = "fmod";
 };
 struct MaximumOp : RegularBinaryOp<MaximumOp> {
@@ -322,18 +397,22 @@ struct MinimumOp : RegularBinaryOp<MinimumOp> {
 };
 struct MulOp : RegularBinaryOp<MulOp> {
   static constexpr const char* aten_name = "mul.Tensor";
+  static constexpr const char* aten_name_inplace = "mul_.Tensor";
   static constexpr const char* torch_op = "mul";
 };
 struct PowTensorOp : RegularBinaryOp<PowTensorOp> {
   static constexpr const char* aten_name = "pow.Tensor_Tensor";
+  static constexpr const char* aten_name_inplace = "pow_.Tensor";
   static constexpr const char* torch_op = "pow";
 };
 struct RemainderOp : RegularBinaryOp<RemainderOp> {
   static constexpr const char* aten_name = "remainder.Tensor";
+  static constexpr const char* aten_name_inplace = "remainder_.Tensor";
   static constexpr const char* torch_op = "remainder";
 };
 struct SubOp : AlphaBinaryOp<SubOp> {
   static constexpr const char* aten_name = "sub.Tensor";
+  static constexpr const char* aten_name_inplace = "sub_.Tensor";
   static constexpr const char* torch_op = "sub";
 };
 struct MmOp : PyreOp<MmOp> {
@@ -349,7 +428,8 @@ struct MmOp : PyreOp<MmOp> {
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
-    return {ctx.inputs[0].size(0), ctx.inputs[1].size(1)};
+    // Use raw_inputs for output shape — adapted inputs may be permuted.
+    return {ctx.raw_inputs[0].size(0), ctx.raw_inputs[1].size(1)};
   }
   static KernelSpec buildKernelSpec(
       const std::string& func_name, const OpContext& ctx);
@@ -364,82 +444,102 @@ struct MmOp : PyreOp<MmOp> {
 
 struct AbsOp : RegularUnaryOp<AbsOp> {
   static constexpr const char* aten_name = "abs";
+  static constexpr const char* aten_name_inplace = "abs_";
   static constexpr const char* torch_op = "torch.aten.abs";
 };
 struct BitwiseNotOp : RegularUnaryOp<BitwiseNotOp> {
   static constexpr const char* aten_name = "bitwise_not";
+  static constexpr const char* aten_name_inplace = "bitwise_not_";
   static constexpr const char* torch_op = "torch.aten.bitwise_not";
 };
 struct CeilOp : RegularUnaryOp<CeilOp> {
   static constexpr const char* aten_name = "ceil";
+  static constexpr const char* aten_name_inplace = "ceil_";
   static constexpr const char* torch_op = "torch.aten.ceil";
 };
 struct CosOp : RegularUnaryOp<CosOp> {
   static constexpr const char* aten_name = "cos";
+  static constexpr const char* aten_name_inplace = "cos_";
   static constexpr const char* torch_op = "torch.aten.cos";
 };
 struct ErfOp : RegularUnaryOp<ErfOp> {
   static constexpr const char* aten_name = "erf";
+  static constexpr const char* aten_name_inplace = "erf_";
   static constexpr const char* torch_op = "torch.aten.erf";
 };
 struct ExpOp : RegularUnaryOp<ExpOp> {
   static constexpr const char* aten_name = "exp";
+  static constexpr const char* aten_name_inplace = "exp_";
   static constexpr const char* torch_op = "torch.aten.exp";
 };
 struct FloorOp : RegularUnaryOp<FloorOp> {
   static constexpr const char* aten_name = "floor";
+  static constexpr const char* aten_name_inplace = "floor_";
   static constexpr const char* torch_op = "torch.aten.floor";
 };
 struct LogOp : RegularUnaryOp<LogOp> {
   static constexpr const char* aten_name = "log";
+  static constexpr const char* aten_name_inplace = "log_";
   static constexpr const char* torch_op = "torch.aten.log";
 };
 struct LogicalNotOp : RegularUnaryOp<LogicalNotOp> {
   static constexpr const char* aten_name = "logical_not";
+  static constexpr const char* aten_name_inplace = "logical_not_";
   static constexpr const char* torch_op = "torch.aten.logical_not";
 };
 struct NegOp : RegularUnaryOp<NegOp> {
   static constexpr const char* aten_name = "neg";
+  static constexpr const char* aten_name_inplace = "neg_";
   static constexpr const char* torch_op = "torch.aten.neg";
 };
 struct ReciprocalOp : RegularUnaryOp<ReciprocalOp> {
   static constexpr const char* aten_name = "reciprocal";
+  static constexpr const char* aten_name_inplace = "reciprocal_";
   static constexpr const char* torch_op = "torch.aten.reciprocal";
 };
 struct ReluOp : RegularUnaryOp<ReluOp> {
   static constexpr const char* aten_name = "relu";
+  static constexpr const char* aten_name_inplace = "relu_";
   static constexpr const char* torch_op = "torch.aten.relu";
 };
 struct RoundOp : RegularUnaryOp<RoundOp> {
   static constexpr const char* aten_name = "round";
+  static constexpr const char* aten_name_inplace = "round_";
   static constexpr const char* torch_op = "torch.aten.round";
 };
 struct RsqrtOp : RegularUnaryOp<RsqrtOp> {
   static constexpr const char* aten_name = "rsqrt";
+  static constexpr const char* aten_name_inplace = "rsqrt_";
   static constexpr const char* torch_op = "torch.aten.rsqrt";
 };
 struct SigmoidOp : RegularUnaryOp<SigmoidOp> {
   static constexpr const char* aten_name = "sigmoid";
+  static constexpr const char* aten_name_inplace = "sigmoid_";
   static constexpr const char* torch_op = "torch.aten.sigmoid";
 };
 struct SignOp : RegularUnaryOp<SignOp> {
   static constexpr const char* aten_name = "sign";
+  static constexpr const char* aten_name_inplace = "sign_";
   static constexpr const char* torch_op = "torch.aten.sign";
 };
 struct SiluOp : RegularUnaryOp<SiluOp> {
   static constexpr const char* aten_name = "silu";
+  static constexpr const char* aten_name_inplace = "silu_";
   static constexpr const char* torch_op = "torch.aten.silu";
 };
 struct SinOp : RegularUnaryOp<SinOp> {
   static constexpr const char* aten_name = "sin";
+  static constexpr const char* aten_name_inplace = "sin_";
   static constexpr const char* torch_op = "torch.aten.sin";
 };
 struct SqrtOp : RegularUnaryOp<SqrtOp> {
   static constexpr const char* aten_name = "sqrt";
+  static constexpr const char* aten_name_inplace = "sqrt_";
   static constexpr const char* torch_op = "torch.aten.sqrt";
 };
 struct TanhOp : RegularUnaryOp<TanhOp> {
   static constexpr const char* aten_name = "tanh";
+  static constexpr const char* aten_name_inplace = "tanh_";
   static constexpr const char* torch_op = "torch.aten.tanh";
 };
 
@@ -447,6 +547,7 @@ struct TanhOp : RegularUnaryOp<TanhOp> {
 
 struct GeluOp : ParameterizedUnaryOp<GeluOp> {
   static constexpr const char* aten_name = "gelu";
+  static constexpr const char* aten_name_inplace = "gelu_";
   static constexpr const char* torch_op = "torch.aten.gelu";
   static at::Tensor impl(const at::Tensor& self,
                           c10::string_view approximate = "none") {
@@ -455,6 +556,12 @@ struct GeluOp : ParameterizedUnaryOp<GeluOp> {
     TORCH_CHECK(approximate == "none",
         "pyre: gelu approximate='tanh' not yet supported");
     return PyreOp<GeluOp>::dispatch({self}, {});
+  }
+  static at::Tensor& impl_inplace(at::Tensor& self,
+                                    c10::string_view approximate = "none") {
+    TORCH_CHECK(approximate == "none",
+        "pyre: gelu_ approximate='tanh' not yet supported");
+    return PyreOp<GeluOp>::dispatch_inplace(self, {}, {});
   }
   static std::string extraArgDecls(const OpContext&) {
     return "    %approx = torch.constant.str \"none\"";
@@ -465,11 +572,17 @@ struct GeluOp : ParameterizedUnaryOp<GeluOp> {
 
 struct HardtanhOp : ParameterizedUnaryOp<HardtanhOp> {
   static constexpr const char* aten_name = "hardtanh";
+  static constexpr const char* aten_name_inplace = "hardtanh_";
   static constexpr const char* torch_op = "torch.aten.hardtanh";
   static at::Tensor impl(const at::Tensor& self,
                           const at::Scalar& min_val = -1,
                           const at::Scalar& max_val = 1) {
     return PyreOp<HardtanhOp>::dispatch({self}, {min_val, max_val});
+  }
+  static at::Tensor& impl_inplace(at::Tensor& self,
+                                    const at::Scalar& min_val = -1,
+                                    const at::Scalar& max_val = 1) {
+    return PyreOp<HardtanhOp>::dispatch_inplace(self, {}, {min_val, max_val});
   }
   static std::string extraArgDecls(const OpContext& ctx) {
     double mn = ctx.scalars[0].toDouble();
@@ -486,10 +599,15 @@ struct HardtanhOp : ParameterizedUnaryOp<HardtanhOp> {
 
 struct LeakyReluOp : ParameterizedUnaryOp<LeakyReluOp> {
   static constexpr const char* aten_name = "leaky_relu";
+  static constexpr const char* aten_name_inplace = "leaky_relu_";
   static constexpr const char* torch_op = "torch.aten.leaky_relu";
   static at::Tensor impl(const at::Tensor& self,
                           const at::Scalar& negative_slope = 0.01) {
     return PyreOp<LeakyReluOp>::dispatch({self}, {negative_slope});
+  }
+  static at::Tensor& impl_inplace(at::Tensor& self,
+                                    const at::Scalar& negative_slope = 0.01) {
+    return PyreOp<LeakyReluOp>::dispatch_inplace(self, {}, {negative_slope});
   }
   static std::string extraArgDecls(const OpContext& ctx) {
     double slope = ctx.scalars[0].toDouble();
@@ -503,12 +621,19 @@ struct LeakyReluOp : ParameterizedUnaryOp<LeakyReluOp> {
 
 struct EluOp : ParameterizedUnaryOp<EluOp> {
   static constexpr const char* aten_name = "elu";
+  static constexpr const char* aten_name_inplace = "elu_";
   static constexpr const char* torch_op = "torch.aten.elu";
   static at::Tensor impl(const at::Tensor& self,
                           const at::Scalar& alpha = 1,
                           const at::Scalar& scale = 1,
                           const at::Scalar& input_scale = 1) {
     return PyreOp<EluOp>::dispatch({self}, {alpha, scale, input_scale});
+  }
+  static at::Tensor& impl_inplace(at::Tensor& self,
+                                    const at::Scalar& alpha = 1,
+                                    const at::Scalar& scale = 1,
+                                    const at::Scalar& input_scale = 1) {
+    return PyreOp<EluOp>::dispatch_inplace(self, {}, {alpha, scale, input_scale});
   }
   static std::string extraArgDecls(const OpContext& ctx) {
     double a = ctx.scalars[0].toDouble();
@@ -533,6 +658,10 @@ struct EluOp : ParameterizedUnaryOp<EluOp> {
 
 template <typename Derived>
 struct ScalarBinaryOp : PyreOp<Derived> {
+  static at::Tensor& impl_inplace(at::Tensor& self, const at::Scalar& other) {
+    return PyreOp<Derived>::dispatch_inplace(self, {}, {other});
+  }
+
   static c10::DimVector inferShape(const OpContext& ctx) {
     return inferShapeIdentity(ctx);
   }
@@ -567,14 +696,19 @@ struct ScalarBinaryOp : PyreOp<Derived> {
 
 struct AddScalarOp : ScalarBinaryOp<AddScalarOp> {
   static constexpr const char* aten_name = "add.Scalar";
+  static constexpr const char* aten_name_inplace = "add_.Scalar";
   static constexpr const char* torch_op = "torch.aten.add.Scalar";
   static at::Tensor impl(const at::Tensor& self,
                           const at::Scalar& other,
                           const at::Scalar& alpha = 1) {
-    // Pre-fold: dispatch scalar = other * alpha, MLIR alpha is always 1.
-    // This avoids needing a separate alpha-aware scalar template.
     double val = other.toDouble() * alpha.toDouble();
     return PyreOp<AddScalarOp>::dispatch({self}, {at::Scalar(val)});
+  }
+  static at::Tensor& impl_inplace(at::Tensor& self,
+                                    const at::Scalar& other,
+                                    const at::Scalar& alpha = 1) {
+    double val = other.toDouble() * alpha.toDouble();
+    return PyreOp<AddScalarOp>::dispatch_inplace(self, {}, {at::Scalar(val)});
   }
   // Alpha is always 1 in MLIR because impl pre-folds other*alpha above.
   static std::string extraArgDecls(const OpContext&) {
@@ -586,13 +720,19 @@ struct AddScalarOp : ScalarBinaryOp<AddScalarOp> {
 
 struct SubScalarOp : ScalarBinaryOp<SubScalarOp> {
   static constexpr const char* aten_name = "sub.Scalar";
+  static constexpr const char* aten_name_inplace = "sub_.Scalar";
   static constexpr const char* torch_op = "torch.aten.sub.Scalar";
   static at::Tensor impl(const at::Tensor& self,
                           const at::Scalar& other,
                           const at::Scalar& alpha = 1) {
-    // Pre-fold: dispatch scalar = other * alpha, MLIR alpha is always 1.
     double val = other.toDouble() * alpha.toDouble();
     return PyreOp<SubScalarOp>::dispatch({self}, {at::Scalar(val)});
+  }
+  static at::Tensor& impl_inplace(at::Tensor& self,
+                                    const at::Scalar& other,
+                                    const at::Scalar& alpha = 1) {
+    double val = other.toDouble() * alpha.toDouble();
+    return PyreOp<SubScalarOp>::dispatch_inplace(self, {}, {at::Scalar(val)});
   }
   // Alpha is always 1 in MLIR because impl pre-folds other*alpha above.
   static std::string extraArgDecls(const OpContext&) {
@@ -604,6 +744,7 @@ struct SubScalarOp : ScalarBinaryOp<SubScalarOp> {
 
 struct MulScalarOp : ScalarBinaryOp<MulScalarOp> {
   static constexpr const char* aten_name = "mul.Scalar";
+  static constexpr const char* aten_name_inplace = "mul_.Scalar";
   static constexpr const char* torch_op = "torch.aten.mul.Scalar";
   static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
     return PyreOp<MulScalarOp>::dispatch({self}, {other});
@@ -612,6 +753,7 @@ struct MulScalarOp : ScalarBinaryOp<MulScalarOp> {
 
 struct DivScalarOp : ScalarBinaryOp<DivScalarOp> {
   static constexpr const char* aten_name = "div.Scalar";
+  static constexpr const char* aten_name_inplace = "div_.Scalar";
   static constexpr const char* torch_op = "torch.aten.div.Scalar";
   static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
     return PyreOp<DivScalarOp>::dispatch({self}, {other});
@@ -620,6 +762,7 @@ struct DivScalarOp : ScalarBinaryOp<DivScalarOp> {
 
 struct PowScalarOp : ScalarBinaryOp<PowScalarOp> {
   static constexpr const char* aten_name = "pow.Tensor_Scalar";
+  static constexpr const char* aten_name_inplace = "pow_.Scalar";
   static constexpr const char* torch_op = "torch.aten.pow.Tensor_Scalar";
   static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
     return PyreOp<PowScalarOp>::dispatch({self}, {other});
@@ -646,14 +789,16 @@ struct ComparisonBinaryOp : PyreOp<Derived> {
     auto out_shape = inferShapeBroadcast(ctx);
     return buildComparisonKernelSpec(
         func_name, Derived::torch_op, ctx.dtype,
-        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
+        ctx.decision.arg_adapters);
   }
   static std::string generateMlir(
       const std::string& func_name, const OpContext& ctx) {
     auto out_shape = inferShapeBroadcast(ctx);
     return generateComparisonMlir(
         func_name, Derived::torch_op, ctx.dtype,
-        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
+        ctx.decision.arg_adapters);
   }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
@@ -853,6 +998,105 @@ struct ProdOp : PyreOp<ProdOp> {
   }
 };
 
+// --- EmbeddingOp (mixed-dtype: float weight + int64 indices) ---
+
+struct EmbeddingOp : PyreOp<EmbeddingOp> {
+  static constexpr const char* aten_name = "embedding";
+  static at::Tensor impl(
+      const at::Tensor& weight, const at::Tensor& indices,
+      int64_t padding_idx, bool scale_grad_by_freq, bool sparse);
+};
+
+// --- IndexSelectOp ---
+
+struct IndexSelectOp : PyreOp<IndexSelectOp> {
+  static constexpr const char* aten_name = "index_select";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, const at::Tensor& index);
+};
+
+// --- GatherOp ---
+
+struct GatherOp : PyreOp<GatherOp> {
+  static constexpr const char* aten_name = "gather";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, const at::Tensor& index,
+      bool sparse_grad);
+};
+
+// --- SoftmaxOp / LogSoftmaxOp ---
+
+struct SoftmaxOp : PyreOp<SoftmaxOp> {
+  static constexpr const char* aten_name = "_softmax";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, bool half_to_float);
+};
+
+struct LogSoftmaxOp : PyreOp<LogSoftmaxOp> {
+  static constexpr const char* aten_name = "_log_softmax";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim, bool half_to_float);
+};
+
+// --- ScatterSrcOp ---
+
+struct ScatterSrcOp : PyreOp<ScatterSrcOp> {
+  static constexpr const char* aten_name = "scatter.src";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+  static at::Tensor& impl_inplace(
+      at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+};
+
+// --- ScatterAddOp ---
+
+struct ScatterAddOp : PyreOp<ScatterAddOp> {
+  static constexpr const char* aten_name = "scatter_add";
+  static at::Tensor impl(
+      const at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+  static at::Tensor& impl_inplace(
+      at::Tensor& self, int64_t dim,
+      const at::Tensor& index, const at::Tensor& src);
+};
+
+// --- IndexPutOp ---
+
+struct IndexPutOp : PyreOp<IndexPutOp> {
+  static constexpr const char* aten_name = "index_put";
+  static at::Tensor impl(
+      const at::Tensor& self,
+      const c10::List<std::optional<at::Tensor>>& indices,
+      const at::Tensor& values, bool accumulate);
+  static at::Tensor& impl_inplace(
+      at::Tensor& self,
+      const c10::List<std::optional<at::Tensor>>& indices,
+      const at::Tensor& values, bool accumulate);
+};
+
+// --- IndexTensorOp (advanced indexing with variable index list) ---
+
+struct IndexTensorOp : PyreOp<IndexTensorOp> {
+  static constexpr const char* aten_name = "index.Tensor";
+  static at::Tensor impl(
+      const at::Tensor& self,
+      const c10::List<std::optional<at::Tensor>>& indices);
+};
+
+// --- ArangeOp (zero tensor inputs — scalar-only kernel) ---
+
+struct ArangeOp : PyreOp<ArangeOp> {
+  static constexpr const char* aten_name = "arange.start_step";
+  static at::Tensor impl(
+      const at::Scalar& start, const at::Scalar& end, const at::Scalar& step,
+      std::optional<at::ScalarType> dtype,
+      std::optional<at::Layout> layout,
+      std::optional<at::Device> device,
+      std::optional<bool> pin_memory);
+};
+
 // --- TypeCastOp (_to_copy with dtype) ---
 
 struct TypeCastOp : PyreOp<TypeCastOp> {
@@ -883,7 +1127,9 @@ struct BmmOp : PyreOp<BmmOp> {
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
-    return {ctx.inputs[0].size(0), ctx.inputs[0].size(1), ctx.inputs[1].size(2)};
+    // Use raw_inputs for output shape — adapted inputs may be permuted.
+    return {ctx.raw_inputs[0].size(0), ctx.raw_inputs[0].size(1),
+            ctx.raw_inputs[1].size(2)};
   }
   static KernelSpec buildKernelSpec(
       const std::string& func_name, const OpContext& ctx) {
