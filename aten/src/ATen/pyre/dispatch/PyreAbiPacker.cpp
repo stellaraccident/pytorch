@@ -186,17 +186,12 @@ void AbiPacker::packArgs(
       buf_used_by_input[slot.buf_idx] = true;
   }
 
-  // 1. Unique input buffers as opaque !hal.buffer + parent element count.
+  // 1. Unique input buffers as opaque !hal.buffer.
   // Output-only buffers go in the output_buffers section.
   for (int i = 0; i < static_cast<int>(unique_bufs_.size()); ++i) {
     if (!buf_used_by_input[i]) continue;
-    // Push !hal.buffer ref.
     iree_vm_ref_t ref = iree_hal_buffer_retain_ref(unique_bufs_[i].buffer);
     PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
-    // Push parent element count (index).
-    iree_vm_value_t val = iree_vm_value_make_i64(
-        unique_bufs_[i].total_elements);
-    PYRE_CHECK_OK(iree_vm_list_push_value(args, &val));
   }
 
   // 2. Element offsets (only for non-zero offsets).

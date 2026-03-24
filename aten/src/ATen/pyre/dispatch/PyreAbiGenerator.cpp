@@ -179,11 +179,10 @@ std::string AbiGenerator::emitEnvelopeFunction(
   // --- Envelope signature ---
   ss << "  util.func public @" << envelope_name << "(\n";
 
-  // Unique input buffers as opaque !hal.buffer + element count.
+  // Unique input buffers as opaque !hal.buffer.
   for (int i = 0; i < static_cast<int>(unique_bufs_.size()); ++i) {
     if (!buf_used_by_input[i]) continue;
     ss << "      %buf" << i << ": !hal.buffer,\n";
-    ss << "      %buf" << i << "_elems: index,\n";
   }
 
   // Element offsets for non-zero offset tensors.
@@ -210,134 +209,61 @@ std::string AbiGenerator::emitEnvelopeFunction(
   ss << "      %signal: !hal.fence\n";
   ss << "  ) {\n";
 
-  // --- Import unique INPUT buffers as flat 1D tensors ---
-  for (int i = 0; i < static_cast<int>(unique_bufs_.size()); ++i) {
-    if (!buf_used_by_input[i]) continue;
-    auto flat_type = flatTensorType(unique_bufs_[i].dtype);
-    ss << "    %parent_" << i << " = hal.tensor.import wait(%wait) => %buf"
-       << i << " \"buf" << i << "\"\n"
-       << "        : !hal.buffer -> " << flat_type
-       << "{%buf" << i << "_elems}\n";
-  }
-
-  // --- Slice operands from parents (for offset tensors) ---
-  // Also shape non-offset tensors from flat to shaped.
+  // --- Import each input tensor directly with hal.tensor.import offset() ---
   int input_idx = 0;
   for (int ti = 0; ti < static_cast<int>(tensors_.size()); ++ti) {
     if (tensors_[ti].is_output) continue;
     const auto& t = tensors_[ti];
-    auto flat_type = flatTensorType(t.dtype);
-
-    // Use physical sizes for import — these match what's in memory.
     const auto& import_sizes = t.phys_sizes;
-
-    // Compute element count (product of physical dims).
-    std::string count_var;
-    if (import_sizes.size() == 1 && import_sizes[0] != 1) {
-      count_var = "%dim_" + std::to_string(ti) + "_0";
-    } else {
-      std::string prev;
-      int mul_idx = 0;
-      for (size_t d = 0; d < import_sizes.size(); ++d) {
-        if (import_sizes[d] == 1) continue;
-        std::string dim_val = "%dim_" + std::to_string(ti) + "_" +
-                              std::to_string(d);
-        if (prev.empty()) {
-          prev = dim_val;
-        } else {
-          std::string result = "%count_" + std::to_string(ti) + "_" +
-                               std::to_string(mul_idx++);
-          ss << "    " << result << " = arith.muli " << prev << ", "
-             << dim_val << " : index\n";
-          prev = result;
-        }
-      }
-      if (prev.empty()) {
-        ss << "    %c1_count_" << ti << " = arith.constant 1 : index\n";
-        count_var = "%c1_count_" + std::to_string(ti);
-      } else {
-        count_var = prev;
-      }
-    }
-
-    // Import using physical shape (for permuted tensors, this differs from logical).
-    auto phys_shaped_type = shapedTensorType(import_sizes, t.dtype);
+    auto phys_shaped_type = import_sizes.empty()
+        ? "tensor<" + builtinElementType(t.dtype) + ">"
+        : shapedTensorType(import_sizes, t.dtype);
     std::string shaped_name = "%shaped_" + std::to_string(ti);
 
-    if (import_sizes.empty()) {
-      // 0-dim scalar tensor: import directly as scalar tensor.
-      auto scalar_type = "tensor<" + builtinElementType(t.dtype) + ">";
+    if (t.element_offset == 0) {
+      // Zero offset: direct import, no offset() needed.
       ss << "    " << shaped_name
          << " = hal.tensor.import wait(%wait) => %buf"
          << t.buf_idx << " \"input" << ti << "\"\n"
-         << "        : !hal.buffer -> " << scalar_type << "\n";
-    } else if (t.element_offset == 0 && import_sizes.size() == 1) {
-      // Simple 1D case: extract_slice from flat parent.
-      ss << "    %c0_" << ti << " = arith.constant 0 : index\n";
-      ss << "    " << shaped_name << " = tensor.extract_slice %parent_"
-         << t.buf_idx << "[%c0_" << ti << "] [" << count_var << "] [1]\n"
-         << "        : " << flat_type << " to " << flat_type << "\n";
-    } else if (t.element_offset == 0) {
-      // Multi-dim, no offset: import directly as physical shaped tensor.
-      ss << "    " << shaped_name
-         << " = hal.tensor.import wait(%wait) => %buf"
-         << t.buf_idx << " \"input" << ti << "\"\n"
-         << "        : !hal.buffer -> " << phys_shaped_type << "{";
-      bool first_d = true;
-      for (size_t d = 0; d < import_sizes.size(); ++d) {
-        if (import_sizes[d] != 1) {
-          if (!first_d) ss << ", ";
-          ss << "%dim_" << ti << "_" << d;
-          first_d = false;
-        }
-      }
-      ss << "}\n";
-    } else {
-      // Non-zero offset: import flat, extract_slice at offset.
-      std::string off_var = "%off_" + std::to_string(ti);
-      int byte_align = t.byte_alignment;
-      int elem_align = byte_align / static_cast<int>(t.elem_size);
-      if (elem_align < 1) elem_align = 1;
-      if (elem_align > 1) {
-        ss << "    %off_aligned_" << ti << " = util.assume.int "
-           << off_var << "<udiv = " << elem_align << "> : index\n";
-        off_var = "%off_aligned_" + std::to_string(ti);
-      }
-      std::string flat_name = "%flat_" + std::to_string(ti);
-      ss << "    " << flat_name << " = tensor.extract_slice %parent_"
-         << t.buf_idx << "[" << off_var << "] [" << count_var << "] [1]\n"
-         << "        : " << flat_type << " to " << flat_type << "\n";
-
-      if (import_sizes.size() <= 1) {
-        shaped_name = flat_name;
-      } else {
-        // Reshape flat → shaped via expand_shape.
-        // Use fully-dynamic type so all dims accept SSA values.
-        std::string dyn_shaped_type = "tensor<";
+         << "        : !hal.buffer -> " << phys_shaped_type;
+      if (!import_sizes.empty()) {
+        ss << "{";
+        bool first_d = true;
         for (size_t d = 0; d < import_sizes.size(); ++d) {
-          dyn_shaped_type += "?x";
-        }
-        dyn_shaped_type += builtinElementType(t.dtype) + ">";
-
-        for (size_t d = 0; d < import_sizes.size(); ++d) {
-          if (import_sizes[d] == 1) {
-            ss << "    %c1_dim_" << ti << "_" << d
-               << " = arith.constant 1 : index\n";
+          if (import_sizes[d] != 1) {
+            if (!first_d) ss << ", ";
+            ss << "%dim_" << ti << "_" << d;
+            first_d = false;
           }
         }
-        ss << "    " << shaped_name << " = tensor.expand_shape "
-           << flat_name << " [[0";
-        for (size_t d = 1; d < import_sizes.size(); ++d) ss << ", " << d;
-        ss << "]]\n        output_shape [";
-        for (size_t d = 0; d < import_sizes.size(); ++d) {
-          if (d > 0) ss << ", ";
-          if (import_sizes[d] == 1)
-            ss << "%c1_dim_" << ti << "_" << d;
-          else
-            ss << "%dim_" << ti << "_" << d;
-        }
-        ss << "] : " << flat_type << " into " << dyn_shaped_type << "\n";
+        ss << "}";
       }
+      ss << "\n";
+    } else {
+      // Non-zero offset: compute byte offset, import with offset().
+      std::string off_var = "%off_" + std::to_string(ti);
+      std::string byte_off_var = "%byte_off_" + std::to_string(ti);
+      ss << "    %elem_size_" << ti
+         << " = util.sizeof " << builtinElementType(t.dtype) << "\n";
+      ss << "    " << byte_off_var << " = arith.muli "
+         << off_var << ", %elem_size_" << ti << " : index\n";
+      ss << "    " << shaped_name
+         << " = hal.tensor.import wait(%wait) => %buf"
+         << t.buf_idx << " offset(" << byte_off_var << ") \"input" << ti << "\"\n"
+         << "        : !hal.buffer -> " << phys_shaped_type;
+      if (!import_sizes.empty()) {
+        ss << "{";
+        bool first_d = true;
+        for (size_t d = 0; d < import_sizes.size(); ++d) {
+          if (import_sizes[d] != 1) {
+            if (!first_d) ss << ", ";
+            ss << "%dim_" << ti << "_" << d;
+            first_d = false;
+          }
+        }
+        ss << "}";
+      }
+      ss << "\n";
     }
 
     // Apply permutation if needed (physical → logical via linalg.transpose).
