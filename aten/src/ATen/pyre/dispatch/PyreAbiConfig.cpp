@@ -8,12 +8,14 @@ const AbiConfig AbiConfig::kTorchTyped{
     Convention::kTorch, DtypeMapping::kTyped};
 const AbiConfig AbiConfig::kNativeOpaque{
     Convention::kNative, DtypeMapping::kOpaque};
+const AbiConfig AbiConfig::kEnvelope{
+    Convention::kEnvelope, DtypeMapping::kTyped};
 
 c10::ArrayRef<std::string> AbiConfig::compilerFlags() const {
   if (flags_cached_) return cached_flags_;
 
   auto& base = c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags();
-  if (convention_ == Convention::kTorch) {
+  if (convention_ == Convention::kTorch || convention_ == Convention::kEnvelope) {
     cached_flags_.assign(base.begin(), base.end());
   } else {
     for (const auto& f : base) {
@@ -30,6 +32,7 @@ c10::ArrayRef<std::string> AbiConfig::compilerFlags() const {
 std::string AbiConfig::resolveFunction(const std::string& func_name) const {
   if (convention_ == Convention::kTorch)
     return "module." + func_name + "$async";
+  // Both kNative and kEnvelope use direct name (no $async suffix).
   return "module." + func_name;
 }
 

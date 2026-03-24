@@ -1228,6 +1228,8 @@ if(USE_PYRE)
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreOps.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreTensor.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreAbiConfig.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreAbiGenerator.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreAbiPacker.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgAdapter.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreCatKernel.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreIndexKernels.cpp

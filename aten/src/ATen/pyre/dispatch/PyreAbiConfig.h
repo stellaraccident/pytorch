@@ -23,7 +23,7 @@ namespace at::pyre {
 
 class AbiConfig {
  public:
-  enum class Convention { kTorch, kNative };
+  enum class Convention { kTorch, kNative, kEnvelope };
   enum class DtypeMapping { kTyped, kOpaque };
 
   Convention convention() const { return convention_; }
@@ -40,12 +40,17 @@ class AbiConfig {
 
   // Whether loadKernel should use native_abi resolution.
   bool isNative() const { return convention_ == Convention::kNative; }
+  bool isEnvelope() const { return convention_ == Convention::kEnvelope; }
 
   // Torch-mlir convention with typed buffer views.
   static const AbiConfig kTorchTyped;
 
   // Native IREE convention with opaque integer buffer views.
   static const AbiConfig kNativeOpaque;
+
+  // Envelope convention: torch input type, direct function resolution.
+  // Used by AbiPacker/AbiGenerator dispatch path.
+  static const AbiConfig kEnvelope;
 
  private:
   AbiConfig(Convention c, DtypeMapping d)

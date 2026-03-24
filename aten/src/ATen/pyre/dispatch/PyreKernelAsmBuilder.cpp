@@ -250,6 +250,250 @@ static ArgAdapterVars buildArgAdapterVars(
 }
 
 // ---------------------------------------------------------------------------
+// ComputeBody helpers
+// ---------------------------------------------------------------------------
+
+static std::string vtensorType(
+    const std::string& shape_str, const std::string& elt) {
+  return "!torch.vtensor<[" + shape_str + "], " + elt + ">";
+}
+
+static std::string builtinTensorType(const std::string& shape_str,
+                                      const std::string& elt) {
+  // Convert torch-mlir element types to builtin: f32→f32, si32→i32, etc.
+  std::string builtin_elt = elt;
+  if (builtin_elt.substr(0, 2) == "si")
+    builtin_elt = "i" + builtin_elt.substr(2);
+  else if (builtin_elt.substr(0, 2) == "ui")
+    builtin_elt = "i" + builtin_elt.substr(2);
+  else if (builtin_elt == "i1")
+    builtin_elt = "i1";
+  if (shape_str.empty())
+    return "tensor<" + builtin_elt + ">";
+  // Convert comma-separated shape to x-separated (tensor<?x4xf32>).
+  std::string tensor_dims;
+  for (char c : shape_str) {
+    if (c == ',') tensor_dims += 'x';
+    else tensor_dims += c;
+  }
+  return "tensor<" + tensor_dims + "x" + builtin_elt + ">";
+}
+
+// Wrap a ComputeBody back into a complete MLIR module (backward compat).
+std::string wrapComputeBody(
+    const std::string& func_name,
+    const ComputeBody& body,
+    c10::ArrayRef<ArgAdapter> adapters,
+    c10::ArrayRef<std::string> physical_input_vtensor_types,
+    c10::ArrayRef<std::string> physical_input_names) {
+  std::string mlir;
+
+  // Type aliases.
+  std::string out_mutable = body.output_vtensor_type;
+  // Convert vtensor to mutable tensor for %out_
+  // !torch.vtensor<[...], dtype> → !torch.tensor<[...], dtype>
+  std::string out_t = out_mutable;
+  auto pos = out_t.find("vtensor");
+  if (pos != std::string::npos) out_t.replace(pos, 7, "tensor");
+
+  mlir += "!out_t = " + out_t + "\n";
+  mlir += "!out_v = " + body.output_vtensor_type + "\n";
+
+  for (size_t i = 0; i < body.input_vtensor_types.size(); ++i) {
+    std::string prefix = body.input_names[i];
+    // Use the physical type for the input arg (pre-adapter).
+    if (i < physical_input_vtensor_types.size()) {
+      mlir += "!" + prefix + "_in = " + physical_input_vtensor_types[i] + "\n";
+    } else {
+      mlir += "!" + prefix + "_in = " + body.input_vtensor_types[i] + "\n";
+    }
+    mlir += "!" + prefix + "_c = " + body.input_vtensor_types[i] + "\n";
+  }
+
+  mlir += "\nmodule @module {\n";
+  mlir += "  func.func @" + func_name + "(%out_: !out_t";
+
+  // Input args.
+  for (size_t i = 0; i < body.input_names.size(); ++i) {
+    std::string phys_name = (i < physical_input_names.size())
+        ? physical_input_names[i]
+        : body.input_names[i] + "_raw";
+    mlir += ", %" + phys_name + ": !" + body.input_names[i] + "_in";
+  }
+
+  mlir += ")\n      attributes {torch.assume_strict_symbolic_shapes} {\n";
+
+  // Adapter lines (permute ops for transposed inputs).
+  for (size_t i = 0; i < adapters.size() && i < body.input_names.size(); ++i) {
+    if (adapters[i].kind == ArgAdapter::kPermute) {
+      std::string phys_name = (i < physical_input_names.size())
+          ? physical_input_names[i]
+          : body.input_names[i] + "_raw";
+      std::string in_type = "!" + body.input_names[i] + "_in";
+      std::string out_type = "!" + body.input_names[i] + "_c";
+      mlir += emitPermuteLines(
+          body.input_names[i], phys_name,
+          inversePerm(adapters[i].permutation), in_type, out_type);
+      mlir += "\n";
+    }
+  }
+
+  // The torch ops body.
+  mlir += body.mlir_ops;
+
+  // Overwrite epilogue.
+  mlir += "    torch.overwrite.tensor.contents %result overwrites %out_"
+          " : !out_v, !out_t\n";
+  mlir += "    return\n";
+  mlir += "  }\n";
+  mlir += "}\n";
+
+  return mlir;
+}
+
+// ---------------------------------------------------------------------------
+// ComputeBody generators
+// ---------------------------------------------------------------------------
+
+ComputeBody generateBinaryComputeBody(
+    const std::string& linalg_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  auto info = resolveBinaryOp(linalg_op);
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string lhs_s = broadcastAwareShapeStr(lhs_shape);
+  std::string rhs_s = broadcastAwareShapeStr(rhs_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(lhs_s, elt));
+  body.input_vtensor_types.push_back(vtensorType(rhs_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(lhs_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(rhs_s, elt));
+  body.input_names = {"lhs", "rhs"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+
+  std::string ops;
+  if (!info.extra_arg_decls.empty())
+    ops += info.extra_arg_decls + "\n";
+  ops += "    %result = " + info.torch_op + " %lhs, %rhs" +
+         info.extra_args + " : " +
+         body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+         info.extra_arg_types + " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateBinaryAlphaComputeBody(
+    const std::string& alpha_add_op, double alpha_value,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  auto info = resolveAlphaOp(alpha_add_op, alpha_value);
+  std::string alpha_type = scalarType(alpha_value);
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string lhs_s = broadcastAwareShapeStr(lhs_shape);
+  std::string rhs_s = broadcastAwareShapeStr(rhs_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(lhs_s, elt));
+  body.input_vtensor_types.push_back(vtensorType(rhs_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(lhs_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(rhs_s, elt));
+  body.input_names = {"lhs", "rhs"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+
+  std::string ops;
+  ops += info.alpha_decl + "\n";
+  ops += "    %result = " + info.torch_op + " %lhs, %rhs, %alpha : " +
+         body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+         ", " + alpha_type + " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateUnaryComputeBody(
+    const std::string& scalar_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(in_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(in_s, elt));
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+
+  std::string ops;
+  if (!extra_arg_decls.empty())
+    ops += "    " + extra_arg_decls + "\n";
+  ops += "    %result = " + scalar_op + " %input" +
+         extra_args + " : " +
+         body.input_vtensor_types[0] + extra_arg_types +
+         " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateMmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string m1_s = broadcastAwareShapeStr(mat1_shape);
+  std::string m2_s = broadcastAwareShapeStr(mat2_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(m1_s, elt));
+  body.input_vtensor_types.push_back(vtensorType(m2_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(m1_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(m2_s, elt));
+  body.input_names = {"mat1", "mat2"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+
+  std::string ops;
+  ops += "    %result = torch.aten.mm %mat1, %mat2 : " +
+         body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+         " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateSoftmaxComputeBody(
+    const std::string& softmax_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> shape, int64_t dim) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string shape_s = broadcastAwareShapeStr(shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(shape_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(shape_s, elt));
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(shape_s, elt);
+  body.output_tensor_type = builtinTensorType(shape_s, elt);
+
+  std::string ops;
+  ops += "    %dim = torch.constant.int " + std::to_string(dim) + "\n";
+  ops += "    %half_to_float = torch.constant.bool false\n";
+  ops += "    %result = torch.aten." + softmax_op +
+         " %input, %dim, %half_to_float : " +
+         body.input_vtensor_types[0] +
+         ", !torch.int, !torch.bool -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+// ---------------------------------------------------------------------------
 // Binary ops — build + generate (unified: identity + permute via template)
 // ---------------------------------------------------------------------------
 

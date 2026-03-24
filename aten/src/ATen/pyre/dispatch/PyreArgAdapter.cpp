@@ -6,13 +6,11 @@
 namespace at::pyre {
 
 ArgAdapter ArgAdapter::analyze(const at::Tensor& tensor) {
-  // HACK(pyre-workspace-blp): Non-zero storage offset (from split/narrow)
-  // means the tensor's data doesn't start at byte 0 of the IREE buffer.
-  // Force clone into a fresh buffer at offset 0. The proper fix is
-  // iree_hal_buffer_subspan, but compiled kernels crash with non-zero
-  // binding offsets (see ticket for details).
-  if (tensor.storage_offset() != 0)
-    return {kContiguous, {}};
+  // DISABLED for RCA (pyre-workspace-blp). With this disabled, tensors
+  // from split() produce wrong results because buildBufferView ignores
+  // storage_offset.
+  // if (tensor.storage_offset() != 0)
+  //   return {kContiguous, {}};
 
   // PyTorch is_contiguous() can return true for tensors with non-standard
   // strides when size-1 dims are involved (e.g. [1,2,1,32] strides

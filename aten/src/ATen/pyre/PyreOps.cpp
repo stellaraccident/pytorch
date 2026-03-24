@@ -1,5 +1,10 @@
 #include <ATen/pyre/PyreOps.h>
 #include <ATen/pyre/dispatch/PyreAlgorithmicKernels.h>
+#include <c10/pyre/impl/PyreRuntime.h>
+#include <c10/pyre/impl/PyreStream.h>
+#include <c10/pyre/impl/PyreStorage.h>
+#include <iree/hal/fence.h>
+#include <iree/vm/api.h>
 
 #ifdef AT_PER_OPERATOR_HEADERS
 #include <ATen/ops/_to_copy_native.h>
@@ -281,6 +286,79 @@ void invokeKernelInplace(
     PyreKernelDispatch::invoke(kernel, inputs, tmp, ctx);
     self.copy_(tmp);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Envelope dispatch: AbiPacker-based invocation
+// ---------------------------------------------------------------------------
+
+void invokeEnvelope(
+    CachedKernel* kernel,
+    const AbiPacker& packer,
+    c10::ArrayRef<at::Tensor> inputs,
+    at::Tensor& output) {
+  auto& runtime = c10::pyre::PyreRuntime::get();
+  auto alloc = runtime.hostAllocator();
+
+  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  auto& stream_ctx = stream.context();
+
+  // Build wait fence joining all input and output mutation timelines.
+  iree_hal_fence_t* wait = nullptr;
+  PYRE_CHECK_OK(iree_hal_fence_create(
+      static_cast<iree_host_size_t>(inputs.size() + 2), alloc, &wait));
+  for (const auto& t : inputs) {
+    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+        t.storage().data_ptr().get_context());
+    if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
+      PYRE_CHECK_OK(iree_hal_fence_insert(
+          wait, ctx->mutation_sem, ctx->mutation_timepoint));
+  }
+  {
+    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+        output.storage().data_ptr().get_context());
+    if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
+      PYRE_CHECK_OK(iree_hal_fence_insert(
+          wait, ctx->mutation_sem, ctx->mutation_timepoint));
+  }
+
+  // Signal fence.
+  uint64_t signal_value = ++stream_ctx.timepoint;
+  iree_hal_fence_t* signal = nullptr;
+  PYRE_CHECK_OK(iree_hal_fence_create_at(
+      stream_ctx.timeline.get(), signal_value, alloc, &signal));
+
+  // Build args via packer.
+  iree_host_size_t arg_count =
+      static_cast<iree_host_size_t>(packer.numUniqueBuffers()) +
+      static_cast<iree_host_size_t>(packer.dynamicDims().size()) +
+      20;  // generous: offsets + output bufs + transients + fences
+  iree_vm_list_t* args = nullptr;
+  PYRE_CHECK_OK(iree_vm_list_create(
+      iree_vm_make_undefined_type_def(), arg_count, alloc, &args));
+
+  packer.packArgs(args, /*transients=*/nullptr, wait, signal);
+
+  // Invoke.
+  PYRE_CHECK_OK(iree_vm_invoke(
+      kernel->context.get(), kernel->function,
+      IREE_VM_INVOCATION_FLAG_NONE, nullptr,
+      args, /*rets=*/nullptr, alloc));
+
+  // Timeline bookkeeping.
+  for (const auto& t : inputs) {
+    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+        t.storage().data_ptr().get_context());
+    if (ctx) ctx->recordUse(stream_ctx.timeline.get(), signal_value);
+  }
+  auto* out_ctx = static_cast<c10::pyre::PyreBufferContext*>(
+      output.storage().data_ptr().get_context());
+  if (out_ctx) out_ctx->recordMutation(
+      stream_ctx.timeline.get(), signal_value);
+
+  iree_vm_list_release(args);
+  iree_hal_fence_release(wait);
+  iree_hal_fence_release(signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -753,17 +831,12 @@ static at::Tensor dispatchIndexPut(
   auto vals_adapter = ArgAdapter::analyze(values);
   at::Tensor self_phys = self;
   at::Tensor vals_phys = values;
+  // DISABLED for RCA (pyre-workspace-blp)
   if (self_adapter.kind == ArgAdapter::kPermute) {
     self_phys = self.permute(self_adapter.permutation);
-  } else if (self_adapter.kind == ArgAdapter::kContiguous) {
-    // HACK(pyre-workspace-blp): clone to get offset-0 buffer.
-    self_phys = self.storage_offset() != 0 ? self.clone() : self.contiguous();
   }
   if (vals_adapter.kind == ArgAdapter::kPermute) {
     vals_phys = values.permute(vals_adapter.permutation);
-  } else if (vals_adapter.kind == ArgAdapter::kContiguous) {
-    // HACK(pyre-workspace-blp): clone to get offset-0 buffer.
-    vals_phys = values.storage_offset() != 0 ? values.clone() : values.contiguous();
   }
 
   std::string self_s = dynShape(self_phys.sizes());

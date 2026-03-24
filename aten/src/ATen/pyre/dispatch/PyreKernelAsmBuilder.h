@@ -46,6 +46,73 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// ---------------------------------------------------------------------------
+// ComputeBody — extracted torch op body without module/func wrapper.
+//
+// Contains only the logical torch dialect ops between input SSA values and
+// result SSA value. No module wrapper, no func.func, no type aliases, no
+// torch.overwrite.tensor.contents, no permute adapters.
+//
+// AbiGenerator (T2) wraps this with envelope function + compute func.func
+// shell. The backward-compat wrapComputeBody() re-wraps for the old path.
+// ---------------------------------------------------------------------------
+
+struct ComputeBody {
+  // Torch dialect ops only (indented, newline-terminated).
+  // Uses SSA names from input_names for inputs, produces %result.
+  std::string mlir_ops;
+
+  // Per-input: logical type strings (post-permutation shapes).
+  c10::SmallVector<std::string, 4> input_vtensor_types;
+  c10::SmallVector<std::string, 4> input_tensor_types;
+
+  // Per-input: SSA names referenced in mlir_ops.
+  c10::SmallVector<std::string, 4> input_names;
+
+  // Output type strings.
+  std::string output_vtensor_type;
+  std::string output_tensor_type;
+};
+
+// Wrap a ComputeBody back into a complete MLIR module for backward compat.
+// Adds type aliases, module, func.func, adapters, and overwrite epilogue.
+// This is the migration bridge — remove once T4 wires AbiGenerator.
+std::string wrapComputeBody(
+    const std::string& func_name,
+    const ComputeBody& body,
+    c10::ArrayRef<ArgAdapter> adapters,
+    c10::ArrayRef<std::string> physical_input_vtensor_types,
+    c10::ArrayRef<std::string> physical_input_names);
+
+// --- Compute body generators (new API for AbiGenerator) ---
+
+ComputeBody generateBinaryComputeBody(
+    const std::string& linalg_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateBinaryAlphaComputeBody(
+    const std::string& alpha_add_op, double alpha_value,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateUnaryComputeBody(
+    const std::string& scalar_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+ComputeBody generateMmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateSoftmaxComputeBody(
+    const std::string& softmax_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> shape, int64_t dim);
+
 // --- softmax ---
 
 KernelSpec buildSoftmaxKernelSpec(

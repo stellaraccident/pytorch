@@ -10,6 +10,8 @@
 
 #include <ATen/Tensor.h>
 #include <ATen/pyre/PyreTensor.h>
+#include <ATen/pyre/dispatch/PyreAbiGenerator.h>
+#include <ATen/pyre/dispatch/PyreAbiPacker.h>
 #include <ATen/pyre/dispatch/PyreArgAdapter.h>
 #include <ATen/pyre/dispatch/PyreArgShapeSpecializer.h>
 #include <ATen/pyre/dispatch/PyreKernelAsmBuilder.h>
@@ -21,6 +23,7 @@
 #include <ATen/Functions.h>
 #include <c10/core/Scalar.h>
 #include <c10/pyre/impl/PyreDevice.h>
+#include <c10/pyre/impl/PyreStream.h>
 
 #include <torch/library.h>
 
@@ -109,6 +112,14 @@ void invokeKernelInplace(
     const std::vector<at::Tensor>& inputs,
     at::Tensor& self);
 
+// Invoke an envelope kernel via AbiPacker's arg packing.
+// Handles timeline management (wait/signal fences).
+void invokeEnvelope(
+    CachedKernel* kernel,
+    const AbiPacker& packer,
+    c10::ArrayRef<at::Tensor> inputs,
+    at::Tensor& output);
+
 // ---------------------------------------------------------------------------
 // CRTP base
 // ---------------------------------------------------------------------------
@@ -169,6 +180,90 @@ struct PyreOp {
     return self;
   }
 
+  // Envelope dispatch path: uses AbiPacker/AbiGenerator.
+  // Requires Derived::generateComputeBody(). Falls back to legacy dispatch()
+  // for ops that don't implement it.
+  static at::Tensor dispatchEnvelope(
+      c10::ArrayRef<at::Tensor> raw_inputs,
+      c10::ArrayRef<at::Scalar> scalars) {
+    c10::SmallVector<at::Tensor, 4> promoted_storage;
+    c10::ArrayRef<at::Tensor> effective_inputs;
+    promoteScalarTensors(raw_inputs, promoted_storage, effective_inputs);
+
+    for (const auto& t : effective_inputs)
+      TORCH_CHECK(hasPyreBuffer(t), "pyre: ", Derived::aten_name,
+          " requires tensors with IREE buffers");
+
+    auto dtype = effective_inputs[0].scalar_type();
+
+    // Force contiguous for inputs with non-permutable strides.
+    // Permuted inputs are handled by linalg.transpose in the envelope.
+    // kContiguous means the strides can't be expressed as any axis
+    // permutation — the data layout is non-dense (e.g., x[::2]).
+    c10::SmallVector<at::Tensor, 4> contiguous_storage;
+    c10::ArrayRef<at::Tensor> visit_inputs = effective_inputs;
+    {
+      bool needs_copy = false;
+      for (const auto& t : effective_inputs) {
+        auto adapter = ArgAdapter::analyze(t);
+        if (adapter.kind == ArgAdapter::kContiguous) {
+          needs_copy = true;
+          break;
+        }
+      }
+      if (needs_copy) {
+        for (const auto& t : effective_inputs) {
+          auto adapter = ArgAdapter::analyze(t);
+          if (adapter.kind == ArgAdapter::kContiguous)
+            contiguous_storage.push_back(t.contiguous());
+          else
+            contiguous_storage.push_back(t);
+        }
+        visit_inputs = contiguous_storage;
+      }
+    }
+
+    // AbiPacker visits inputs (handles storage aliasing, offsets,
+    // permutation detection internally).
+    AbiPacker packer;
+    for (const auto& t : visit_inputs)
+      packer.visitInput(t);
+
+    // Build OpContext with visit_inputs for shape inference and spec building.
+    SpecDecision empty_decision;
+    OpContext ctx{visit_inputs, effective_inputs, scalars, dtype,
+                  empty_decision};
+
+    auto out_shape = Derived::inferShape(ctx);
+    auto out = at::empty(out_shape, Derived::outputOptions(ctx));
+    packer.visitOutput(out);
+
+    auto func_name = Derived::buildFuncName(ctx);
+
+    // Phase 1: build spec for compute identity and cache key.
+    auto spec = Derived::buildKernelSpec(func_name, ctx);
+    auto cache_key = packer.cacheKey(
+        spec.template_sha1, spec.substitutions,
+        AbiConfig::kEnvelope.compilerFlags());
+
+    // Phase 2: lookup. Generate envelope MLIR on cache miss.
+    auto& cache = PyreKernelCache::get();
+    auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
+    if (!kernel) {
+      AbiGenerator gen;
+      for (const auto& t : visit_inputs) gen.visitInput(t);
+      gen.visitOutput(out);
+      auto body = Derived::generateComputeBody(func_name, ctx);
+      auto mlir = gen.generateModule(func_name, body);
+      kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
+    }
+
+    invokeEnvelope(kernel, packer, visit_inputs, out);
+    return out;
+  }
+
+  // Legacy dispatch path: uses ArgShapeSpecializer + applyAdapters.
+  // Used by ops that don't have generateComputeBody() yet.
   static at::Tensor dispatch(
       c10::ArrayRef<at::Tensor> raw_inputs,
       c10::ArrayRef<at::Scalar> scalars) {
@@ -195,13 +290,11 @@ struct PyreOp {
     auto out_shape  = Derived::inferShape(ctx);
     auto func_name  = Derived::buildFuncName(ctx);
 
-    // Phase 1: build spec (cheap) and hash for cache lookup.
     auto spec = Derived::buildKernelSpec(func_name, ctx);
     auto cache_key = contentHashCacheKey(
         spec.template_sha1, spec.substitutions,
         c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
 
-    // Phase 2: lookup. Generate MLIR only on cache miss.
     auto& cache = PyreKernelCache::get();
     auto* kernel = cache.lookup(cache_key, func_name);
     if (!kernel) {
@@ -226,7 +319,7 @@ struct PyreOp {
 template <typename Derived>
 struct RegularBinaryOp : PyreOp<Derived> {
   static at::Tensor impl(const at::Tensor& self, const at::Tensor& other) {
-    return PyreOp<Derived>::dispatch({self, other}, {});
+    return PyreOp<Derived>::dispatchEnvelope({self, other}, {});
   }
   static at::Tensor& impl_inplace(at::Tensor& self, const at::Tensor& other) {
     return PyreOp<Derived>::dispatch_inplace(self, {other}, {});
@@ -243,6 +336,13 @@ struct RegularBinaryOp : PyreOp<Derived> {
       const std::string& func_name, const OpContext& ctx) {
     return buildBinaryMlir(Derived::torch_op, func_name, ctx);
   }
+  static ComputeBody generateComputeBody(
+      const std::string& /*func_name*/, const OpContext& ctx) {
+    auto out_shape = inferShapeBroadcast(ctx);
+    return generateBinaryComputeBody(
+        Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+  }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
   }
@@ -257,7 +357,7 @@ struct AlphaBinaryOp : PyreOp<Derived> {
   static at::Tensor impl(
       const at::Tensor& self, const at::Tensor& other,
       const at::Scalar& alpha) {
-    return PyreOp<Derived>::dispatch({self, other}, {alpha});
+    return PyreOp<Derived>::dispatchEnvelope({self, other}, {alpha});
   }
   static at::Tensor& impl_inplace(
       at::Tensor& self, const at::Tensor& other,
@@ -276,6 +376,14 @@ struct AlphaBinaryOp : PyreOp<Derived> {
       const std::string& func_name, const OpContext& ctx) {
     return buildBinaryMlir(Derived::torch_op, func_name, ctx);
   }
+  static ComputeBody generateComputeBody(
+      const std::string& /*func_name*/, const OpContext& ctx) {
+    double alpha = ctx.scalars.empty() ? 1.0 : ctx.scalars[0].toDouble();
+    auto out_shape = inferShapeBroadcast(ctx);
+    return generateBinaryAlphaComputeBody(
+        Derived::torch_op, alpha, ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+  }
   static std::string buildFuncName(const OpContext& ctx) {
     auto base = funcNameDefault(Derived::aten_name);
     if (!ctx.scalars.empty() &&
@@ -292,7 +400,7 @@ struct AlphaBinaryOp : PyreOp<Derived> {
 template <typename Derived>
 struct RegularUnaryOp : PyreOp<Derived> {
   static at::Tensor impl(const at::Tensor& self) {
-    return PyreOp<Derived>::dispatch({self}, {});
+    return PyreOp<Derived>::dispatchEnvelope({self}, {});
   }
   static at::Tensor& impl_inplace(at::Tensor& self) {
     return PyreOp<Derived>::dispatch_inplace(self, {}, {});
@@ -309,6 +417,13 @@ struct RegularUnaryOp : PyreOp<Derived> {
       const std::string& func_name, const OpContext& ctx) {
     return buildUnaryMlir(Derived::torch_op, func_name, ctx);
   }
+  static ComputeBody generateComputeBody(
+      const std::string& /*func_name*/, const OpContext& ctx) {
+    auto out_shape = inferShapeIdentity(ctx);
+    return generateUnaryComputeBody(
+        Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), out_shape);
+  }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
   }
@@ -321,7 +436,7 @@ struct RegularUnaryOp : PyreOp<Derived> {
 template <typename Derived>
 struct ParameterizedUnaryOp : PyreOp<Derived> {
   static at::Tensor impl(const at::Tensor& self) {
-    return PyreOp<Derived>::dispatch({self}, {});
+    return PyreOp<Derived>::dispatchEnvelope({self}, {});
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
@@ -339,6 +454,16 @@ struct ParameterizedUnaryOp : PyreOp<Derived> {
       const std::string& func_name, const OpContext& ctx) {
     return buildUnaryMlir(
         Derived::torch_op, func_name, ctx,
+        Derived::extraArgDecls(ctx),
+        Derived::extraArgs(),
+        Derived::extraArgTypes());
+  }
+  static ComputeBody generateComputeBody(
+      const std::string& /*func_name*/, const OpContext& ctx) {
+    auto out_shape = inferShapeIdentity(ctx);
+    return generateUnaryComputeBody(
+        Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), out_shape,
         Derived::extraArgDecls(ctx),
         Derived::extraArgs(),
         Derived::extraArgTypes());
