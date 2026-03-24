@@ -118,12 +118,12 @@ KernelSpec buildBinarySpec(
     return buildBinaryAlphaKernelSpec(
         func_name, alpha_add_op, alpha_val, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-        out_shape, ctx.decision.arg_adapters);
+        out_shape, c10::ArrayRef<ArgAdapter>{});
   }
   return buildBinaryKernelSpec(
       func_name, linalg_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-      out_shape, ctx.decision.arg_adapters);
+      out_shape, c10::ArrayRef<ArgAdapter>{});
 }
 
 std::string buildBinaryMlir(
@@ -140,12 +140,12 @@ std::string buildBinaryMlir(
     return generateBinaryAlphaMlir(
         func_name, alpha_add_op, alpha_val, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-        out_shape, ctx.decision.arg_adapters);
+        out_shape, c10::ArrayRef<ArgAdapter>{});
   }
   return generateBinaryMlir(
       func_name, linalg_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-      out_shape, ctx.decision.arg_adapters);
+      out_shape, c10::ArrayRef<ArgAdapter>{});
 }
 
 KernelSpec buildUnarySpec(
@@ -154,9 +154,9 @@ KernelSpec buildUnarySpec(
     const std::string& extra_arg_decls,
     const std::string& extra_args,
     const std::string& extra_arg_types) {
-  ArgAdapter adapter = ctx.decision.arg_adapters.empty()
+  ArgAdapter adapter = c10::ArrayRef<ArgAdapter>{}.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
-      : ctx.decision.arg_adapters[0];
+      : c10::ArrayRef<ArgAdapter>{}[0];
   return buildUnaryKernelSpec(
       func_name, torch_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
@@ -169,9 +169,9 @@ std::string buildUnaryMlir(
     const std::string& extra_arg_decls,
     const std::string& extra_args,
     const std::string& extra_arg_types) {
-  ArgAdapter adapter = ctx.decision.arg_adapters.empty()
+  ArgAdapter adapter = c10::ArrayRef<ArgAdapter>{}.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
-      : ctx.decision.arg_adapters[0];
+      : c10::ArrayRef<ArgAdapter>{}[0];
   return generateUnaryMlir(
       func_name, torch_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
@@ -248,45 +248,7 @@ CachedKernel* getOrCompile(
   return cache.store(cache_key, func_name, std::move(vmfb), abi);
 }
 
-at::Tensor invokeKernel(
-    CachedKernel* kernel,
-    const std::vector<at::Tensor>& inputs,
-    c10::IntArrayRef out_shape,
-    const at::TensorOptions& opts) {
-  auto output = at::empty(out_shape, opts);
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
-  auto& ctx = stream.context();
-  PyreKernelDispatch::invoke(kernel, inputs, output, ctx);
-  return output;
-}
 
-// HACK(pyre-workspace-blp): Check if a tensor is strictly dense row-major
-// at offset 0. The offset check is a workaround — with proper subspan
-// support, non-zero offsets would be handled by the buffer view.
-static bool isDenseRowMajorAtZero(const at::Tensor& t) {
-  if (t.storage_offset() != 0) return false;
-  int64_t expected = 1;
-  for (int64_t i = t.dim() - 1; i >= 0; --i) {
-    if (t.size(i) > 1 && t.stride(i) != expected) return false;
-    expected *= t.size(i);
-  }
-  return true;
-}
-
-void invokeKernelInplace(
-    CachedKernel* kernel,
-    const std::vector<at::Tensor>& inputs,
-    at::Tensor& self) {
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
-  auto& ctx = stream.context();
-  if (isDenseRowMajorAtZero(self)) {
-    PyreKernelDispatch::invoke(kernel, inputs, self, ctx);
-  } else {
-    auto tmp = at::empty(self.sizes(), self.options());
-    PyreKernelDispatch::invoke(kernel, inputs, tmp, ctx);
-    self.copy_(tmp);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Envelope dispatch: AbiPacker-based invocation
@@ -395,7 +357,7 @@ KernelSpec MmOp::buildKernelSpec(
   return buildMmKernelSpec(
       func_name, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
-      ctx.decision.arg_adapters);
+      c10::ArrayRef<ArgAdapter>{});
 }
 
 std::string MmOp::generateMlir(
@@ -404,7 +366,7 @@ std::string MmOp::generateMlir(
   return generateMmMlir(
       func_name, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
-      ctx.decision.arg_adapters);
+      c10::ArrayRef<ArgAdapter>{});
 }
 
 // ---------------------------------------------------------------------------
@@ -415,8 +377,8 @@ static void addmmArgs(const OpContext& ctx, double& beta, double& alpha,
                       bool& mat2_permuted) {
   beta = ctx.scalars.size() >= 1 ? ctx.scalars[0].toDouble() : 1.0;
   alpha = ctx.scalars.size() >= 2 ? ctx.scalars[1].toDouble() : 1.0;
-  mat2_permuted = ctx.decision.arg_adapters.size() > 2
-      && ctx.decision.arg_adapters[2].kind == ArgAdapter::kPermute;
+  mat2_permuted = c10::ArrayRef<ArgAdapter>{}.size() > 2
+      && c10::ArrayRef<ArgAdapter>{}[2].kind == ArgAdapter::kPermute;
 }
 
 KernelSpec AddmmOp::buildKernelSpec(

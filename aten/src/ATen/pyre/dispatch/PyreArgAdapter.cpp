@@ -6,12 +6,6 @@
 namespace at::pyre {
 
 ArgAdapter ArgAdapter::analyze(const at::Tensor& tensor) {
-  // DISABLED for RCA (pyre-workspace-blp). With this disabled, tensors
-  // from split() produce wrong results because buildBufferView ignores
-  // storage_offset.
-  // if (tensor.storage_offset() != 0)
-  //   return {kContiguous, {}};
-
   // PyTorch is_contiguous() can return true for tensors with non-standard
   // strides when size-1 dims are involved (e.g. [1,2,1,32] strides
   // (64,32,64,1) from transpose). We need strict row-major verification
@@ -69,44 +63,6 @@ ArgAdapter ArgAdapter::analyze(const at::Tensor& tensor) {
     return {kPermute, std::move(perm)};
 
   return {kContiguous, {}};
-}
-
-std::vector<at::Tensor> applyAdapters(
-    const std::vector<at::Tensor>& inputs,
-    const std::vector<ArgAdapter>& adapters) {
-  std::vector<at::Tensor> result;
-  result.reserve(inputs.size());
-
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    const auto& adapter = (i < adapters.size())
-        ? adapters[i]
-        : ArgAdapter{ArgAdapter::kIdentity, {}};
-
-    switch (adapter.kind) {
-      case ArgAdapter::kPermute: {
-        // The adapter's perm maps physical position → logical dim
-        // (sorted by stride). Applying it to the logical-shape tensor
-        // recovers the physical (contiguous) layout.
-        result.push_back(inputs[i].permute(adapter.permutation));
-        break;
-      }
-      case ArgAdapter::kContiguous: {
-        // HACK(pyre-workspace-blp): .contiguous() is a no-op when strides
-        // are contiguous, even if storage_offset != 0. Use .clone() to
-        // ensure the data starts at byte 0 in a fresh buffer.
-        if (inputs[i].storage_offset() != 0) {
-          result.push_back(inputs[i].clone());
-        } else {
-          result.push_back(inputs[i].contiguous());
-        }
-        break;
-      }
-      default:
-        result.push_back(inputs[i]);
-        break;
-    }
-  }
-  return result;
 }
 
 } // namespace at::pyre

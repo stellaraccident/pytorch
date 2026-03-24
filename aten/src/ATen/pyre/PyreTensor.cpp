@@ -228,13 +228,11 @@ c10::pyre::hal_buffer_view_ptr buildBufferView(const at::Tensor& tensor) {
 
   iree_hal_buffer_t* buf = ctx->buffer.get();
 
-  // HACK(pyre-workspace-blp): log if we see a non-zero offset here.
-  // All dispatch paths should clone offset tensors before reaching this
-  // point, so this warning indicates a missing clone.
+  // Only used by native strided copy/fill kernels which handle offsets
+  // via StridedCopyPlan, not through the buffer view.
   if (tensor.storage_offset() != 0) {
-    PYRE_LOG(WARN) << "buildBufferView: tensor has storage_offset="
-        << tensor.storage_offset() << " shape=" << tensor.sizes()
-        << " — buffer view will be wrong (offset not reflected)\n";
+    PYRE_LOG(DEBUG) << "buildBufferView: tensor has storage_offset="
+        << tensor.storage_offset() << " shape=" << tensor.sizes() << "\n";
   }
 
   iree_hal_buffer_view_t* view = nullptr;
@@ -250,13 +248,9 @@ c10::pyre::hal_buffer_view_ptr buildOpaqueBufferView(const at::Tensor& tensor) {
   TORCH_CHECK(hasPyreBuffer(tensor),
       "pyre: tensor has no IREE buffer (CPU fallback tensor?)");
 
-  // HACK(pyre-workspace-blp): log if we see a non-zero offset here.
-  // Copy kernels (clone/copy_) may legitimately pass offset tensors
-  // through this path — the copy plan handles offsets separately.
   if (tensor.storage_offset() != 0) {
-    PYRE_LOG(WARN) << "buildOpaqueBufferView: tensor has storage_offset="
-        << tensor.storage_offset() << " shape=" << tensor.sizes()
-        << " — buffer view will be wrong (offset not reflected)\n";
+    PYRE_LOG(DEBUG) << "buildOpaqueBufferView: tensor has storage_offset="
+        << tensor.storage_offset() << " shape=" << tensor.sizes() << "\n";
   }
 
   auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(

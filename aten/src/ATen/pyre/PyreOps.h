@@ -13,11 +13,9 @@
 #include <ATen/pyre/dispatch/PyreAbiGenerator.h>
 #include <ATen/pyre/dispatch/PyreAbiPacker.h>
 #include <ATen/pyre/dispatch/PyreArgAdapter.h>
-#include <ATen/pyre/dispatch/PyreArgShapeSpecializer.h>
 #include <ATen/pyre/dispatch/PyreKernelAsmBuilder.h>
 #include <ATen/pyre/dispatch/PyreKernelCache.h>
 #include <ATen/pyre/dispatch/PyreKernelCompiler.h>
-#include <ATen/pyre/dispatch/PyreKernelDispatch.h>
 #include <ATen/pyre/dispatch/PyreTypeMapping.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/Functions.h>
@@ -34,11 +32,10 @@
 namespace at::pyre {
 
 struct OpContext {
-  c10::ArrayRef<at::Tensor> inputs;       // post-adapter (physical layout)
-  c10::ArrayRef<at::Tensor> raw_inputs;   // pre-adapter (logical layout)
+  c10::ArrayRef<at::Tensor> inputs;
+  c10::ArrayRef<at::Tensor> raw_inputs;
   c10::ArrayRef<at::Scalar> scalars;
   c10::ScalarType dtype;
-  const SpecDecision& decision;
 };
 
 // Stock helper functions (non-templated, do the real work).
@@ -97,20 +94,6 @@ CachedKernel* getOrCompile(
     const std::string& func_name,
     const std::string& mlir,
     const AbiConfig& abi = AbiConfig::kTorchTyped);
-
-// Invoke a kernel with the given inputs, producing an output tensor.
-at::Tensor invokeKernel(
-    CachedKernel* kernel,
-    const std::vector<at::Tensor>& inputs,
-    c10::IntArrayRef out_shape,
-    const at::TensorOptions& opts);
-
-// Invoke a kernel in-place: writes result into self's buffer (contiguous fast
-// path) or into a contiguous temp then copies back (non-contiguous slow path).
-void invokeKernelInplace(
-    CachedKernel* kernel,
-    const std::vector<at::Tensor>& inputs,
-    at::Tensor& self);
 
 // Invoke an envelope kernel via AbiPacker's arg packing.
 // Handles timeline management (wait/signal fences).
@@ -177,8 +160,7 @@ struct PyreOp {
     for (const auto& t : visit_inputs) packer.visitInput(t);
     packer.visitOutput(self);  // inplace: output IS self
 
-    SpecDecision empty_decision;
-    OpContext ctx{visit_inputs, effective_inputs, scalars, dtype, empty_decision};
+    OpContext ctx{visit_inputs, effective_inputs, scalars, dtype};
 
     auto func_name = Derived::buildFuncName(ctx);
     auto spec = Derived::buildKernelSpec(func_name, ctx);
@@ -248,9 +230,7 @@ struct PyreOp {
       packer.visitInput(t);
 
     // Build OpContext with visit_inputs for shape inference and spec building.
-    SpecDecision empty_decision;
-    OpContext ctx{visit_inputs, effective_inputs, scalars, dtype,
-                  empty_decision};
+    OpContext ctx{visit_inputs, effective_inputs, scalars, dtype};
 
     auto out_shape = Derived::inferShape(ctx);
     auto out = at::empty(out_shape, Derived::outputOptions(ctx));
@@ -921,7 +901,7 @@ struct ComparisonBinaryOp : PyreOp<Derived> {
     return buildComparisonKernelSpec(
         func_name, Derived::torch_op, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
-        ctx.decision.arg_adapters);
+        c10::ArrayRef<ArgAdapter>{});
   }
   static std::string generateMlir(
       const std::string& func_name, const OpContext& ctx) {
@@ -929,7 +909,7 @@ struct ComparisonBinaryOp : PyreOp<Derived> {
     return generateComparisonMlir(
         func_name, Derived::torch_op, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
-        ctx.decision.arg_adapters);
+        c10::ArrayRef<ArgAdapter>{});
   }
   static ComputeBody generateComputeBody(
       const std::string& /*func_name*/, const OpContext& ctx) {

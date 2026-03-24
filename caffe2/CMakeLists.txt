@@ -1233,7 +1233,6 @@ if(USE_PYRE)
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgAdapter.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreCatKernel.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreIndexKernels.cpp
-    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgShapeSpecializer.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelAsmBuilder.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCache.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCompiler.cpp
