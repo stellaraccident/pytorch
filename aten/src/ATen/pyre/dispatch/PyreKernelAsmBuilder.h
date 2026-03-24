@@ -113,6 +113,82 @@ ComputeBody generateSoftmaxComputeBody(
     const std::string& softmax_op, c10::ScalarType dtype,
     c10::ArrayRef<int64_t> shape, int64_t dim);
 
+ComputeBody generateComparisonComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateComparisonScalarComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, double scalar_value);
+
+ComputeBody generateBmmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateWhereComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> cond_shape,
+    c10::ArrayRef<int64_t> self_shape,
+    c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateAddmmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> bias_shape, c10::ArrayRef<int64_t> mat1_shape,
+    c10::ArrayRef<int64_t> mat2_shape, c10::ArrayRef<int64_t> out_shape,
+    double beta, double alpha);
+
+ComputeBody generateReductionComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<int64_t> dims, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+ComputeBody generateSingleDimReductionComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    int64_t dim, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+ComputeBody generateEmbeddingComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateIndexSelectComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+ComputeBody generateGatherComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+ComputeBody generateScatterSrcComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+ComputeBody generateScatterAddComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+ComputeBody generateTypeCastComputeBody(
+    c10::ScalarType in_dtype, c10::ScalarType out_dtype,
+    c10::ArrayRef<int64_t> shape);
+
+ComputeBody generateArangeComputeBody(
+    c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step);
+
 // --- softmax ---
 
 KernelSpec buildSoftmaxKernelSpec(

@@ -404,56 +404,81 @@ std::string AbiGenerator::emitEnvelopeFunction(
 
   const auto& out = tensors_[out_ti];
 
-  // Output shape dim args for hal.tensor.alias.
-  std::string out_shaped_type = shapedTensorType(out.sizes, out.dtype);
-
-  // Build dim list for the output.
-  std::string out_dims_str;
-  for (size_t d = 0; d < out.sizes.size(); ++d) {
-    if (out.sizes[d] != 1) {
-      if (!out_dims_str.empty()) out_dims_str += ", ";
-      // Output dims come from compute result — use the dynamic dim args.
-      // For the simple case, reuse input dims that match.
-      // For now, use output tensor's dim values from the body type.
-      out_dims_str += "%dim_out_" + std::to_string(d);
+  // Determine which output dims are dynamic (? in the type).
+  // Parse body.output_tensor_type to find which dims are dynamic.
+  // A dim is dynamic if it appears as '?' in the type string.
+  c10::SmallVector<bool, 6> out_dim_is_dynamic;
+  {
+    // Parse "tensor<?x4xf32>" style type to find dynamic dims.
+    auto type_str = body.output_tensor_type;
+    auto lt = type_str.find('<');
+    auto gt = type_str.rfind('x');
+    if (lt != std::string::npos) {
+      std::string dims_str = type_str.substr(lt + 1);
+      // Remove element type suffix (last xTYPE>)
+      for (size_t d = 0; d < out.sizes.size(); ++d) {
+        // Find next dim token before 'x' or '>'
+        size_t pos = 0;
+        std::string remaining = dims_str;
+        out_dim_is_dynamic.clear();
+        for (size_t dd = 0; dd < out.sizes.size(); ++dd) {
+          if (remaining.empty()) break;
+          if (remaining[0] == '?') {
+            out_dim_is_dynamic.push_back(true);
+            remaining = remaining.substr(1);
+          } else {
+            out_dim_is_dynamic.push_back(false);
+            // Skip digits
+            size_t end = 0;
+            while (end < remaining.size() && std::isdigit(remaining[end])) ++end;
+            remaining = remaining.substr(end);
+          }
+          // Skip 'x' separator
+          if (!remaining.empty() && remaining[0] == 'x')
+            remaining = remaining.substr(1);
+        }
+        break; // only one pass needed
+      }
     }
   }
+  // Fallback: if parsing failed, assume non-1 dims are dynamic.
+  if (out_dim_is_dynamic.size() != out.sizes.size()) {
+    out_dim_is_dynamic.clear();
+    for (size_t d = 0; d < out.sizes.size(); ++d)
+      out_dim_is_dynamic.push_back(out.sizes[d] != 1);
+  }
 
-  // Emit output dim computations.
-  // For most ops, output dims are the same as input dims (or computed from them).
-  // We'll use tensor.dim on the result to get them.
+  // Emit tensor.dim for dynamic output dims.
   for (size_t d = 0; d < out.sizes.size(); ++d) {
-    if (out.sizes[d] != 1) {
+    if (out_dim_is_dynamic[d]) {
       ss << "    %c" << d << "_out_idx = arith.constant " << d << " : index\n";
       ss << "    %dim_out_" << d << " = tensor.dim %result, %c"
          << d << "_out_idx : " << body.output_tensor_type << "\n";
     }
   }
 
+  // Helper lambda to emit dim list in {%d0, %d1} format.
+  auto emitDynDims = [&]() {
+    bool first = true;
+    for (size_t d = 0; d < out.sizes.size(); ++d) {
+      if (out_dim_is_dynamic[d]) {
+        if (!first) ss << ", ";
+        ss << "%dim_out_" << d;
+        first = false;
+      }
+    }
+  };
+
   // Alias result to output buffer.
   ss << "\n    %aliased = hal.tensor.alias wait(%wait) =>\n"
      << "        %result : " << body.output_tensor_type << "{";
-  bool first = true;
-  for (size_t d = 0; d < out.sizes.size(); ++d) {
-    if (out.sizes[d] != 1) {
-      if (!first) ss << ", ";
-      ss << "%dim_out_" << d;
-      first = false;
-    }
-  }
+  emitDynDims();
   ss << "} to %buf_out_" << out_ti << " : !hal.buffer\n";
 
   // Transients annotation.
   ss << "    %annotated = hal.tensor.transients %aliased : "
      << body.output_tensor_type << "{";
-  first = true;
-  for (size_t d = 0; d < out.sizes.size(); ++d) {
-    if (out.sizes[d] != 1) {
-      if (!first) ss << ", ";
-      ss << "%dim_out_" << d;
-      first = false;
-    }
-  }
+  emitDynDims();
   ss << "}\n        from %transients : !hal.buffer\n";
 
   // Barrier → signal.
@@ -464,14 +489,7 @@ std::string AbiGenerator::emitEnvelopeFunction(
   // Export (discarded).
   ss << "    %out_bv = hal.tensor.export %ready \"output0\"\n"
      << "        : " << body.output_tensor_type << "{";
-  first = true;
-  for (size_t d = 0; d < out.sizes.size(); ++d) {
-    if (out.sizes[d] != 1) {
-      if (!first) ss << ", ";
-      ss << "%dim_out_" << d;
-      first = false;
-    }
-  }
+  emitDynDims();
   ss << "} -> !hal.buffer_view\n";
 
   ss << "    util.return\n";

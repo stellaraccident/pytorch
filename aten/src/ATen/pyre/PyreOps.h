@@ -549,7 +549,7 @@ struct MmOp : PyreOp<MmOp> {
         "pyre: mm requires 2D tensors");
     TORCH_CHECK(self.size(1) == other.size(0),
         "pyre: mm dimension mismatch");
-    return dispatch({self, other}, {});
+    return dispatchEnvelope({self, other}, {});
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
@@ -560,6 +560,12 @@ struct MmOp : PyreOp<MmOp> {
       const std::string& func_name, const OpContext& ctx);
   static std::string generateMlir(
       const std::string& func_name, const OpContext& ctx);
+  static ComputeBody generateComputeBody(
+      const std::string& func_name, const OpContext& ctx) {
+    auto out_shape = inferShape(ctx);
+    return generateMmComputeBody(ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+  }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(aten_name);
   }
@@ -680,7 +686,7 @@ struct GeluOp : ParameterizedUnaryOp<GeluOp> {
         "pyre: gelu approximate must be 'none' or 'tanh'");
     TORCH_CHECK(approximate == "none",
         "pyre: gelu approximate='tanh' not yet supported");
-    return PyreOp<GeluOp>::dispatch({self}, {});
+    return PyreOp<GeluOp>::dispatchEnvelope({self}, {});
   }
   static at::Tensor& impl_inplace(at::Tensor& self,
                                     c10::string_view approximate = "none") {
@@ -702,7 +708,7 @@ struct HardtanhOp : ParameterizedUnaryOp<HardtanhOp> {
   static at::Tensor impl(const at::Tensor& self,
                           const at::Scalar& min_val = -1,
                           const at::Scalar& max_val = 1) {
-    return PyreOp<HardtanhOp>::dispatch({self}, {min_val, max_val});
+    return PyreOp<HardtanhOp>::dispatchEnvelope({self}, {min_val, max_val});
   }
   static at::Tensor& impl_inplace(at::Tensor& self,
                                     const at::Scalar& min_val = -1,
@@ -728,7 +734,7 @@ struct LeakyReluOp : ParameterizedUnaryOp<LeakyReluOp> {
   static constexpr const char* torch_op = "torch.aten.leaky_relu";
   static at::Tensor impl(const at::Tensor& self,
                           const at::Scalar& negative_slope = 0.01) {
-    return PyreOp<LeakyReluOp>::dispatch({self}, {negative_slope});
+    return PyreOp<LeakyReluOp>::dispatchEnvelope({self}, {negative_slope});
   }
   static at::Tensor& impl_inplace(at::Tensor& self,
                                     const at::Scalar& negative_slope = 0.01) {
@@ -752,7 +758,7 @@ struct EluOp : ParameterizedUnaryOp<EluOp> {
                           const at::Scalar& alpha = 1,
                           const at::Scalar& scale = 1,
                           const at::Scalar& input_scale = 1) {
-    return PyreOp<EluOp>::dispatch({self}, {alpha, scale, input_scale});
+    return PyreOp<EluOp>::dispatchEnvelope({self}, {alpha, scale, input_scale});
   }
   static at::Tensor& impl_inplace(at::Tensor& self,
                                     const at::Scalar& alpha = 1,
@@ -808,10 +814,36 @@ struct ScalarBinaryOp : PyreOp<Derived> {
         Derived::extraArgs(),
         Derived::extraArgTypes());
   }
+  static ComputeBody generateComputeBody(
+      const std::string& /*func_name*/, const OpContext& ctx) {
+    double scalar_val = ctx.scalars[0].toDouble();
+    auto out_shape = inferShapeIdentity(ctx);
+    // Scalar binary: generate as unary with embedded scalar constant.
+    std::string scalar_decl = "    %scalar = torch.constant.float " +
+        std::to_string(scalar_val);
+    if (scalar_val == static_cast<int64_t>(scalar_val))
+      scalar_decl = "    %scalar = torch.constant.int " +
+          std::to_string(static_cast<int64_t>(scalar_val));
+    std::string scalar_type = (scalar_val == static_cast<int64_t>(scalar_val))
+        ? "!torch.int" : "!torch.float";
+    std::string extra_decls = scalar_decl;
+    std::string extra_args_str = Derived::extraArgs();
+    std::string extra_types_str = Derived::extraArgTypes();
+    if (!extra_decls.empty()) {
+      std::string derived_decls = Derived::extraArgDecls(ctx);
+      if (!derived_decls.empty())
+        extra_decls += "\n" + derived_decls;
+    }
+    return generateUnaryComputeBody(
+        Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), out_shape,
+        extra_decls,
+        ", %scalar" + extra_args_str,
+        ", " + scalar_type + extra_types_str);
+  }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
   }
-  // Default: no extra args. Override in add.Scalar/sub.Scalar for alpha.
   static std::string extraArgDecls(const OpContext&) { return ""; }
   static std::string extraArgs() { return ""; }
   static std::string extraArgTypes() { return ""; }
@@ -827,7 +859,7 @@ struct AddScalarOp : ScalarBinaryOp<AddScalarOp> {
                           const at::Scalar& other,
                           const at::Scalar& alpha = 1) {
     double val = other.toDouble() * alpha.toDouble();
-    return PyreOp<AddScalarOp>::dispatch({self}, {at::Scalar(val)});
+    return PyreOp<AddScalarOp>::dispatchEnvelope({self}, {at::Scalar(val)});
   }
   static at::Tensor& impl_inplace(at::Tensor& self,
                                     const at::Scalar& other,
@@ -851,7 +883,7 @@ struct SubScalarOp : ScalarBinaryOp<SubScalarOp> {
                           const at::Scalar& other,
                           const at::Scalar& alpha = 1) {
     double val = other.toDouble() * alpha.toDouble();
-    return PyreOp<SubScalarOp>::dispatch({self}, {at::Scalar(val)});
+    return PyreOp<SubScalarOp>::dispatchEnvelope({self}, {at::Scalar(val)});
   }
   static at::Tensor& impl_inplace(at::Tensor& self,
                                     const at::Scalar& other,
@@ -872,7 +904,7 @@ struct MulScalarOp : ScalarBinaryOp<MulScalarOp> {
   static constexpr const char* aten_name_inplace = "mul_.Scalar";
   static constexpr const char* torch_op = "torch.aten.mul.Scalar";
   static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
-    return PyreOp<MulScalarOp>::dispatch({self}, {other});
+    return PyreOp<MulScalarOp>::dispatchEnvelope({self}, {other});
   }
 };
 
@@ -881,7 +913,7 @@ struct DivScalarOp : ScalarBinaryOp<DivScalarOp> {
   static constexpr const char* aten_name_inplace = "div_.Scalar";
   static constexpr const char* torch_op = "torch.aten.div.Scalar";
   static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
-    return PyreOp<DivScalarOp>::dispatch({self}, {other});
+    return PyreOp<DivScalarOp>::dispatchEnvelope({self}, {other});
   }
 };
 
@@ -890,7 +922,7 @@ struct PowScalarOp : ScalarBinaryOp<PowScalarOp> {
   static constexpr const char* aten_name_inplace = "pow_.Scalar";
   static constexpr const char* torch_op = "torch.aten.pow.Tensor_Scalar";
   static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
-    return PyreOp<PowScalarOp>::dispatch({self}, {other});
+    return PyreOp<PowScalarOp>::dispatchEnvelope({self}, {other});
   }
 };
 
@@ -901,7 +933,7 @@ struct PowScalarOp : ScalarBinaryOp<PowScalarOp> {
 template <typename Derived>
 struct ComparisonBinaryOp : PyreOp<Derived> {
   static at::Tensor impl(const at::Tensor& self, const at::Tensor& other) {
-    return PyreOp<Derived>::dispatch({self, other}, {});
+    return PyreOp<Derived>::dispatchEnvelope({self, other}, {});
   }
   static c10::DimVector inferShape(const OpContext& ctx) {
     return inferShapeBroadcast(ctx);
@@ -925,6 +957,13 @@ struct ComparisonBinaryOp : PyreOp<Derived> {
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
         ctx.decision.arg_adapters);
   }
+  static ComputeBody generateComputeBody(
+      const std::string& /*func_name*/, const OpContext& ctx) {
+    auto out_shape = inferShapeBroadcast(ctx);
+    return generateComparisonComputeBody(
+        Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+  }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(Derived::aten_name);
   }
@@ -937,7 +976,7 @@ struct ComparisonBinaryOp : PyreOp<Derived> {
 template <typename Derived>
 struct ComparisonScalarOp : PyreOp<Derived> {
   static at::Tensor impl(const at::Tensor& self, const at::Scalar& other) {
-    return PyreOp<Derived>::dispatch({self}, {other});
+    return PyreOp<Derived>::dispatchEnvelope({self}, {other});
   }
   static c10::DimVector inferShape(const OpContext& ctx) {
     return inferShapeIdentity(ctx);
@@ -957,6 +996,13 @@ struct ComparisonScalarOp : PyreOp<Derived> {
     double scalar_val = ctx.scalars[0].toDouble();
     return generateComparisonScalarMlir(
         func_name, Derived::torch_op, ctx.dtype,
+        ctx.inputs[0].sizes(), scalar_val);
+  }
+  static ComputeBody generateComputeBody(
+      const std::string& /*func_name*/, const OpContext& ctx) {
+    double scalar_val = ctx.scalars[0].toDouble();
+    return generateComparisonScalarComputeBody(
+        Derived::torch_op, ctx.dtype,
         ctx.inputs[0].sizes(), scalar_val);
   }
   static std::string buildFuncName(const OpContext&) {
@@ -1188,6 +1234,7 @@ struct ScatterAddOp : PyreOp<ScatterAddOp> {
 };
 
 // --- IndexPutOp ---
+// TODO: migrate to envelope dispatch
 
 struct IndexPutOp : PyreOp<IndexPutOp> {
   static constexpr const char* aten_name = "index_put";
@@ -1202,6 +1249,7 @@ struct IndexPutOp : PyreOp<IndexPutOp> {
 };
 
 // --- IndexTensorOp (advanced indexing with variable index list) ---
+// TODO: migrate to envelope dispatch
 
 struct IndexTensorOp : PyreOp<IndexTensorOp> {
   static constexpr const char* aten_name = "index.Tensor";
@@ -1248,7 +1296,7 @@ struct BmmOp : PyreOp<BmmOp> {
         "pyre: bmm batch size mismatch");
     TORCH_CHECK(self.size(2) == mat2.size(1),
         "pyre: bmm inner dimension mismatch");
-    return dispatch({self, mat2}, {});
+    return dispatchEnvelope({self, mat2}, {});
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
@@ -1266,6 +1314,12 @@ struct BmmOp : PyreOp<BmmOp> {
     return generateBmmMlir(func_name, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), inferShape(ctx));
   }
+  static ComputeBody generateComputeBody(
+      const std::string& func_name, const OpContext& ctx) {
+    auto out_shape = inferShape(ctx);
+    return generateBmmComputeBody(ctx.dtype,
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape);
+  }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(aten_name);
   }
@@ -1281,7 +1335,7 @@ struct WhereOp : PyreOp<WhereOp> {
       const at::Tensor& self,
       const at::Tensor& other) {
     // dtype from self (not condition which is bool)
-    return dispatch({condition, self, other}, {});
+    return dispatchEnvelope({condition, self, other}, {});
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
@@ -1308,12 +1362,20 @@ struct WhereOp : PyreOp<WhereOp> {
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
         ctx.inputs[2].sizes(), out_shape);
   }
+  static ComputeBody generateComputeBody(
+      const std::string& func_name, const OpContext& ctx) {
+    auto out_shape = inferShape(ctx);
+    return generateWhereComputeBody(ctx.raw_inputs[1].scalar_type(),
+        ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
+        ctx.inputs[2].sizes(), out_shape);
+  }
   static std::string buildFuncName(const OpContext&) {
     return funcNameDefault(aten_name);
   }
 };
 
 // --- CatOp (algorithmic MLIR generation) ---
+// TODO: migrate to envelope dispatch
 
 struct CatOp : PyreOp<CatOp> {
   static constexpr const char* aten_name = "cat";
@@ -1333,7 +1395,7 @@ struct AddmmOp : PyreOp<AddmmOp> {
       const at::Scalar& beta, const at::Scalar& alpha) {
     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2,
         "pyre: addmm requires 2D matrices");
-    return dispatch({bias, mat1, mat2}, {beta, alpha});
+    return dispatchEnvelope({bias, mat1, mat2}, {beta, alpha});
   }
 
   static c10::DimVector inferShape(const OpContext& ctx) {
@@ -1344,11 +1406,11 @@ struct AddmmOp : PyreOp<AddmmOp> {
       const std::string& func_name, const OpContext& ctx);
   static std::string generateMlir(
       const std::string& func_name, const OpContext& ctx);
+  static ComputeBody generateComputeBody(
+      const std::string& func_name, const OpContext& ctx);
 
   static std::string buildFuncName(const OpContext& ctx) {
-    bool mat2_t = ctx.decision.arg_adapters.size() > 2
-        && ctx.decision.arg_adapters[2].kind == ArgAdapter::kPermute;
-    return mat2_t ? "pyre_addmm_t" : "pyre_addmm";
+    return funcNameDefault(aten_name);
   }
 };
 
