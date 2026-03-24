@@ -213,9 +213,10 @@ void AbiPacker::packArgs(
     PYRE_CHECK_OK(iree_vm_list_push_value(args, &val));
   }
 
-  // 4. Output buffers (as !hal.buffer, not buffer_view).
+  // 4. Output buffers (as !hal.buffer). Skip if output aliases an input
+  // buffer — the envelope uses the input buffer directly via hal.tensor.alias.
   for (const auto& slot : slots_) {
-    if (slot.is_output) {
+    if (slot.is_output && !buf_used_by_input[slot.buf_idx]) {
       iree_hal_buffer_t* buf = unique_bufs_[slot.buf_idx].buffer;
       iree_vm_ref_t ref = iree_hal_buffer_retain_ref(buf);
       PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));

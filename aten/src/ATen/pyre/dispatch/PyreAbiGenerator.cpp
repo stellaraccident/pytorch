@@ -197,9 +197,9 @@ std::string AbiGenerator::emitEnvelopeFunction(
        << "_" << dynamic_dims[i].second << ": index,\n";
   }
 
-  // Output buffers.
+  // Output buffers — skip if output aliases an input (same buffer).
   for (int i = 0; i < static_cast<int>(tensors_.size()); ++i) {
-    if (tensors_[i].is_output) {
+    if (tensors_[i].is_output && !buf_used_by_input[tensors_[i].buf_idx]) {
       ss << "      %buf_out_" << i << ": !hal.buffer,\n";
     }
   }
@@ -469,11 +469,18 @@ std::string AbiGenerator::emitEnvelopeFunction(
     }
   };
 
-  // Alias result to output buffer.
+  // Alias result to output buffer. If output aliases an input buffer,
+  // reference the input buffer arg directly (no separate output arg).
+  std::string out_buf_name;
+  if (buf_used_by_input[out.buf_idx]) {
+    out_buf_name = "%buf" + std::to_string(out.buf_idx);
+  } else {
+    out_buf_name = "%buf_out_" + std::to_string(out_ti);
+  }
   ss << "\n    %aliased = hal.tensor.alias wait(%wait) =>\n"
      << "        %result : " << body.output_tensor_type << "{";
   emitDynDims();
-  ss << "} to %buf_out_" << out_ti << " : !hal.buffer\n";
+  ss << "} to " << out_buf_name << " : !hal.buffer\n";
 
   // Transients annotation.
   ss << "    %annotated = hal.tensor.transients %aliased : "
