@@ -19,13 +19,13 @@ class PyreKernelCache {
   // Returns cached kernel or nullptr on miss.
   CachedKernel* lookup(const std::string& cache_key,
                         const std::string& func_name,
-                        const AbiConfig& abi = AbiConfig::kTorchTyped);
+                        const AbiConfig& abi = AbiConfig::kEnvelope);
 
   // Store a compiled kernel. Returns pointer to stored entry.
   CachedKernel* store(const std::string& cache_key,
                        const std::string& func_name,
                        std::shared_ptr<CompilerOutput> vmfb,
-                       const AbiConfig& abi = AbiConfig::kTorchTyped);
+                       const AbiConfig& abi = AbiConfig::kEnvelope);
 
   // Disk cache operations.
   std::shared_ptr<CompilerOutput> loadFromDisk(const std::string& cache_key);

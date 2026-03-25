@@ -57,11 +57,4 @@ void executeCopyPlan(
     c10::pyre::PyreBufferContext* src_ctx,
     c10::pyre::PyreBufferContext* dst_ctx);
 
-// Build an IREE buffer view wrapping a tensor's HAL buffer (RAII).
-c10::pyre::hal_buffer_view_ptr buildBufferView(const at::Tensor& tensor);
-
-// Build a buffer view using opaque integer element types (by bitwidth).
-// For data movement kernels where the MLIR uses si8/si16/si32/si64.
-c10::pyre::hal_buffer_view_ptr buildOpaqueBufferView(const at::Tensor& tensor);
-
 } // namespace at::pyre

@@ -24,6 +24,6 @@ struct CachedKernel {
 CachedKernel loadKernel(
     std::shared_ptr<CompilerOutput> vmfb,
     const std::string& func_name,
-    const AbiConfig& abi = AbiConfig::kTorchTyped);
+    const AbiConfig& abi = AbiConfig::kEnvelope);
 
 } // namespace at::pyre

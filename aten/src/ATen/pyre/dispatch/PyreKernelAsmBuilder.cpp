@@ -45,6 +45,23 @@ static std::string broadcastAwareShapeStr(c10::ArrayRef<int64_t> sizes) {
   return s;
 }
 
+// Build DimSpec vector from the broadcast-aware rule: size==1 is static, else dynamic.
+static c10::SmallVector<DimSpec, 6> broadcastAwareDimSpec(
+    c10::ArrayRef<int64_t> sizes) {
+  c10::SmallVector<DimSpec, 6> spec;
+  for (int64_t s : sizes)
+    spec.push_back(s == 1 ? DimSpec::fixed(1) : DimSpec::dynamic());
+  return spec;
+}
+
+// Build DimSpec vector where ALL dims are concrete (fixed).
+static c10::SmallVector<DimSpec, 6> concreteDimSpec(
+    c10::ArrayRef<int64_t> sizes) {
+  c10::SmallVector<DimSpec, 6> spec;
+  for (int64_t s : sizes) spec.push_back(DimSpec::fixed(s));
+  return spec;
+}
+
 // Concrete shape string with actual sizes — needed for permuted inputs
 // so the compiler can track dimension reordering.
 static std::string concreteShapeStr(c10::ArrayRef<int64_t> sizes) {
@@ -247,6 +264,669 @@ static ArgAdapterVars buildArgAdapterVars(
     v.use_name = std::string(arg_name) + "_raw";
   }
   return v;
+}
+
+// ---------------------------------------------------------------------------
+// ComputeBody helpers
+// ---------------------------------------------------------------------------
+
+static std::string vtensorType(
+    const std::string& shape_str, const std::string& elt) {
+  return "!torch.vtensor<[" + shape_str + "], " + elt + ">";
+}
+
+static std::string builtinTensorType(const std::string& shape_str,
+                                      const std::string& elt) {
+  // Convert torch-mlir element types to builtin: f32→f32, si32→i32, etc.
+  std::string builtin_elt = elt;
+  if (builtin_elt.substr(0, 2) == "si")
+    builtin_elt = "i" + builtin_elt.substr(2);
+  else if (builtin_elt.substr(0, 2) == "ui")
+    builtin_elt = "i" + builtin_elt.substr(2);
+  else if (builtin_elt == "i1")
+    builtin_elt = "i1";
+  if (shape_str.empty())
+    return "tensor<" + builtin_elt + ">";
+  // Convert comma-separated shape to x-separated (tensor<?x4xf32>).
+  std::string tensor_dims;
+  for (char c : shape_str) {
+    if (c == ',') tensor_dims += 'x';
+    else tensor_dims += c;
+  }
+  return "tensor<" + tensor_dims + "x" + builtin_elt + ">";
+}
+
+// Wrap a ComputeBody back into a complete MLIR module (backward compat).
+std::string wrapComputeBody(
+    const std::string& func_name,
+    const ComputeBody& body,
+    c10::ArrayRef<ArgAdapter> adapters,
+    c10::ArrayRef<std::string> physical_input_vtensor_types,
+    c10::ArrayRef<std::string> physical_input_names) {
+  std::string mlir;
+
+  // Type aliases.
+  std::string out_mutable = body.output_vtensor_type;
+  // Convert vtensor to mutable tensor for %out_
+  // !torch.vtensor<[...], dtype> → !torch.tensor<[...], dtype>
+  std::string out_t = out_mutable;
+  auto pos = out_t.find("vtensor");
+  if (pos != std::string::npos) out_t.replace(pos, 7, "tensor");
+
+  mlir += "!out_t = " + out_t + "\n";
+  mlir += "!out_v = " + body.output_vtensor_type + "\n";
+
+  for (size_t i = 0; i < body.input_vtensor_types.size(); ++i) {
+    std::string prefix = body.input_names[i];
+    // Use the physical type for the input arg (pre-adapter).
+    if (i < physical_input_vtensor_types.size()) {
+      mlir += "!" + prefix + "_in = " + physical_input_vtensor_types[i] + "\n";
+    } else {
+      mlir += "!" + prefix + "_in = " + body.input_vtensor_types[i] + "\n";
+    }
+    mlir += "!" + prefix + "_c = " + body.input_vtensor_types[i] + "\n";
+  }
+
+  mlir += "\nmodule @module {\n";
+  mlir += "  func.func @" + func_name + "(%out_: !out_t";
+
+  // Input args.
+  for (size_t i = 0; i < body.input_names.size(); ++i) {
+    std::string phys_name = (i < physical_input_names.size())
+        ? physical_input_names[i]
+        : body.input_names[i] + "_raw";
+    mlir += ", %" + phys_name + ": !" + body.input_names[i] + "_in";
+  }
+
+  mlir += ")\n      attributes {torch.assume_strict_symbolic_shapes} {\n";
+
+  // Adapter lines (permute ops for transposed inputs).
+  for (size_t i = 0; i < adapters.size() && i < body.input_names.size(); ++i) {
+    if (adapters[i].kind == ArgAdapter::kPermute) {
+      std::string phys_name = (i < physical_input_names.size())
+          ? physical_input_names[i]
+          : body.input_names[i] + "_raw";
+      std::string in_type = "!" + body.input_names[i] + "_in";
+      std::string out_type = "!" + body.input_names[i] + "_c";
+      mlir += emitPermuteLines(
+          body.input_names[i], phys_name,
+          inversePerm(adapters[i].permutation), in_type, out_type);
+      mlir += "\n";
+    }
+  }
+
+  // The torch ops body.
+  mlir += body.mlir_ops;
+
+  // Overwrite epilogue.
+  mlir += "    torch.overwrite.tensor.contents %result overwrites %out_"
+          " : !out_v, !out_t\n";
+  mlir += "    return\n";
+  mlir += "  }\n";
+  mlir += "}\n";
+
+  return mlir;
+}
+
+// ---------------------------------------------------------------------------
+// ComputeBody generators
+// ---------------------------------------------------------------------------
+
+ComputeBody generateBinaryComputeBody(
+    const std::string& linalg_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  auto info = resolveBinaryOp(linalg_op);
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string lhs_s = broadcastAwareShapeStr(lhs_shape);
+  std::string rhs_s = broadcastAwareShapeStr(rhs_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(lhs_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(lhs_shape));
+  body.input_vtensor_types.push_back(vtensorType(rhs_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(rhs_shape));
+  body.input_tensor_types.push_back(builtinTensorType(lhs_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(rhs_s, elt));
+  body.input_names = {"lhs", "rhs"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+
+  std::string ops;
+  if (!info.extra_arg_decls.empty())
+    ops += info.extra_arg_decls + "\n";
+  ops += "    %result = " + info.torch_op + " %lhs, %rhs" +
+         info.extra_args + " : " +
+         body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+         info.extra_arg_types + " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateBinaryAlphaComputeBody(
+    const std::string& alpha_add_op, double alpha_value,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  auto info = resolveAlphaOp(alpha_add_op, alpha_value);
+  std::string alpha_type = scalarType(alpha_value);
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string lhs_s = broadcastAwareShapeStr(lhs_shape);
+  std::string rhs_s = broadcastAwareShapeStr(rhs_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(lhs_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(lhs_shape));
+  body.input_vtensor_types.push_back(vtensorType(rhs_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(rhs_shape));
+  body.input_tensor_types.push_back(builtinTensorType(lhs_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(rhs_s, elt));
+  body.input_names = {"lhs", "rhs"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+
+  std::string ops;
+  ops += info.alpha_decl + "\n";
+  ops += "    %result = " + info.torch_op + " %lhs, %rhs, %alpha : " +
+         body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+         ", " + alpha_type + " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateUnaryComputeBody(
+    const std::string& scalar_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(in_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(input_shape));
+  body.input_tensor_types.push_back(builtinTensorType(in_s, elt));
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+
+  std::string ops;
+  if (!extra_arg_decls.empty())
+    ops += "    " + extra_arg_decls + "\n";
+  ops += "    %result = " + scalar_op + " %input" +
+         extra_args + " : " +
+         body.input_vtensor_types[0] + extra_arg_types +
+         " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateMmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string m1_s = broadcastAwareShapeStr(mat1_shape);
+  std::string m2_s = broadcastAwareShapeStr(mat2_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(m1_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(mat1_shape));
+  body.input_vtensor_types.push_back(vtensorType(m2_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(mat2_shape));
+  body.input_tensor_types.push_back(builtinTensorType(m1_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(m2_s, elt));
+  body.input_names = {"mat1", "mat2"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+
+  std::string ops;
+  ops += "    %result = torch.aten.mm %mat1, %mat2 : " +
+         body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+         " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateSoftmaxComputeBody(
+    const std::string& softmax_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> shape, int64_t dim) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string shape_s = broadcastAwareShapeStr(shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(shape_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(shape));
+  body.input_tensor_types.push_back(builtinTensorType(shape_s, elt));
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(shape_s, elt);
+  body.output_tensor_type = builtinTensorType(shape_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(shape);
+
+  std::string ops;
+  ops += "    %dim = torch.constant.int " + std::to_string(dim) + "\n";
+  ops += "    %half_to_float = torch.constant.bool false\n";
+  ops += "    %result = torch.aten." + softmax_op +
+         " %input, %dim, %half_to_float : " +
+         body.input_vtensor_types[0] +
+         ", !torch.int, !torch.bool -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateComparisonComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string lhs_s = broadcastAwareShapeStr(lhs_shape);
+  std::string rhs_s = broadcastAwareShapeStr(rhs_shape);
+  std::string out_s = broadcastAwareShapeStr(out_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(lhs_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(lhs_shape));
+  body.input_vtensor_types.push_back(vtensorType(rhs_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(rhs_shape));
+  body.input_tensor_types.push_back(builtinTensorType(lhs_s, elt));
+  body.input_tensor_types.push_back(builtinTensorType(rhs_s, elt));
+  body.input_names = {"lhs", "rhs"};
+  body.output_vtensor_type = vtensorType(out_s, "i1");
+  body.output_tensor_type = builtinTensorType(out_s, "i1");
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+
+  body.mlir_ops = "    %result = " + torch_op + " %lhs, %rhs : " +
+      body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+      " -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateComparisonScalarComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, double scalar_value) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+
+  ComputeBody body;
+  body.input_vtensor_types.push_back(vtensorType(in_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(input_shape));
+  body.input_tensor_types.push_back(builtinTensorType(in_s, elt));
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(in_s, "i1");
+  body.output_tensor_type = builtinTensorType(in_s, "i1");
+  body.output_shape_spec = broadcastAwareDimSpec(input_shape);
+
+  std::string ops;
+  if (scalar_value == static_cast<int64_t>(scalar_value))
+    ops += "    %scalar = torch.constant.int " +
+           std::to_string(static_cast<int64_t>(scalar_value)) + "\n";
+  else
+    ops += "    %scalar = torch.constant.float " +
+           std::to_string(scalar_value) + "\n";
+  std::string scalar_type = (scalar_value == static_cast<int64_t>(scalar_value))
+      ? "!torch.int" : "!torch.float";
+  ops += "    %result = " + torch_op + " %input, %scalar : " +
+      body.input_vtensor_types[0] + ", " + scalar_type +
+      " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+// Forward declaration (defined in the reduction section below).
+static std::string reducedShapeStr(
+    c10::ArrayRef<int64_t> input_shape,
+    c10::ArrayRef<int64_t> dims,
+    bool keepdim);
+
+ComputeBody generateBmmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string m1 = broadcastAwareShapeStr(mat1_shape);
+  std::string m2 = broadcastAwareShapeStr(mat2_shape);
+  std::string os = broadcastAwareShapeStr(out_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(m1, elt), vtensorType(m2, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(mat1_shape), broadcastAwareDimSpec(mat2_shape)};
+  body.input_tensor_types = {builtinTensorType(m1, elt), builtinTensorType(m2, elt)};
+  body.input_names = {"mat1", "mat2"};
+  body.output_vtensor_type = vtensorType(os, elt);
+  body.output_tensor_type = builtinTensorType(os, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+  body.mlir_ops = "    %result = torch.aten.bmm %mat1, %mat2 : " +
+      body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+      " -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateWhereComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> cond_shape, c10::ArrayRef<int64_t> self_shape,
+    c10::ArrayRef<int64_t> other_shape, c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string cs = broadcastAwareShapeStr(cond_shape);
+  std::string ss = broadcastAwareShapeStr(self_shape);
+  std::string os_str = broadcastAwareShapeStr(other_shape);
+  std::string outs = broadcastAwareShapeStr(out_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(cs, "i1"), vtensorType(ss, elt), vtensorType(os_str, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(cond_shape), broadcastAwareDimSpec(self_shape), broadcastAwareDimSpec(other_shape)};
+  body.input_tensor_types = {builtinTensorType(cs, "i1"), builtinTensorType(ss, elt), builtinTensorType(os_str, elt)};
+  body.input_names = {"condition", "self_v", "other_v"};
+  body.output_vtensor_type = vtensorType(outs, elt);
+  body.output_tensor_type = builtinTensorType(outs, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+  body.mlir_ops = "    %result = torch.aten.where.self %condition, %self_v, %other_v : " +
+      body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] + ", " +
+      body.input_vtensor_types[2] + " -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateAddmmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> bias_shape, c10::ArrayRef<int64_t> mat1_shape,
+    c10::ArrayRef<int64_t> mat2_shape, c10::ArrayRef<int64_t> out_shape,
+    double beta, double alpha) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string bs = broadcastAwareShapeStr(bias_shape);
+  std::string m1 = broadcastAwareShapeStr(mat1_shape);
+  std::string m2 = broadcastAwareShapeStr(mat2_shape);
+  std::string os = broadcastAwareShapeStr(out_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(bs, elt), vtensorType(m1, elt), vtensorType(m2, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(bias_shape), broadcastAwareDimSpec(mat1_shape), broadcastAwareDimSpec(mat2_shape)};
+  body.input_tensor_types = {builtinTensorType(bs, elt), builtinTensorType(m1, elt), builtinTensorType(m2, elt)};
+  body.input_names = {"bias", "mat1", "mat2"};
+  body.output_vtensor_type = vtensorType(os, elt);
+  body.output_tensor_type = builtinTensorType(os, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+  std::string ops;
+  ops += scalarDecl("beta", beta) + "\n";
+  ops += scalarDecl("alpha", alpha) + "\n";
+  ops += "    %result = torch.aten.addmm %bias, %mat1, %mat2, %beta, %alpha : " +
+      body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] + ", " +
+      body.input_vtensor_types[2] + ", " + scalarType(beta) + ", " + scalarType(alpha) +
+      " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+// Build DimSpec for a reduction output, mirroring reducedShapeStr logic.
+// Non-reduced dims are always dynamic (?). Reduced dims become static 1
+// (if keepdim) or are removed (if !keepdim).
+static c10::SmallVector<DimSpec, 6> reducedDimSpec(
+    c10::ArrayRef<int64_t> input_shape,
+    c10::ArrayRef<int64_t> dims,
+    bool keepdim) {
+  std::set<int64_t> reduce_set;
+  for (int64_t d : dims) {
+    if (d < 0) d += static_cast<int64_t>(input_shape.size());
+    reduce_set.insert(d);
+  }
+  c10::SmallVector<DimSpec, 6> spec;
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (reduce_set.count(static_cast<int64_t>(i))) {
+      if (keepdim) spec.push_back(DimSpec::fixed(1));
+    } else {
+      spec.push_back(DimSpec::dynamic());
+    }
+  }
+  return spec;
+}
+
+static std::string dimDeclsStr(c10::ArrayRef<int64_t> dims) {
+  std::string s;
+  for (size_t i = 0; i < dims.size(); ++i)
+    s += "    %d" + std::to_string(i) + " = torch.constant.int " +
+         std::to_string(dims[i]) + "\n";
+  return s;
+}
+static std::string dimArgsStr(size_t n) {
+  std::string s;
+  for (size_t i = 0; i < n; ++i) { if (i > 0) s += ", "; s += "%d" + std::to_string(i); }
+  return s;
+}
+static std::string dimTypesStr(size_t n) {
+  std::string s;
+  for (size_t i = 0; i < n; ++i) { if (i > 0) s += ", "; s += "!torch.int"; }
+  return s;
+}
+
+ComputeBody generateReductionComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<int64_t> dims, bool keepdim,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string out_s = reducedShapeStr(input_shape, dims, keepdim);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(in_s, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(input_shape)};
+  body.input_tensor_types = {builtinTensorType(in_s, elt)};
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+  body.output_shape_spec = reducedDimSpec(input_shape, dims, keepdim);
+  std::string ops;
+  ops += dimDeclsStr(dims);
+  ops += "    %dims = torch.prim.ListConstruct " + dimArgsStr(dims.size()) +
+         " : (" + dimTypesStr(dims.size()) + ") -> !torch.list<int>\n";
+  ops += "    %keepdim = torch.constant.bool " + std::string(keepdim ? "true" : "false") + "\n";
+  if (!extra_arg_decls.empty()) ops += "    " + extra_arg_decls + "\n";
+  ops += "    %result = " + torch_op + " %input, %dims, %keepdim" + extra_args +
+         " : " + body.input_vtensor_types[0] + ", !torch.list<int>, !torch.bool" +
+         extra_arg_types + " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateSingleDimReductionComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    int64_t dim, bool keepdim,
+    const std::string& extra_arg_decls,
+    const std::string& extra_args,
+    const std::string& extra_arg_types) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string out_s = reducedShapeStr(input_shape, {dim}, keepdim);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(in_s, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(input_shape)};
+  body.input_tensor_types = {builtinTensorType(in_s, elt)};
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(out_s, elt);
+  body.output_tensor_type = builtinTensorType(out_s, elt);
+  body.output_shape_spec = reducedDimSpec(input_shape, {dim}, keepdim);
+  std::string ops;
+  ops += "    %dim = torch.constant.int " + std::to_string(dim) + "\n";
+  ops += "    %keepdim = torch.constant.bool " + std::string(keepdim ? "true" : "false") + "\n";
+  if (!extra_arg_decls.empty()) ops += "    " + extra_arg_decls + "\n";
+  ops += "    %result = " + torch_op + " %input, %dim, %keepdim" + extra_args +
+         " : " + body.input_vtensor_types[0] + ", !torch.int, !torch.bool" +
+         extra_arg_types + " -> " + body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+ComputeBody generateEmbeddingComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string ws = broadcastAwareShapeStr(weight_shape);
+  std::string is = broadcastAwareShapeStr(indices_shape);
+  std::string os = broadcastAwareShapeStr(out_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(ws, elt), vtensorType(is, "si64")};
+  body.input_shape_specs = {broadcastAwareDimSpec(weight_shape), broadcastAwareDimSpec(indices_shape)};
+  body.input_tensor_types = {builtinTensorType(ws, elt), builtinTensorType(is, "si64")};
+  body.input_names = {"weight", "indices"};
+  body.output_vtensor_type = vtensorType(os, elt);
+  body.output_tensor_type = builtinTensorType(os, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+  body.mlir_ops =
+      "    %padding_idx = torch.constant.int -1\n"
+      "    %scale = torch.constant.bool false\n"
+      "    %sparse = torch.constant.bool false\n"
+      "    %result = torch.aten.embedding %weight, %indices, %padding_idx, %scale, %sparse : " +
+      body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+      ", !torch.int, !torch.bool, !torch.bool -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateIndexSelectComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string ix_s = broadcastAwareShapeStr(index_shape);
+  std::string os = broadcastAwareShapeStr(out_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(in_s, elt), vtensorType(ix_s, "si64")};
+  body.input_shape_specs = {broadcastAwareDimSpec(input_shape), broadcastAwareDimSpec(index_shape)};
+  body.input_tensor_types = {builtinTensorType(in_s, elt), builtinTensorType(ix_s, "si64")};
+  body.input_names = {"input", "index"};
+  body.output_vtensor_type = vtensorType(os, elt);
+  body.output_tensor_type = builtinTensorType(os, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+  body.mlir_ops = "    %dim = torch.constant.int " + std::to_string(dim) + "\n" +
+      "    %result = torch.aten.index_select %input, %dim, %index : " +
+      body.input_vtensor_types[0] + ", !torch.int, " + body.input_vtensor_types[1] +
+      " -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateGatherComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string ix_s = broadcastAwareShapeStr(index_shape);
+  std::string os = broadcastAwareShapeStr(out_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(in_s, elt), vtensorType(ix_s, "si64")};
+  body.input_shape_specs = {broadcastAwareDimSpec(input_shape), broadcastAwareDimSpec(index_shape)};
+  body.input_tensor_types = {builtinTensorType(in_s, elt), builtinTensorType(ix_s, "si64")};
+  body.input_names = {"input", "index"};
+  body.output_vtensor_type = vtensorType(os, elt);
+  body.output_tensor_type = builtinTensorType(os, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+  body.mlir_ops = "    %dim = torch.constant.int " + std::to_string(dim) + "\n" +
+      "    %sparse_grad = torch.constant.bool false\n" +
+      "    %result = torch.aten.gather %input, %dim, %index, %sparse_grad : " +
+      body.input_vtensor_types[0] + ", !torch.int, " + body.input_vtensor_types[1] +
+      ", !torch.bool -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateScatterSrcComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string ix_s = broadcastAwareShapeStr(index_shape);
+  std::string sr_s = broadcastAwareShapeStr(src_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(in_s, elt), vtensorType(ix_s, "si64"), vtensorType(sr_s, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(input_shape), broadcastAwareDimSpec(index_shape), broadcastAwareDimSpec(src_shape)};
+  body.input_tensor_types = {builtinTensorType(in_s, elt), builtinTensorType(ix_s, "si64"), builtinTensorType(sr_s, elt)};
+  body.input_names = {"self_v", "index", "src"};
+  body.output_vtensor_type = vtensorType(in_s, elt);
+  body.output_tensor_type = builtinTensorType(in_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(input_shape);
+  body.mlir_ops = "    %dim = torch.constant.int " + std::to_string(dim) + "\n" +
+      "    %result = torch.aten.scatter.src %self_v, %dim, %index, %src : " +
+      body.input_vtensor_types[0] + ", !torch.int, " + body.input_vtensor_types[1] +
+      ", " + body.input_vtensor_types[2] + " -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateScatterAddComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string in_s = broadcastAwareShapeStr(input_shape);
+  std::string ix_s = broadcastAwareShapeStr(index_shape);
+  std::string sr_s = broadcastAwareShapeStr(src_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(in_s, elt), vtensorType(ix_s, "si64"), vtensorType(sr_s, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(input_shape), broadcastAwareDimSpec(index_shape), broadcastAwareDimSpec(src_shape)};
+  body.input_tensor_types = {builtinTensorType(in_s, elt), builtinTensorType(ix_s, "si64"), builtinTensorType(sr_s, elt)};
+  body.input_names = {"self_v", "index", "src"};
+  body.output_vtensor_type = vtensorType(in_s, elt);
+  body.output_tensor_type = builtinTensorType(in_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(input_shape);
+  body.mlir_ops = "    %dim = torch.constant.int " + std::to_string(dim) + "\n" +
+      "    %result = torch.aten.scatter_add %self_v, %dim, %index, %src : " +
+      body.input_vtensor_types[0] + ", !torch.int, " + body.input_vtensor_types[1] +
+      ", " + body.input_vtensor_types[2] + " -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateTypeCastComputeBody(
+    c10::ScalarType in_dtype, c10::ScalarType out_dtype,
+    c10::ArrayRef<int64_t> shape) {
+  std::string in_elt = scalarTypeToTorchMlir(in_dtype);
+  std::string out_elt = scalarTypeToTorchMlir(out_dtype);
+  std::string shape_s = broadcastAwareShapeStr(shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(shape_s, in_elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(shape)};
+  body.input_tensor_types = {builtinTensorType(shape_s, in_elt)};
+  body.input_names = {"input"};
+  body.output_vtensor_type = vtensorType(shape_s, out_elt);
+  body.output_tensor_type = builtinTensorType(shape_s, out_elt);
+  body.output_shape_spec = broadcastAwareDimSpec(shape);
+  std::string dtype_const = "    %dtype = torch.constant.int " +
+      std::to_string(static_cast<int64_t>(out_dtype));
+  body.mlir_ops = dtype_const + "\n" +
+      "    %none = torch.constant.none\n"
+      "    %false = torch.constant.bool false\n"
+      "    %result = torch.aten._to_copy %input, %dtype, %none, %none, %none, %false, %none : " +
+      body.input_vtensor_types[0] +
+      ", !torch.int, !torch.none, !torch.none, !torch.none, !torch.bool, !torch.none -> " +
+      body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateArangeComputeBody(
+    c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string size_s = std::to_string(out_size);
+  ComputeBody body;
+  // Arange has NO tensor inputs.
+  body.output_vtensor_type = vtensorType(size_s, elt);
+  body.output_tensor_type = builtinTensorType(size_s, elt);
+  body.output_shape_spec = concreteDimSpec({out_size});
+  body.mlir_ops =
+      scalarDecl("start", start) + "\n" +
+      scalarDecl("end", end) + "\n" +
+      scalarDecl("step", step) + "\n" +
+      "    %none = torch.constant.none\n"
+      "    %result = torch.aten.arange.start_step %start, %end, %step, %none, %none, %none, %none : " +
+      scalarType(start) + ", " + scalarType(end) + ", " + scalarType(step) +
+      ", !torch.none, !torch.none, !torch.none, !torch.none -> " +
+      body.output_vtensor_type + "\n";
+  return body;
 }
 
 // ---------------------------------------------------------------------------

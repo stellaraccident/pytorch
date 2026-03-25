@@ -46,6 +46,168 @@ std::string contentHashCacheKey(
     const SubstPairs& substitutions,
     c10::ArrayRef<std::string> compiler_flags);
 
+// ---------------------------------------------------------------------------
+// ComputeBody — extracted torch op body without module/func wrapper.
+//
+// Contains only the logical torch dialect ops between input SSA values and
+// result SSA value. No module wrapper, no func.func, no type aliases, no
+// torch.overwrite.tensor.contents, no permute adapters.
+//
+// AbiGenerator (T2) wraps this with envelope function + compute func.func
+// shell. The backward-compat wrapComputeBody() re-wraps for the old path.
+// ---------------------------------------------------------------------------
+
+// Per-dim specialization decision: concrete value means static in the
+// MLIR type, kDynamic means ? (runtime value passed as index arg).
+// Future: kDynamicDivisible(N) for util.assume.int<udiv=N>.
+struct DimSpec {
+  static constexpr int64_t kDynamic = -1;
+  int64_t value;  // kDynamic or the static size
+
+  bool isDynamic() const { return value == kDynamic; }
+  static DimSpec dynamic() { return {kDynamic}; }
+  static DimSpec fixed(int64_t v) { return {v}; }
+};
+
+struct ComputeBody {
+  // Torch dialect ops only (indented, newline-terminated).
+  // Uses SSA names from input_names for inputs, produces %result.
+  std::string mlir_ops;
+
+  // Per-input: logical type strings (post-permutation shapes).
+  c10::SmallVector<std::string, 4> input_vtensor_types;
+  c10::SmallVector<std::string, 4> input_tensor_types;
+
+  // Per-input: SSA names referenced in mlir_ops.
+  c10::SmallVector<std::string, 4> input_names;
+
+  // Per-input: dim specialization decisions (parallel to type strings).
+  // input_shape_specs[i][d] tells whether dim d of input i is static or dynamic.
+  c10::SmallVector<c10::SmallVector<DimSpec, 6>, 4> input_shape_specs;
+
+  // Output type strings.
+  std::string output_vtensor_type;
+  std::string output_tensor_type;
+
+  // Output dim specialization decisions.
+  c10::SmallVector<DimSpec, 6> output_shape_spec;
+};
+
+// Wrap a ComputeBody back into a complete MLIR module for backward compat.
+// Adds type aliases, module, func.func, adapters, and overwrite epilogue.
+// This is the migration bridge — remove once T4 wires AbiGenerator.
+std::string wrapComputeBody(
+    const std::string& func_name,
+    const ComputeBody& body,
+    c10::ArrayRef<ArgAdapter> adapters,
+    c10::ArrayRef<std::string> physical_input_vtensor_types,
+    c10::ArrayRef<std::string> physical_input_names);
+
+// --- Compute body generators (new API for AbiGenerator) ---
+
+ComputeBody generateBinaryComputeBody(
+    const std::string& linalg_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateBinaryAlphaComputeBody(
+    const std::string& alpha_add_op, double alpha_value,
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateUnaryComputeBody(
+    const std::string& scalar_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+ComputeBody generateMmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateSoftmaxComputeBody(
+    const std::string& softmax_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> shape, int64_t dim);
+
+ComputeBody generateComparisonComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> lhs_shape, c10::ArrayRef<int64_t> rhs_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateComparisonScalarComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, double scalar_value);
+
+ComputeBody generateBmmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateWhereComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> cond_shape,
+    c10::ArrayRef<int64_t> self_shape,
+    c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateAddmmComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> bias_shape, c10::ArrayRef<int64_t> mat1_shape,
+    c10::ArrayRef<int64_t> mat2_shape, c10::ArrayRef<int64_t> out_shape,
+    double beta, double alpha);
+
+ComputeBody generateReductionComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    c10::ArrayRef<int64_t> dims, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+ComputeBody generateSingleDimReductionComputeBody(
+    const std::string& torch_op, c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> out_shape,
+    int64_t dim, bool keepdim,
+    const std::string& extra_arg_decls = "",
+    const std::string& extra_args = "",
+    const std::string& extra_arg_types = "");
+
+ComputeBody generateEmbeddingComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> weight_shape, c10::ArrayRef<int64_t> indices_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
+ComputeBody generateIndexSelectComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+ComputeBody generateGatherComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> out_shape, int64_t dim);
+
+ComputeBody generateScatterSrcComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+ComputeBody generateScatterAddComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> input_shape, c10::ArrayRef<int64_t> index_shape,
+    c10::ArrayRef<int64_t> src_shape, int64_t dim);
+
+ComputeBody generateTypeCastComputeBody(
+    c10::ScalarType in_dtype, c10::ScalarType out_dtype,
+    c10::ArrayRef<int64_t> shape);
+
+ComputeBody generateArangeComputeBody(
+    c10::ScalarType dtype,
+    int64_t out_size, double start, double end, double step);
+
 // --- softmax ---
 
 KernelSpec buildSoftmaxKernelSpec(

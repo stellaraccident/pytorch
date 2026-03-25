@@ -1,25 +1,11 @@
-"""Tests for compiled kernel dispatch (Epic 1).
-
-Requires IREE compiler: set PYRE_IREE_COMPILE or PYRE_IREE_COMPILER_LIB.
-"""
-import os
-import unittest
-
+"""Tests for compiled kernel dispatch."""
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-
-
-def has_compiler():
-    return bool(
-        os.environ.get("PYRE_IREE_COMPILE")
-        or os.environ.get("PYRE_IREE_COMPILER_LIB")
-    )
 
 
 DEVICE = "host:0"
 
 
-@unittest.skipUnless(has_compiler(), "IREE compiler not available")
 class TestBinaryOps(TestCase):
     """Binary elementwise ops: add, sub, mul, div."""
 
@@ -87,7 +73,6 @@ class TestBinaryOps(TestCase):
             self.assertEqual(r.cpu(), a.cpu() + b.cpu())
 
 
-@unittest.skipUnless(has_compiler(), "IREE compiler not available")
 class TestUnaryOps(TestCase):
     """Unary elementwise ops: neg, relu."""
 
@@ -109,7 +94,6 @@ class TestUnaryOps(TestCase):
         self.assertEqual(torch.relu(a).cpu(), expected)
 
 
-@unittest.skipUnless(has_compiler(), "IREE compiler not available")
 class TestBroadcasting(TestCase):
     """Broadcasting tests — currently skipped pending static-dim support."""
 
@@ -124,7 +108,6 @@ class TestBroadcasting(TestCase):
         self.assertEqual(torch.add(a, b).cpu(), a.cpu() + b.cpu())
 
 
-@unittest.skipUnless(has_compiler(), "IREE compiler not available")
 class TestAsyncPipeline(TestCase):
     """Chained operations execute correctly (fences chain)."""
 
@@ -144,7 +127,6 @@ class TestAsyncPipeline(TestCase):
         self.assertEqual(result.cpu(), expected, atol=1e-5, rtol=1e-5)
 
 
-@unittest.skipUnless(has_compiler(), "IREE compiler not available")
 class TestPermutedOps(TestCase):
     """Fused axis permutation: compiler sees through torch.aten.permute."""
 

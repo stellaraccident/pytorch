@@ -1228,16 +1228,15 @@ if(USE_PYRE)
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreOps.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/PyreTensor.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreAbiConfig.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreAbiGenerator.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreAbiPacker.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgAdapter.cpp
+    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreDataMovementKernels.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreCatKernel.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreIndexKernels.cpp
-    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreArgShapeSpecializer.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelAsmBuilder.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCache.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelCompiler.cpp
-    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreKernelDispatch.cpp
-    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreStridedCopyKernel.cpp
-    ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreStridedFillKernel.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/StridedCopyPlan.cpp
     ${TORCH_ROOT}/aten/src/ATen/pyre/dispatch/PyreVMContext.cpp
   )

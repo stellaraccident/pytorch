@@ -3,19 +3,9 @@
 Linear layers use CPU fallback (matmul not yet compiled).
 Elementwise ops (add, relu) use compiled IREE kernels when available.
 """
-import os
-import unittest
-
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import run_tests, TestCase
-
-
-def has_compiler():
-    return bool(
-        os.environ.get("PYRE_IREE_COMPILE")
-        or os.environ.get("PYRE_IREE_COMPILER_LIB")
-    )
 
 
 DEVICE = "host:0"
@@ -34,7 +24,6 @@ class TestMLP(TestCase):
         )
         return model
 
-    @unittest.skipUnless(has_compiler(), "IREE compiler not available")
     def test_mlp_forward_cpu_reference(self):
         """MLP on host:0 matches CPU reference."""
         torch.manual_seed(42)
@@ -54,7 +43,6 @@ class TestMLP(TestCase):
 
         self.assertEqual(y_host.cpu(), y_cpu, atol=1e-5, rtol=1e-5)
 
-    @unittest.skipUnless(has_compiler(), "IREE compiler not available")
     def test_mlp_different_batch_sizes(self):
         """MLP works with varying batch sizes."""
         torch.manual_seed(0)
@@ -68,7 +56,6 @@ class TestMLP(TestCase):
             # Verify not all zeros (computation actually happened)
             self.assertGreater(y.cpu().abs().sum().item(), 0)
 
-    @unittest.skipUnless(has_compiler(), "IREE compiler not available")
     def test_mlp_with_manual_elementwise(self):
         """Manually compose linear + relu using ops that go through compiled path."""
         torch.manual_seed(42)

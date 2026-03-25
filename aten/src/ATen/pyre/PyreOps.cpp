@@ -1,5 +1,10 @@
 #include <ATen/pyre/PyreOps.h>
 #include <ATen/pyre/dispatch/PyreAlgorithmicKernels.h>
+#include <c10/pyre/impl/PyreRuntime.h>
+#include <c10/pyre/impl/PyreStream.h>
+#include <c10/pyre/impl/PyreStorage.h>
+#include <iree/hal/fence.h>
+#include <iree/vm/api.h>
 
 #ifdef AT_PER_OPERATOR_HEADERS
 #include <ATen/ops/_to_copy_native.h>
@@ -113,12 +118,12 @@ KernelSpec buildBinarySpec(
     return buildBinaryAlphaKernelSpec(
         func_name, alpha_add_op, alpha_val, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-        out_shape, ctx.decision.arg_adapters);
+        out_shape, c10::ArrayRef<ArgAdapter>{});
   }
   return buildBinaryKernelSpec(
       func_name, linalg_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-      out_shape, ctx.decision.arg_adapters);
+      out_shape, c10::ArrayRef<ArgAdapter>{});
 }
 
 std::string buildBinaryMlir(
@@ -135,12 +140,12 @@ std::string buildBinaryMlir(
     return generateBinaryAlphaMlir(
         func_name, alpha_add_op, alpha_val, ctx.dtype,
         ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-        out_shape, ctx.decision.arg_adapters);
+        out_shape, c10::ArrayRef<ArgAdapter>{});
   }
   return generateBinaryMlir(
       func_name, linalg_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
-      out_shape, ctx.decision.arg_adapters);
+      out_shape, c10::ArrayRef<ArgAdapter>{});
 }
 
 KernelSpec buildUnarySpec(
@@ -149,9 +154,9 @@ KernelSpec buildUnarySpec(
     const std::string& extra_arg_decls,
     const std::string& extra_args,
     const std::string& extra_arg_types) {
-  ArgAdapter adapter = ctx.decision.arg_adapters.empty()
+  ArgAdapter adapter = c10::ArrayRef<ArgAdapter>{}.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
-      : ctx.decision.arg_adapters[0];
+      : c10::ArrayRef<ArgAdapter>{}[0];
   return buildUnaryKernelSpec(
       func_name, torch_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
@@ -164,9 +169,9 @@ std::string buildUnaryMlir(
     const std::string& extra_arg_decls,
     const std::string& extra_args,
     const std::string& extra_arg_types) {
-  ArgAdapter adapter = ctx.decision.arg_adapters.empty()
+  ArgAdapter adapter = c10::ArrayRef<ArgAdapter>{}.empty()
       ? ArgAdapter{ArgAdapter::kIdentity, {}}
-      : ctx.decision.arg_adapters[0];
+      : c10::ArrayRef<ArgAdapter>{}[0];
   return generateUnaryMlir(
       func_name, torch_op, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[0].sizes(), adapter,
@@ -243,44 +248,104 @@ CachedKernel* getOrCompile(
   return cache.store(cache_key, func_name, std::move(vmfb), abi);
 }
 
-at::Tensor invokeKernel(
-    CachedKernel* kernel,
-    const std::vector<at::Tensor>& inputs,
-    c10::IntArrayRef out_shape,
-    const at::TensorOptions& opts) {
-  auto output = at::empty(out_shape, opts);
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
-  auto& ctx = stream.context();
-  PyreKernelDispatch::invoke(kernel, inputs, output, ctx);
-  return output;
-}
 
-// HACK(pyre-workspace-blp): Check if a tensor is strictly dense row-major
-// at offset 0. The offset check is a workaround — with proper subspan
-// support, non-zero offsets would be handled by the buffer view.
-static bool isDenseRowMajorAtZero(const at::Tensor& t) {
-  if (t.storage_offset() != 0) return false;
-  int64_t expected = 1;
-  for (int64_t i = t.dim() - 1; i >= 0; --i) {
-    if (t.size(i) > 1 && t.stride(i) != expected) return false;
-    expected *= t.size(i);
-  }
-  return true;
-}
 
-void invokeKernelInplace(
+// ---------------------------------------------------------------------------
+// Envelope dispatch: AbiPacker-based invocation
+// ---------------------------------------------------------------------------
+
+void invokeEnvelope(
     CachedKernel* kernel,
-    const std::vector<at::Tensor>& inputs,
-    at::Tensor& self) {
+    const AbiPacker& packer,
+    c10::ArrayRef<at::Tensor> inputs,
+    at::Tensor& output) {
+  auto& runtime = c10::pyre::PyreRuntime::get();
+  auto alloc = runtime.hostAllocator();
+
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
-  auto& ctx = stream.context();
-  if (isDenseRowMajorAtZero(self)) {
-    PyreKernelDispatch::invoke(kernel, inputs, self, ctx);
-  } else {
-    auto tmp = at::empty(self.sizes(), self.options());
-    PyreKernelDispatch::invoke(kernel, inputs, tmp, ctx);
-    self.copy_(tmp);
+  auto& stream_ctx = stream.context();
+
+  // Build wait fence joining all input and output mutation timelines.
+  iree_hal_fence_t* wait = nullptr;
+  PYRE_CHECK_OK(iree_hal_fence_create(
+      static_cast<iree_host_size_t>(inputs.size() + 2), alloc, &wait));
+  for (const auto& t : inputs) {
+    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+        t.storage().data_ptr().get_context());
+    if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
+      PYRE_CHECK_OK(iree_hal_fence_insert(
+          wait, ctx->mutation_sem, ctx->mutation_timepoint));
   }
+  {
+    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+        output.storage().data_ptr().get_context());
+    if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
+      PYRE_CHECK_OK(iree_hal_fence_insert(
+          wait, ctx->mutation_sem, ctx->mutation_timepoint));
+  }
+
+  // Signal fence.
+  uint64_t signal_value = ++stream_ctx.timepoint;
+  iree_hal_fence_t* signal = nullptr;
+  PYRE_CHECK_OK(iree_hal_fence_create_at(
+      stream_ctx.timeline.get(), signal_value, alloc, &signal));
+
+  // Build args via packer.
+  iree_host_size_t arg_count =
+      static_cast<iree_host_size_t>(packer.numUniqueBuffers()) +
+      static_cast<iree_host_size_t>(packer.dynamicDims().size()) +
+      20;  // generous: offsets + output bufs + transients + fences
+  iree_vm_list_t* args = nullptr;
+  PYRE_CHECK_OK(iree_vm_list_create(
+      iree_vm_make_undefined_type_def(), arg_count, alloc, &args));
+
+  // Allocate a minimal transient buffer. The envelope's hal.tensor.transients
+  // annotation requires a non-null buffer even if no transient space is needed.
+  // The compiler's _transients_size companion returns the actual requirement.
+  auto* device = c10::pyre::PyreDevice::get(0);
+  iree_hal_buffer_t* transient_buf = nullptr;
+  {
+    iree_hal_buffer_params_t params = {};
+    params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE;
+    params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+    params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL
+                | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+    // Start with a minimal allocation. T5 (transient cache) will
+    // call the _transients_size function and cache the result.
+    // HACK(pyre-workspace-ijr.5): Allocate a fixed transient buffer instead
+    // of calling the _transients_size companion function. T5 (transient cache)
+    // will query the actual size and TLS-cache the result.
+    iree_device_size_t transient_size = 64;
+    if (kernel->has_transients_size) {
+      transient_size = 1024 * 1024;  // 1MB default
+    }
+    PYRE_CHECK_OK(iree_hal_allocator_allocate_buffer(
+        device->allocator(), params, transient_size, &transient_buf));
+  }
+
+  packer.packArgs(args, transient_buf, wait, signal);
+
+  // Invoke.
+  PYRE_CHECK_OK(iree_vm_invoke(
+      kernel->context.get(), kernel->function,
+      IREE_VM_INVOCATION_FLAG_NONE, nullptr,
+      args, /*rets=*/nullptr, alloc));
+
+  // Timeline bookkeeping.
+  for (const auto& t : inputs) {
+    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+        t.storage().data_ptr().get_context());
+    if (ctx) ctx->recordUse(stream_ctx.timeline.get(), signal_value);
+  }
+  auto* out_ctx = static_cast<c10::pyre::PyreBufferContext*>(
+      output.storage().data_ptr().get_context());
+  if (out_ctx) out_ctx->recordMutation(
+      stream_ctx.timeline.get(), signal_value);
+
+  iree_vm_list_release(args);
+  iree_hal_buffer_release(transient_buf);
+  iree_hal_fence_release(wait);
+  iree_hal_fence_release(signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +358,7 @@ KernelSpec MmOp::buildKernelSpec(
   return buildMmKernelSpec(
       func_name, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
-      ctx.decision.arg_adapters);
+      c10::ArrayRef<ArgAdapter>{});
 }
 
 std::string MmOp::generateMlir(
@@ -302,7 +367,7 @@ std::string MmOp::generateMlir(
   return generateMmMlir(
       func_name, ctx.dtype,
       ctx.inputs[0].sizes(), ctx.inputs[1].sizes(), out_shape,
-      ctx.decision.arg_adapters);
+      c10::ArrayRef<ArgAdapter>{});
 }
 
 // ---------------------------------------------------------------------------
@@ -313,8 +378,8 @@ static void addmmArgs(const OpContext& ctx, double& beta, double& alpha,
                       bool& mat2_permuted) {
   beta = ctx.scalars.size() >= 1 ? ctx.scalars[0].toDouble() : 1.0;
   alpha = ctx.scalars.size() >= 2 ? ctx.scalars[1].toDouble() : 1.0;
-  mat2_permuted = ctx.decision.arg_adapters.size() > 2
-      && ctx.decision.arg_adapters[2].kind == ArgAdapter::kPermute;
+  mat2_permuted = c10::ArrayRef<ArgAdapter>{}.size() > 2
+      && c10::ArrayRef<ArgAdapter>{}[2].kind == ArgAdapter::kPermute;
 }
 
 KernelSpec AddmmOp::buildKernelSpec(
@@ -347,6 +412,16 @@ std::string AddmmOp::generateMlir(
       ctx.inputs[2].sizes(), inferShape(ctx), beta, alpha);
 }
 
+ComputeBody AddmmOp::generateComputeBody(
+    const std::string& func_name, const OpContext& ctx) {
+  double beta = ctx.scalars.size() >= 1 ? ctx.scalars[0].toDouble() : 1.0;
+  double alpha = ctx.scalars.size() >= 2 ? ctx.scalars[1].toDouble() : 1.0;
+  auto out_shape = inferShape(ctx);
+  return generateAddmmComputeBody(ctx.dtype,
+      ctx.inputs[0].sizes(), ctx.inputs[1].sizes(),
+      ctx.inputs[2].sizes(), out_shape, beta, alpha);
+}
+
 // ---------------------------------------------------------------------------
 // Multi-dim reduction dispatch helper
 // ---------------------------------------------------------------------------
@@ -359,10 +434,6 @@ at::Tensor dispatchMultiDimReduction(
       " requires IREE buffers");
 
   auto dtype = self.scalar_type();
-  auto decision = ArgShapeSpecializer().analyze(
-      aten_name, dtype, {self},
-      c10::pyre::PyreDevice::get(0)->capabilities());
-  auto adapted = applyAdapters({self}, decision.arg_adapters);
 
   c10::SmallVector<int64_t, 6> norm_dims;
   for (auto d : dims) {
@@ -380,26 +451,44 @@ at::Tensor dispatchMultiDimReduction(
     extra_types = ", !torch.none";
   }
 
-  auto spec = buildReductionKernelSpec(
-      func_name, torch_op, dtype,
-      adapted[0].sizes(), out_shape, norm_dims, keepdim,
-      extra_decls, extra_args, extra_types);
-
-  auto cache_key = contentHashCacheKey(
-      spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
-
-  auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
-  if (!kernel) {
-    auto mlir = generateReductionMlir(
-        func_name, torch_op, dtype,
-        adapted[0].sizes(), out_shape, norm_dims, keepdim,
-        extra_decls, extra_args, extra_types);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+  // Force contiguous for non-permutable strides.
+  at::Tensor visit_self = self;
+  {
+    auto adapter = ArgAdapter::analyze(self);
+    if (adapter.kind == ArgAdapter::kContiguous)
+      visit_self = self.contiguous();
   }
 
-  return invokeKernel(kernel, adapted, out_shape, self.options());
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+
+  auto out = at::empty(out_shape, self.options());
+  packer.visitOutput(out);
+
+  auto spec = buildReductionKernelSpec(
+      func_name, torch_op, dtype,
+      visit_self.sizes(), out_shape, norm_dims, keepdim,
+      extra_decls, extra_args, extra_types);
+
+  auto cache_key = packer.cacheKey(
+      spec.template_sha1, spec.substitutions,
+      AbiConfig::kEnvelope.compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
+  if (!kernel) {
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitOutput(out);
+    auto body = generateReductionComputeBody(
+        torch_op, dtype, visit_self.sizes(), out_shape, norm_dims, keepdim,
+        extra_decls, extra_args, extra_types);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
+  }
+
+  invokeEnvelope(kernel, packer, {visit_self}, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -421,26 +510,44 @@ at::Tensor dispatchSingleDimReduction(
   auto out_shape = inferReducedShape(self.sizes(), {dim}, keepdim);
   auto func_name = funcNameDefault(aten_name);
 
-  auto spec = buildSingleDimReductionKernelSpec(
-      func_name, torch_op, dtype,
-      self.sizes(), out_shape, dim, keepdim,
-      extra_decls, extra_args, extra_types);
-
-  auto cache_key = contentHashCacheKey(
-      spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
-
-  auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
-  if (!kernel) {
-    auto mlir = generateSingleDimReductionMlir(
-        func_name, torch_op, dtype,
-        self.sizes(), out_shape, dim, keepdim,
-        extra_decls, extra_args, extra_types);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+  // Force contiguous for non-permutable strides.
+  at::Tensor visit_self = self;
+  {
+    auto adapter = ArgAdapter::analyze(self);
+    if (adapter.kind == ArgAdapter::kContiguous)
+      visit_self = self.contiguous();
   }
 
-  return invokeKernel(kernel, {self}, out_shape, self.options());
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+
+  auto out = at::empty(out_shape, self.options());
+  packer.visitOutput(out);
+
+  auto spec = buildSingleDimReductionKernelSpec(
+      func_name, torch_op, dtype,
+      visit_self.sizes(), out_shape, dim, keepdim,
+      extra_decls, extra_args, extra_types);
+
+  auto cache_key = packer.cacheKey(
+      spec.template_sha1, spec.substitutions,
+      AbiConfig::kEnvelope.compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
+  if (!kernel) {
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitOutput(out);
+    auto body = generateSingleDimReductionComputeBody(
+        torch_op, dtype, visit_self.sizes(), out_shape, dim, keepdim,
+        extra_decls, extra_args, extra_types);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
+  }
+
+  invokeEnvelope(kernel, packer, {visit_self}, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -461,21 +568,45 @@ at::Tensor EmbeddingOp::impl(
   out_shape.push_back(weight.size(1));
 
   auto func_name = funcNameDefault(aten_name);
-  auto spec = buildEmbeddingKernelSpec(
-      func_name, dtype, weight.sizes(), indices.sizes(), out_shape);
-  auto cache_key = contentHashCacheKey(
-      spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
 
-  auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
-  if (!kernel) {
-    auto mlir = generateEmbeddingMlir(
-        func_name, dtype, weight.sizes(), indices.sizes(), out_shape);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+  // Force contiguous for non-permutable strides.
+  at::Tensor visit_weight = weight;
+  at::Tensor visit_indices = indices;
+  {
+    auto wa = ArgAdapter::analyze(weight);
+    if (wa.kind == ArgAdapter::kContiguous) visit_weight = weight.contiguous();
+    auto ia = ArgAdapter::analyze(indices);
+    if (ia.kind == ArgAdapter::kContiguous) visit_indices = indices.contiguous();
   }
 
-  return invokeKernel(kernel, {weight, indices}, out_shape, weight.options());
+  AbiPacker packer;
+  packer.visitInput(visit_weight);
+  packer.visitInput(visit_indices);
+
+  auto out = at::empty(out_shape, weight.options());
+  packer.visitOutput(out);
+
+  auto spec = buildEmbeddingKernelSpec(
+      func_name, dtype, visit_weight.sizes(), visit_indices.sizes(), out_shape);
+  auto cache_key = packer.cacheKey(
+      spec.template_sha1, spec.substitutions,
+      AbiConfig::kEnvelope.compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
+  if (!kernel) {
+    AbiGenerator gen;
+    gen.visitInput(visit_weight);
+    gen.visitInput(visit_indices);
+    gen.visitOutput(out);
+    auto body = generateEmbeddingComputeBody(
+        dtype, visit_weight.sizes(), visit_indices.sizes(), out_shape);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
+  }
+
+  invokeEnvelope(kernel, packer, {visit_weight, visit_indices}, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -494,21 +625,44 @@ at::Tensor IndexSelectOp::impl(
   out_shape[dim] = index.size(0);
 
   auto func_name = funcNameDefault(aten_name);
-  auto spec = buildIndexSelectKernelSpec(
-      func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
-  auto cache_key = contentHashCacheKey(
-      spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
 
-  auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
-  if (!kernel) {
-    auto mlir = generateIndexSelectMlir(
-        func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+  at::Tensor visit_self = self;
+  at::Tensor visit_index = index;
+  {
+    auto sa = ArgAdapter::analyze(self);
+    if (sa.kind == ArgAdapter::kContiguous) visit_self = self.contiguous();
+    auto ia = ArgAdapter::analyze(index);
+    if (ia.kind == ArgAdapter::kContiguous) visit_index = index.contiguous();
   }
 
-  return invokeKernel(kernel, {self, index}, out_shape, self.options());
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+  packer.visitInput(visit_index);
+
+  auto out = at::empty(out_shape, self.options());
+  packer.visitOutput(out);
+
+  auto spec = buildIndexSelectKernelSpec(
+      func_name, dtype, visit_self.sizes(), visit_index.sizes(), out_shape, dim);
+  auto cache_key = packer.cacheKey(
+      spec.template_sha1, spec.substitutions,
+      AbiConfig::kEnvelope.compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
+  if (!kernel) {
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitInput(visit_index);
+    gen.visitOutput(out);
+    auto body = generateIndexSelectComputeBody(
+        dtype, visit_self.sizes(), visit_index.sizes(), out_shape, dim);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
+  }
+
+  invokeEnvelope(kernel, packer, {visit_self, visit_index}, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -526,21 +680,44 @@ at::Tensor GatherOp::impl(
   c10::DimVector out_shape(index.sizes().begin(), index.sizes().end());
 
   auto func_name = funcNameDefault(aten_name);
-  auto spec = buildGatherKernelSpec(
-      func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
-  auto cache_key = contentHashCacheKey(
-      spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
 
-  auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
-  if (!kernel) {
-    auto mlir = generateGatherMlir(
-        func_name, dtype, self.sizes(), index.sizes(), out_shape, dim);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+  at::Tensor visit_self = self;
+  at::Tensor visit_index = index;
+  {
+    auto sa = ArgAdapter::analyze(self);
+    if (sa.kind == ArgAdapter::kContiguous) visit_self = self.contiguous();
+    auto ia = ArgAdapter::analyze(index);
+    if (ia.kind == ArgAdapter::kContiguous) visit_index = index.contiguous();
   }
 
-  return invokeKernel(kernel, {self, index}, out_shape, self.options());
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+  packer.visitInput(visit_index);
+
+  auto out = at::empty(out_shape, self.options());
+  packer.visitOutput(out);
+
+  auto spec = buildGatherKernelSpec(
+      func_name, dtype, visit_self.sizes(), visit_index.sizes(), out_shape, dim);
+  auto cache_key = packer.cacheKey(
+      spec.template_sha1, spec.substitutions,
+      AbiConfig::kEnvelope.compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
+  if (!kernel) {
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitInput(visit_index);
+    gen.visitOutput(out);
+    auto body = generateGatherComputeBody(
+        dtype, visit_self.sizes(), visit_index.sizes(), out_shape, dim);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
+  }
+
+  invokeEnvelope(kernel, packer, {visit_self, visit_index}, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -556,18 +733,40 @@ static at::Tensor dispatchSoftmax(
   auto dtype = self.scalar_type();
   auto func_name = funcNameDefault(aten_name);
 
-  auto spec = buildSoftmaxKernelSpec(func_name, softmax_op, dtype, self.sizes(), dim);
-  auto cache_key = contentHashCacheKey(
+  at::Tensor visit_self = self;
+  {
+    auto adapter = ArgAdapter::analyze(self);
+    if (adapter.kind == ArgAdapter::kContiguous)
+      visit_self = self.contiguous();
+  }
+
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+
+  c10::DimVector out_shape(self.sizes().begin(), self.sizes().end());
+  auto out = at::empty(out_shape, self.options());
+  packer.visitOutput(out);
+
+  auto spec = buildSoftmaxKernelSpec(func_name, softmax_op, dtype,
+      visit_self.sizes(), dim);
+  auto cache_key = packer.cacheKey(
       spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+      AbiConfig::kEnvelope.compilerFlags());
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = generateSoftmaxMlir(func_name, softmax_op, dtype, self.sizes(), dim);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitOutput(out);
+    auto body = generateSoftmaxComputeBody(
+        softmax_op, dtype, visit_self.sizes(), dim);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
-  return invokeKernel(kernel, {self}, c10::DimVector(self.sizes()), self.options());
+
+  invokeEnvelope(kernel, packer, {visit_self}, out);
+  return out;
 }
 
 at::Tensor SoftmaxOp::impl(
@@ -593,21 +792,48 @@ static at::Tensor dispatchScatterSrc(
   auto dtype = self.scalar_type();
   auto func_name = funcNameDefault("scatter_src");
 
+  at::Tensor visit_self = self, visit_index = index, visit_src = src;
+  {
+    auto sa = ArgAdapter::analyze(self);
+    if (sa.kind == ArgAdapter::kContiguous) visit_self = self.contiguous();
+    auto ia = ArgAdapter::analyze(index);
+    if (ia.kind == ArgAdapter::kContiguous) visit_index = index.contiguous();
+    auto ra = ArgAdapter::analyze(src);
+    if (ra.kind == ArgAdapter::kContiguous) visit_src = src.contiguous();
+  }
+
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+  packer.visitInput(visit_index);
+  packer.visitInput(visit_src);
+
+  c10::DimVector out_shape(self.sizes().begin(), self.sizes().end());
+  auto out = at::empty(out_shape, self.options());
+  packer.visitOutput(out);
+
   auto spec = buildScatterSrcKernelSpec(
-      func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-  auto cache_key = contentHashCacheKey(
+      func_name, dtype, visit_self.sizes(), visit_index.sizes(),
+      visit_src.sizes(), dim);
+  auto cache_key = packer.cacheKey(
       spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+      AbiConfig::kEnvelope.compilerFlags());
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = generateScatterSrcMlir(
-        func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitInput(visit_index);
+    gen.visitInput(visit_src);
+    gen.visitOutput(out);
+    auto body = generateScatterSrcComputeBody(
+        dtype, visit_self.sizes(), visit_index.sizes(), visit_src.sizes(), dim);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
-  return invokeKernel(kernel, {self, index, src},
-                      c10::DimVector(self.sizes()), self.options());
+
+  invokeEnvelope(kernel, packer, {visit_self, visit_index, visit_src}, out);
+  return out;
 }
 
 at::Tensor ScatterSrcOp::impl(
@@ -615,6 +841,7 @@ at::Tensor ScatterSrcOp::impl(
     const at::Tensor& index, const at::Tensor& src) {
   return dispatchScatterSrc(self, dim, index, src);
 }
+
 
 at::Tensor& ScatterSrcOp::impl_inplace(
     at::Tensor& self, int64_t dim,
@@ -625,23 +852,33 @@ at::Tensor& ScatterSrcOp::impl_inplace(
   auto dtype = self.scalar_type();
   auto func_name = funcNameDefault("scatter_src_inplace");
 
+  AbiPacker packer;
+  packer.visitInput(self);
+  packer.visitInput(index);
+  packer.visitInput(src);
+  packer.visitOutput(self);
+
   auto spec = buildScatterSrcInplaceKernelSpec(
       func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-  auto cache_key = contentHashCacheKey(
+  auto cache_key = packer.cacheKey(
       spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+      AbiConfig::kEnvelope.compilerFlags());
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = generateScatterSrcInplaceMlir(
-        func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(self);
+    gen.visitInput(index);
+    gen.visitInput(src);
+    gen.visitOutput(self);
+    auto body = generateScatterSrcComputeBody(
+        dtype, self.sizes(), index.sizes(), src.sizes(), dim);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
 
-  // Reads and writes to self. The in-place template accesses self through
-  // %out_ via torch.copy.to_vtensor, so only index and src are inputs.
-  invokeKernelInplace(kernel, {index, src}, self);
+  invokeEnvelope(kernel, packer, {self, index, src}, self);
   return self;
 }
 
@@ -658,21 +895,48 @@ static at::Tensor dispatchScatterAdd(
   auto dtype = self.scalar_type();
   auto func_name = funcNameDefault("scatter_add");
 
+  at::Tensor visit_self = self, visit_index = index, visit_src = src;
+  {
+    auto sa = ArgAdapter::analyze(self);
+    if (sa.kind == ArgAdapter::kContiguous) visit_self = self.contiguous();
+    auto ia = ArgAdapter::analyze(index);
+    if (ia.kind == ArgAdapter::kContiguous) visit_index = index.contiguous();
+    auto ra = ArgAdapter::analyze(src);
+    if (ra.kind == ArgAdapter::kContiguous) visit_src = src.contiguous();
+  }
+
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+  packer.visitInput(visit_index);
+  packer.visitInput(visit_src);
+
+  c10::DimVector out_shape(self.sizes().begin(), self.sizes().end());
+  auto out = at::empty(out_shape, self.options());
+  packer.visitOutput(out);
+
   auto spec = buildScatterAddKernelSpec(
-      func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-  auto cache_key = contentHashCacheKey(
+      func_name, dtype, visit_self.sizes(), visit_index.sizes(),
+      visit_src.sizes(), dim);
+  auto cache_key = packer.cacheKey(
       spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+      AbiConfig::kEnvelope.compilerFlags());
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = generateScatterAddMlir(
-        func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitInput(visit_index);
+    gen.visitInput(visit_src);
+    gen.visitOutput(out);
+    auto body = generateScatterAddComputeBody(
+        dtype, visit_self.sizes(), visit_index.sizes(), visit_src.sizes(), dim);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
-  return invokeKernel(kernel, {self, index, src},
-                      c10::DimVector(self.sizes()), self.options());
+
+  invokeEnvelope(kernel, packer, {visit_self, visit_index, visit_src}, out);
+  return out;
 }
 
 at::Tensor ScatterAddOp::impl(
@@ -680,6 +944,7 @@ at::Tensor ScatterAddOp::impl(
     const at::Tensor& index, const at::Tensor& src) {
   return dispatchScatterAdd(self, dim, index, src);
 }
+
 
 at::Tensor& ScatterAddOp::impl_inplace(
     at::Tensor& self, int64_t dim,
@@ -690,29 +955,156 @@ at::Tensor& ScatterAddOp::impl_inplace(
   auto dtype = self.scalar_type();
   auto func_name = funcNameDefault("scatter_add_inplace");
 
+  AbiPacker packer;
+  packer.visitInput(self);
+  packer.visitInput(index);
+  packer.visitInput(src);
+  packer.visitOutput(self);
+
   auto spec = buildScatterAddInplaceKernelSpec(
       func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-  auto cache_key = contentHashCacheKey(
+  auto cache_key = packer.cacheKey(
       spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+      AbiConfig::kEnvelope.compilerFlags());
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = generateScatterAddInplaceMlir(
-        func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(self);
+    gen.visitInput(index);
+    gen.visitInput(src);
+    gen.visitOutput(self);
+    auto body = generateScatterAddComputeBody(
+        dtype, self.sizes(), index.sizes(), src.sizes(), dim);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
 
-  invokeKernelInplace(kernel, {index, src}, self);
+  invokeEnvelope(kernel, packer, {self, index, src}, self);
   return self;
 }
 
 // ---------------------------------------------------------------------------
-// IndexPutOp — algorithmic MLIR for variable-length index list
+// Shape spec helpers for programmatic ComputeBody builders.
+// ---------------------------------------------------------------------------
+static c10::SmallVector<DimSpec, 6> broadcastAwareDimSpec(
+    c10::ArrayRef<int64_t> sizes) {
+  c10::SmallVector<DimSpec, 6> spec;
+  for (int64_t s : sizes)
+    spec.push_back(s == 1 ? DimSpec::fixed(1) : DimSpec::dynamic());
+  return spec;
+}
+
+// ---------------------------------------------------------------------------
+// IndexPutOp — envelope dispatch with programmatic ComputeBody
 // ---------------------------------------------------------------------------
 
-// Fragment accessors in dispatch/PyreIndexKernels.cpp.
+// Build a ComputeBody for index_put with variable-length index list.
+static ComputeBody buildIndexPutBody(
+    const std::string& elt,
+    c10::IntArrayRef self_sizes, c10::IntArrayRef values_sizes,
+    const c10::SmallVector<std::pair<int64_t, at::Tensor>, 4>& non_none,
+    const c10::List<std::optional<at::Tensor>>& indices,
+    bool accumulate) {
+  auto dynS = [](c10::IntArrayRef s) {
+    std::string r;
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (i > 0) r += ",";
+      r += (s[i] == 1) ? "1" : "?";
+    }
+    return r;
+  };
+  auto mkVt = [&](const std::string& sh, const std::string& e) {
+    return "!torch.vtensor<[" + sh + "], " + e + ">";
+  };
+  auto mkBt = [&](const std::string& sh, const std::string& e) {
+    std::string dims;
+    for (char c : sh) dims += (c == ',') ? 'x' : c;
+    std::string be = e;
+    if (be.substr(0,2) == "si") be = "i" + be.substr(2);
+    return dims.empty() ? "tensor<" + be + ">" : "tensor<" + dims + "x" + be + ">";
+  };
+
+  std::string self_s = dynS(self_sizes);
+  std::string vals_s = dynS(values_sizes);
+
+  ComputeBody body;
+  // Inputs: self, idx0, idx1, ..., values
+  body.input_names.push_back("self_v");
+  body.input_vtensor_types.push_back(mkVt(self_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(self_sizes));
+  body.input_tensor_types.push_back(mkBt(self_s, elt));
+
+  for (size_t i = 0; i < non_none.size(); ++i) {
+    body.input_names.push_back("idx" + std::to_string(i));
+    std::string is = dynS(non_none[i].second.sizes());
+    body.input_vtensor_types.push_back(mkVt(is, "si64"));
+    body.input_shape_specs.push_back(broadcastAwareDimSpec(non_none[i].second.sizes()));
+    body.input_tensor_types.push_back(mkBt(is, "si64"));
+  }
+
+  body.input_names.push_back("values");
+  body.input_vtensor_types.push_back(mkVt(vals_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(values_sizes));
+  body.input_tensor_types.push_back(mkBt(vals_s, elt));
+
+  body.output_vtensor_type = mkVt(self_s, elt);
+  body.output_tensor_type = mkBt(self_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(self_sizes);
+
+  // Build torch ops
+  std::string ops;
+  // Derefine indices into optional list
+  int tc = 0;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (indices[i].has_value() && indices[i]->defined()) {
+      std::string is = dynS(non_none[tc].second.sizes());
+      ops += "    %opt" + std::to_string(i) + " = torch.derefine %idx" +
+             std::to_string(tc) + " : !torch.vtensor<[" + is +
+             "], si64> to !torch.optional<vtensor>\n";
+      tc++;
+    } else {
+      ops += "    %none" + std::to_string(i) + " = torch.constant.none\n";
+      ops += "    %opt" + std::to_string(i) + " = torch.derefine %none" +
+             std::to_string(i) +
+             " : !torch.none to !torch.optional<vtensor>\n";
+    }
+  }
+  // Build index list
+  std::string opt_names, opt_types;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (i > 0) { opt_names += ", "; opt_types += ", "; }
+    opt_names += "%opt" + std::to_string(i);
+    opt_types += "!torch.optional<vtensor>";
+  }
+  ops += "    %indices = torch.prim.ListConstruct " + opt_names +
+         " : (" + opt_types + ") -> !torch.list<optional<vtensor>>\n";
+  ops += "    %accum = torch.constant.bool " +
+         std::string(accumulate ? "true" : "false") + "\n";
+  ops += "    %result = torch.aten.index_put %self_v, %indices, %values, %accum : " +
+         body.input_vtensor_types[0] + ", !torch.list<optional<vtensor>>, " +
+         body.input_vtensor_types.back() + ", !torch.bool -> " +
+         body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+  return body;
+}
+
+// Collect non-None indices from the index list, promoting CPU to device.
+static c10::SmallVector<std::pair<int64_t, at::Tensor>, 4> collectIndices(
+    const c10::List<std::optional<at::Tensor>>& indices,
+    c10::Device target_device) {
+  c10::SmallVector<std::pair<int64_t, at::Tensor>, 4> non_none;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (indices[i].has_value() && indices[i]->defined()) {
+      auto idx = *indices[i];
+      if (!hasPyreBuffer(idx))
+        idx = idx.to(target_device);
+      non_none.push_back({i, idx});
+    }
+  }
+  return non_none;
+}
 
 static at::Tensor dispatchIndexPut(
     const at::Tensor& self,
@@ -721,146 +1113,56 @@ static at::Tensor dispatchIndexPut(
   TORCH_CHECK(hasPyreBuffer(self), "pyre: index_put requires IREE self");
   TORCH_CHECK(hasPyreBuffer(values), "pyre: index_put requires IREE values");
 
-  // Collect non-None indices, promoting CPU to device.
-  c10::SmallVector<std::pair<int64_t, at::Tensor>, 4> non_none;
-  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
-    if (indices[i].has_value() && indices[i]->defined()) {
-      auto idx = *indices[i];
-      if (!hasPyreBuffer(idx))
-        idx = idx.to(self.device());
-      non_none.push_back({i, idx});
-    }
-  }
-  TORCH_CHECK(!non_none.empty(),
-      "pyre: index_put requires at least one index tensor");
+  auto non_none = collectIndices(indices, self.device());
+  TORCH_CHECK(!non_none.empty(), "pyre: index_put requires at least one index tensor");
 
   auto dtype = self.scalar_type();
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto func_name = funcNameDefault("index_put");
 
-  auto dynShape = [](c10::IntArrayRef sizes) {
-    std::string s;
-    for (size_t i = 0; i < sizes.size(); ++i) {
-      if (i > 0) s += ",";
-      s += (sizes[i] == 1) ? "1" : "?";
-    }
-    return s;
-  };
+  // Force contiguous for non-permutable strides.
+  at::Tensor v_self = self, v_values = values;
+  if (ArgAdapter::analyze(self).kind == ArgAdapter::kContiguous)
+    v_self = self.contiguous();
+  if (ArgAdapter::analyze(values).kind == ArgAdapter::kContiguous)
+    v_values = values.contiguous();
 
-  // Adapt self and values for non-standard layouts (permuted strides,
-  // storage offsets).
-  auto self_adapter = ArgAdapter::analyze(self);
-  auto vals_adapter = ArgAdapter::analyze(values);
-  at::Tensor self_phys = self;
-  at::Tensor vals_phys = values;
-  if (self_adapter.kind == ArgAdapter::kPermute) {
-    self_phys = self.permute(self_adapter.permutation);
-  } else if (self_adapter.kind == ArgAdapter::kContiguous) {
-    // HACK(pyre-workspace-blp): clone to get offset-0 buffer.
-    self_phys = self.storage_offset() != 0 ? self.clone() : self.contiguous();
-  }
-  if (vals_adapter.kind == ArgAdapter::kPermute) {
-    vals_phys = values.permute(vals_adapter.permutation);
-  } else if (vals_adapter.kind == ArgAdapter::kContiguous) {
-    // HACK(pyre-workspace-blp): clone to get offset-0 buffer.
-    vals_phys = values.storage_offset() != 0 ? values.clone() : values.contiguous();
-  }
+  // Visit all tensors
+  AbiPacker packer;
+  packer.visitInput(v_self);
+  for (const auto& [dim, idx] : non_none) packer.visitInput(idx);
+  packer.visitInput(v_values);
 
-  std::string self_s = dynShape(self_phys.sizes());
-  std::string vals_s = dynShape(vals_phys.sizes());
+  auto out = at::empty(c10::DimVector(self.sizes()), self.options());
+  packer.visitOutput(out);
 
-  c10::SmallVector<std::string, 8> idx_shapes;
-  for (const auto& [dim, idx] : non_none)
-    idx_shapes.push_back(dynShape(idx.sizes()));
+  auto body = buildIndexPutBody(elt, self.sizes(), values.sizes(),
+                                 non_none, indices, accumulate);
 
-  // Build opt decls, names, types for the index list
-  std::string opt_decls, opt_names, opt_types;
-  int tensor_counter = 0;
-  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
-    if (i > 0) { opt_names += ", "; opt_types += ", "; }
-    opt_names += "%opt" + std::to_string(i);
-    opt_types += "!torch.optional<vtensor>";
-
-    if (indices[i].has_value() && indices[i]->defined()) {
-      std::string tidx = std::to_string(tensor_counter);
-      std::string ish = idx_shapes[tensor_counter];
-      opt_decls += "\n    %opt" + std::to_string(i) +
-          " = torch.derefine %idx" + tidx +
-          " : !torch.vtensor<[" + ish + "], si64> to !torch.optional<vtensor>";
-      tensor_counter++;
-    } else {
-      opt_decls += "\n    %none" + std::to_string(i) + " = torch.constant.none" +
-          "\n    %opt" + std::to_string(i) +
-          " = torch.derefine %none" + std::to_string(i) +
-          " : !torch.none to !torch.optional<vtensor>";
-    }
-  }
-
-  std::string accum_str = accumulate ? "true" : "false";
-
-  // Logical shapes for the index_put op (what the op operates on).
-  std::string self_log_s = dynShape(self.sizes());
-  std::string vals_log_s = dynShape(values.sizes());
-  std::string self_log_t = "!torch.vtensor<[" + self_log_s + "], " + elt + ">";
-  std::string vals_log_t = "!torch.vtensor<[" + vals_log_s + "], " + elt + ">";
-
-  // Physical shapes for function signature (what the buffer view has).
-  std::string self_phys_t = "!torch.vtensor<[" + self_s + "], " + elt + ">";
-  std::string vals_phys_t = "!torch.vtensor<[" + vals_s + "], " + elt + ">";
-
-  // Use PyreKernelAsmFragments for digest/generate split.
-  // The recipe lambda replays identically in both modes.
-  auto recipe = [&](PyreKernelAsmBuilder& b) {
-    // Fragment 0: header (output + self)
-    b.appendFragment(0, {{"FUNC", func_name}, {"SELF_LOG", self_log_s},
-                         {"ELT", elt}, {"SELF_PHYS_T", self_phys_t},
-                         {"VALS_PHYS_T", vals_phys_t}});
-    // Fragment 1: per-index input param (repeated)
-    for (size_t i = 0; i < non_none.size(); ++i) {
-      b.appendFragment(1, {{"IDX", std::to_string(i)},
-                           {"IDX_SHAPE", idx_shapes[i]}});
-    }
-    // Fragment 2: body
-    std::string self_name = self_adapter.kind == ArgAdapter::kPermute ? "self" : "self_raw";
-    std::string vals_name = vals_adapter.kind == ArgAdapter::kPermute ? "values" : "values_raw";
-    std::string self_adapt_body, vals_adapt_body;
-    if (self_adapter.kind == ArgAdapter::kPermute) {
-      self_adapt_body = emitPermuteLines("self", "self_raw",
-          inversePerm(self_adapter.permutation), self_phys_t, self_log_t) + "\n";
-    }
-    if (vals_adapter.kind == ArgAdapter::kPermute) {
-      vals_adapt_body = emitPermuteLines("values", "values_raw",
-          inversePerm(vals_adapter.permutation), vals_phys_t, vals_log_t) + "\n";
-    }
-    b.appendFragment(2, {
-        {"VALS_PHYS_T", vals_phys_t},
-        {"SELF_ADAPT", self_adapt_body}, {"VALS_ADAPT", vals_adapt_body},
-        {"OPT_DECLS", opt_decls},
-        {"ACCUM", accum_str},
-        {"OPT_NAMES", opt_names}, {"OPT_TYPES", opt_types},
-        {"SELF_NAME", self_name}, {"VALS_NAME", vals_name},
-        {"SELF_LOG_T", self_log_t}, {"VALS_LOG_T", vals_log_t},
-        {"SELF_LOG", self_log_s}, {"ELT", elt}});
-  };
-
-  auto& frags = indexPutFragments();
-  auto cache_key = frags.digest(
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags(), recipe);
+  // Cache key from op identity hash
+  std::string identity = std::string("index_put\0", 10) + elt + "\0" +
+      packer.bufTopology() + "\0" + packer.dimPattern();
+  auto cache_key = c10::sha1(identity).str();
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = frags.generateMlir(recipe);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(v_self);
+    for (const auto& [dim, idx] : non_none) gen.visitInput(idx);
+    gen.visitInput(v_values);
+    gen.visitOutput(out);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
 
-  std::vector<at::Tensor> inputs;
-  inputs.push_back(self_phys);
-  for (const auto& [dim, idx] : non_none)
-    inputs.push_back(idx);
-  inputs.push_back(vals_phys);
+  c10::SmallVector<at::Tensor, 8> inputs;
+  inputs.push_back(v_self);
+  for (const auto& [dim, idx] : non_none) inputs.push_back(idx);
+  inputs.push_back(v_values);
 
-  return invokeKernel(kernel, inputs, c10::DimVector(self.sizes()), self.options());
+  invokeEnvelope(kernel, packer, inputs, out);
+  return out;
 }
 
 at::Tensor IndexPutOp::impl(
@@ -877,135 +1179,60 @@ at::Tensor& IndexPutOp::impl_inplace(
   TORCH_CHECK(hasPyreBuffer(self), "pyre: index_put_ requires IREE self");
   TORCH_CHECK(hasPyreBuffer(values), "pyre: index_put_ requires IREE values");
 
-  c10::SmallVector<std::pair<int64_t, at::Tensor>, 4> non_none;
-  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
-    if (indices[i].has_value() && indices[i]->defined()) {
-      auto idx = *indices[i];
-      if (!hasPyreBuffer(idx)) {
-        idx = idx.to(self.device());
-      }
-      non_none.push_back({i, idx});
-    }
-  }
-  TORCH_CHECK(!non_none.empty(),
-      "pyre: index_put_ requires at least one index tensor");
+  auto non_none = collectIndices(indices, self.device());
+  TORCH_CHECK(!non_none.empty(), "pyre: index_put_ requires at least one index tensor");
 
   auto dtype = self.scalar_type();
   std::string elt = scalarTypeToTorchMlir(dtype);
   auto func_name = funcNameDefault("index_put_inplace");
 
-  auto dynShape = [](c10::IntArrayRef sizes) {
-    std::string s;
-    for (size_t i = 0; i < sizes.size(); ++i) {
-      if (i > 0) s += ",";
-      s += (sizes[i] == 1) ? "1" : "?";
-    }
-    return s;
-  };
+  at::Tensor v_values = values;
+  if (ArgAdapter::analyze(values).kind == ArgAdapter::kContiguous)
+    v_values = values.contiguous();
 
-  // Adapt values for non-standard layouts.
-  auto vals_adapter = ArgAdapter::analyze(values);
-  at::Tensor vals_phys = values;
-  if (vals_adapter.kind == ArgAdapter::kPermute) {
-    vals_phys = values.permute(vals_adapter.permutation);
-  } else if (vals_adapter.kind == ArgAdapter::kContiguous) {
-    // HACK(pyre-workspace-blp): clone to get offset-0 buffer.
-    vals_phys = values.storage_offset() != 0 ? values.clone() : values.contiguous();
-  }
+  // Inplace: self is both input (read) and output (write). The packer
+  // deduplicates the storage — same buffer used for import and alias.
+  AbiPacker packer;
+  packer.visitInput(self);
+  for (const auto& [dim, idx] : non_none) packer.visitInput(idx);
+  packer.visitInput(v_values);
+  packer.visitOutput(self);
 
-  std::string self_log_s = dynShape(self.sizes());
-  std::string vals_s = dynShape(vals_phys.sizes());
-  std::string vals_log_s = dynShape(values.sizes());
-  std::string self_log_t = "!torch.vtensor<[" + self_log_s + "], " + elt + ">";
-  std::string vals_phys_t = "!torch.vtensor<[" + vals_s + "], " + elt + ">";
-  std::string vals_log_t = "!torch.vtensor<[" + vals_log_s + "], " + elt + ">";
+  auto body = buildIndexPutBody(elt, self.sizes(), values.sizes(),
+                                 non_none, indices, accumulate);
 
-  c10::SmallVector<std::string, 8> idx_shapes;
-  for (const auto& [dim, idx] : non_none)
-    idx_shapes.push_back(dynShape(idx.sizes()));
-
-  std::string opt_decls, opt_names, opt_types;
-  int tensor_counter = 0;
-  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
-    if (i > 0) { opt_names += ", "; opt_types += ", "; }
-    opt_names += "%opt" + std::to_string(i);
-    opt_types += "!torch.optional<vtensor>";
-    if (indices[i].has_value() && indices[i]->defined()) {
-      std::string tidx = std::to_string(tensor_counter);
-      std::string ish = idx_shapes[tensor_counter];
-      opt_decls += "\n    %opt" + std::to_string(i) +
-          " = torch.derefine %idx" + tidx +
-          " : !torch.vtensor<[" + ish + "], si64> to !torch.optional<vtensor>";
-      tensor_counter++;
-    } else {
-      opt_decls += "\n    %none" + std::to_string(i) + " = torch.constant.none" +
-          "\n    %opt" + std::to_string(i) +
-          " = torch.derefine %none" + std::to_string(i) +
-          " : !torch.none to !torch.optional<vtensor>";
-    }
-  }
-
-  std::string accum_str = accumulate ? "true" : "false";
-
-  std::string vals_adapt_body;
-  std::string vals_name = "values_raw";
-  if (vals_adapter.kind == ArgAdapter::kPermute) {
-    vals_adapt_body = emitPermuteLines("values", "values_raw",
-        inversePerm(vals_adapter.permutation), vals_phys_t, vals_log_t) + "\n";
-    vals_name = "values";
-  }
-
-  auto recipe = [&](PyreKernelAsmBuilder& b) {
-    b.appendFragment(0, {{"FUNC", func_name}, {"SELF_LOG", self_log_s},
-                         {"ELT", elt}});
-    for (size_t i = 0; i < non_none.size(); ++i) {
-      b.appendFragment(1, {{"IDX", std::to_string(i)},
-                           {"IDX_SHAPE", idx_shapes[i]}});
-    }
-    b.appendFragment(2, {
-        {"VALS_PHYS_T", vals_phys_t},
-        {"SELF_LOG_T", self_log_t},
-        {"VALS_ADAPT", vals_adapt_body},
-        {"OPT_DECLS", opt_decls},
-        {"ACCUM", accum_str},
-        {"OPT_NAMES", opt_names}, {"OPT_TYPES", opt_types},
-        {"VALS_NAME", vals_name},
-        {"VALS_LOG_T", vals_log_t},
-        {"SELF_LOG", self_log_s}, {"ELT", elt}});
-  };
-
-  auto& frags = indexPutInplaceFragments();
-  auto cache_key = frags.digest(
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags(), recipe);
+  std::string identity = std::string("index_put_ip\0", 13) + elt + "\0" +
+      packer.bufTopology() + "\0" + packer.dimPattern();
+  auto cache_key = c10::sha1(identity).str();
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = frags.generateMlir(recipe);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(self);
+    for (const auto& [dim, idx] : non_none) gen.visitInput(idx);
+    gen.visitInput(v_values);
+    gen.visitOutput(self);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
 
-  // In-place: self is the output, inputs are {index tensors..., values}.
-  std::vector<at::Tensor> inputs;
-  for (const auto& [dim, idx] : non_none)
-    inputs.push_back(idx);
-  inputs.push_back(vals_phys);
+  c10::SmallVector<at::Tensor, 8> inputs;
+  inputs.push_back(self);
+  for (const auto& [dim, idx] : non_none) inputs.push_back(idx);
+  inputs.push_back(v_values);
 
-  invokeKernelInplace(kernel, inputs, self);
+  invokeEnvelope(kernel, packer, inputs, self);
   return self;
 }
 
 // ---------------------------------------------------------------------------
-// IndexTensorOp — algorithmic MLIR generation for variable index lists
+// IndexTensorOp — envelope dispatch with programmatic ComputeBody
 // ---------------------------------------------------------------------------
-
-// Fragment accessors in dispatch/PyreIndexKernels.cpp.
 
 at::Tensor IndexTensorOp::impl(
     const at::Tensor& self,
     const c10::List<std::optional<at::Tensor>>& indices) {
-  // Promote CPU self to device if indices are on device (common for
-  // model attributes that aren't registered buffers, e.g. causal_mask).
   at::Tensor self_effective = self;
   if (!hasPyreBuffer(self) && self.is_cpu()) {
     c10::Device target = c10::kCPU;
@@ -1022,118 +1249,125 @@ at::Tensor IndexTensorOp::impl(
   TORCH_CHECK(hasPyreBuffer(self_effective),
       "pyre: index.Tensor requires IREE self");
 
-  // Collect non-None indices, promoting CPU indices to device.
-  // Note: __getitem__ passes undefined tensors for None positions.
-  c10::SmallVector<std::pair<int64_t, at::Tensor>, 4> non_none;
-  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
-    if (indices[i].has_value() && indices[i]->defined()) {
-      auto idx = *indices[i];
-      if (!hasPyreBuffer(idx))
-        idx = idx.to(self_effective.device());
-      non_none.push_back({i, idx});
-    }
-  }
-  TORCH_CHECK(!non_none.empty(),
-      "pyre: index.Tensor requires at least one index tensor");
+  auto non_none = collectIndices(indices, self_effective.device());
+  TORCH_CHECK(!non_none.empty(), "pyre: index.Tensor requires at least one index");
 
-  // Fast path: single 1D index → decompose to index_select.
-  if (non_none.size() == 1 && non_none[0].second.dim() == 1) {
+  // Fast path: single 1D index → decompose to index_select (already on envelope).
+  if (non_none.size() == 1 && non_none[0].second.dim() == 1)
     return at::index_select(self_effective, non_none[0].first, non_none[0].second);
-  }
 
-  // General case: algorithmic MLIR generation.
   auto dtype = self_effective.scalar_type();
   std::string elt = scalarTypeToTorchMlir(dtype);
+  auto func_name = funcNameDefault(aten_name);
 
-  // Compute output shape: broadcast index shapes + trailing self dims.
-  // Broadcast all index tensor shapes together.
+  auto dynS = [](c10::IntArrayRef s) {
+    std::string r;
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (i > 0) r += ",";
+      r += (s[i] == 1) ? "1" : "?";
+    }
+    return r;
+  };
+  auto mkVt = [&](const std::string& sh, const std::string& e) {
+    return "!torch.vtensor<[" + sh + "], " + e + ">";
+  };
+  auto mkBt = [&](const std::string& sh, const std::string& e) {
+    std::string dims;
+    for (char c : sh) dims += (c == ',') ? 'x' : c;
+    std::string be = e;
+    if (be.substr(0,2) == "si") be = "i" + be.substr(2);
+    return dims.empty() ? "tensor<" + be + ">" : "tensor<" + dims + "x" + be + ">";
+  };
+
+  // Compute output shape.
   c10::DimVector bcast_shape;
   for (const auto& [dim, idx] : non_none) {
-    if (bcast_shape.empty()) {
+    if (bcast_shape.empty())
       bcast_shape.assign(idx.sizes().begin(), idx.sizes().end());
-    } else {
-      bcast_shape = c10::DimVector(
-          at::infer_size(bcast_shape, idx.sizes()));
-    }
+    else
+      bcast_shape = c10::DimVector(at::infer_size(bcast_shape, idx.sizes()));
   }
-  // Result shape: broadcast_shape + trailing dims after last indexed dim.
   int64_t last_indexed = non_none.back().first;
   c10::DimVector out_shape(bcast_shape.begin(), bcast_shape.end());
   for (int64_t d = last_indexed + 1; d < self_effective.dim(); ++d)
     out_shape.push_back(self_effective.size(d));
 
-  auto func_name = funcNameDefault(aten_name);
+  std::string self_s = dynS(self_effective.sizes());
+  std::string out_s = dynS(out_shape);
 
-  auto dynShape = [](c10::IntArrayRef sizes) {
-    std::string s;
-    for (size_t i = 0; i < sizes.size(); ++i) {
-      if (i > 0) s += ",";
-      s += (sizes[i] == 1) ? "1" : "?";
-    }
-    return s;
-  };
+  // Build ComputeBody
+  ComputeBody body;
+  body.input_names.push_back("self_v");
+  body.input_vtensor_types.push_back(mkVt(self_s, elt));
+  body.input_shape_specs.push_back(broadcastAwareDimSpec(self_effective.sizes()));
+  body.input_tensor_types.push_back(mkBt(self_s, elt));
+  for (size_t i = 0; i < non_none.size(); ++i) {
+    body.input_names.push_back("idx" + std::to_string(i));
+    std::string is = dynS(non_none[i].second.sizes());
+    body.input_vtensor_types.push_back(mkVt(is, "si64"));
+    body.input_shape_specs.push_back(broadcastAwareDimSpec(non_none[i].second.sizes()));
+    body.input_tensor_types.push_back(mkBt(is, "si64"));
+  }
+  body.output_vtensor_type = mkVt(out_s, elt);
+  body.output_tensor_type = mkBt(out_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
 
-  std::string self_s = dynShape(self_effective.sizes());
-  std::string out_s = dynShape(out_shape);
-
-  // Build per-index shape strings and the opt decls/names/types.
-  c10::SmallVector<std::string, 8> idx_shapes;
-  for (const auto& [dim, idx] : non_none)
-    idx_shapes.push_back(dynShape(idx.sizes()));
-
-  std::string opt_decls, opt_names, opt_types;
-  int tensor_counter = 0;
+  std::string ops;
+  int tc = 0;
   for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
-    if (i > 0) { opt_names += ", "; opt_types += ", "; }
-    opt_names += "%opt" + std::to_string(i);
-    opt_types += "!torch.optional<vtensor>";
-
-    if (indices[i].has_value()) {
-      // Find index into non_none
-      std::string tidx = std::to_string(tensor_counter);
-      std::string ish = idx_shapes[tensor_counter];
-      opt_decls += "\n    %opt" + std::to_string(i) +
-          " = torch.derefine %idx" + tidx +
-          " : !torch.vtensor<[" + ish + "], si64> to !torch.optional<vtensor>";
-      tensor_counter++;
+    if (indices[i].has_value() && indices[i]->defined()) {
+      std::string is = dynS(non_none[tc].second.sizes());
+      ops += "    %opt" + std::to_string(i) + " = torch.derefine %idx" +
+             std::to_string(tc) + " : " + mkVt(is, "si64") +
+             " to !torch.optional<vtensor>\n";
+      tc++;
     } else {
-      opt_decls += "\n    %none" + std::to_string(i) + " = torch.constant.none" +
-          "\n    %opt" + std::to_string(i) +
-          " = torch.derefine %none" + std::to_string(i) +
-          " : !torch.none to !torch.optional<vtensor>";
+      ops += "    %none" + std::to_string(i) + " = torch.constant.none\n";
+      ops += "    %opt" + std::to_string(i) + " = torch.derefine %none" +
+             std::to_string(i) + " : !torch.none to !torch.optional<vtensor>\n";
     }
   }
+  std::string onames, otypes;
+  for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+    if (i > 0) { onames += ", "; otypes += ", "; }
+    onames += "%opt" + std::to_string(i);
+    otypes += "!torch.optional<vtensor>";
+  }
+  ops += "    %indices = torch.prim.ListConstruct " + onames +
+         " : (" + otypes + ") -> !torch.list<optional<vtensor>>\n";
+  ops += "    %result = torch.aten.index.Tensor %self_v, %indices : " +
+         body.input_vtensor_types[0] + ", !torch.list<optional<vtensor>> -> " +
+         body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
 
-  auto recipe = [&](PyreKernelAsmBuilder& b) {
-    b.appendFragment(0, {{"FUNC", func_name}, {"OUT_SHAPE", out_s},
-                         {"ELT", elt}, {"SELF_SHAPE", self_s}});
-    for (size_t i = 0; i < non_none.size(); ++i) {
-      b.appendFragment(1, {{"IDX", std::to_string(i)},
-                           {"IDX_SHAPE", idx_shapes[i]}});
-    }
-    b.appendFragment(4, {{"OPT_DECLS", opt_decls},
-                         {"OPT_NAMES", opt_names}, {"OPT_TYPES", opt_types},
-                         {"SELF_SHAPE", self_s}, {"ELT", elt},
-                         {"OUT_SHAPE", out_s}});
-  };
+  // Envelope dispatch
+  AbiPacker packer;
+  packer.visitInput(self_effective);
+  for (const auto& [dim, idx] : non_none) packer.visitInput(idx);
+  auto out = at::empty(out_shape, self_effective.options());
+  packer.visitOutput(out);
 
-  auto& frags = indexFragments();
-  auto cache_key = frags.digest(
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags(), recipe);
+  std::string identity = std::string("index_tensor\0", 13) + elt + "\0" +
+      packer.bufTopology() + "\0" + packer.dimPattern();
+  auto cache_key = c10::sha1(identity).str();
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = frags.generateMlir(recipe);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitInput(self_effective);
+    for (const auto& [dim, idx] : non_none) gen.visitInput(idx);
+    gen.visitOutput(out);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
 
-  std::vector<at::Tensor> inputs;
+  c10::SmallVector<at::Tensor, 8> inputs;
   inputs.push_back(self_effective);
-  for (const auto& [dim, idx] : non_none)
-    inputs.push_back(idx);
+  for (const auto& [dim, idx] : non_none) inputs.push_back(idx);
 
-  return invokeKernel(kernel, inputs, out_shape, self_effective.options());
+  invokeEnvelope(kernel, packer, inputs, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,23 +1397,32 @@ at::Tensor ArangeOp::impl(
   auto out_device = c10::device_or_default(device);
 
   auto func_name = funcNameDefault(aten_name);
+
+  // Arange has zero tensor inputs — only an output.
+  AbiPacker packer;
+  auto out = at::empty({out_size},
+      at::TensorOptions().dtype(out_dtype).device(out_device));
+  packer.visitOutput(out);
+
   auto spec = buildArangeKernelSpec(
       func_name, out_dtype, out_size, start_d, end_d, step_d);
-  auto cache_key = contentHashCacheKey(
+  auto cache_key = packer.cacheKey(
       spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
+      AbiConfig::kEnvelope.compilerFlags());
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = generateArangeMlir(
-        func_name, out_dtype, out_size, start_d, end_d, step_d);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    gen.visitOutput(out);
+    auto body = generateArangeComputeBody(
+        out_dtype, out_size, start_d, end_d, step_d);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
 
-  // Zero tensor inputs — invoke with empty input list.
-  return invokeKernel(kernel, {}, {out_size},
-                      at::TensorOptions().dtype(out_dtype).device(out_device));
+  invokeEnvelope(kernel, packer, {}, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1202,27 +1445,45 @@ at::Tensor TypeCastOp::impl(
   auto out_dtype = *dtype;
   auto func_name = funcNameDefault(aten_name);
 
-  auto spec = buildTypeCastKernelSpec(func_name, in_dtype, out_dtype, self.sizes());
-  auto cache_key = contentHashCacheKey(
-      spec.template_sha1, spec.substitutions,
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags());
-
-  auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
-  if (!kernel) {
-    auto mlir = generateTypeCastMlir(func_name, in_dtype, out_dtype, self.sizes());
-    kernel = getOrCompile(cache_key, func_name, mlir);
+  at::Tensor visit_self = self;
+  {
+    auto adapter = ArgAdapter::analyze(self);
+    if (adapter.kind == ArgAdapter::kContiguous)
+      visit_self = self.contiguous();
   }
 
-  return invokeKernel(kernel, {self}, c10::DimVector(self.sizes()),
-                      self.options().dtype(out_dtype));
+  AbiPacker packer;
+  packer.visitInput(visit_self);
+
+  auto out = at::empty(
+      c10::DimVector(self.sizes()), self.options().dtype(out_dtype));
+  packer.visitOutput(out);
+
+  auto spec = buildTypeCastKernelSpec(
+      func_name, in_dtype, out_dtype, visit_self.sizes());
+  auto cache_key = packer.cacheKey(
+      spec.template_sha1, spec.substitutions,
+      AbiConfig::kEnvelope.compilerFlags());
+
+  auto& cache = PyreKernelCache::get();
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
+  if (!kernel) {
+    AbiGenerator gen;
+    gen.visitInput(visit_self);
+    gen.visitOutput(out);
+    auto body = generateTypeCastComputeBody(
+        in_dtype, out_dtype, visit_self.sizes());
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
+  }
+
+  invokeEnvelope(kernel, packer, {visit_self}, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// CatOp — algorithmic MLIR generation using PyreKernelAsmFragments
+// CatOp — envelope dispatch with programmatic ComputeBody
 // ---------------------------------------------------------------------------
-
-// Fragment accessors in dispatch/PyreCatKernel.cpp.
 
 at::Tensor CatOp::impl(const at::ITensorListRef& tensors, int64_t dim) {
   auto materialized = tensors.materialize();
@@ -1242,68 +1503,87 @@ at::Tensor CatOp::impl(const at::ITensorListRef& tensors, int64_t dim) {
 
   auto func_name = funcNameDefault(aten_name);
   std::string elt = scalarTypeToTorchMlir(dtype);
-  std::string dim_str = std::to_string(dim);
 
-  auto dynShape = [](const at::Tensor& t) {
-    std::string s;
-    for (int64_t i = 0; i < t.dim(); ++i) {
-      if (i > 0) s += ",";
-      s += (t.size(i) == 1) ? "1" : "?";
+  auto dynS = [](c10::IntArrayRef s) {
+    std::string r;
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (i > 0) r += ",";
+      r += (s[i] == 1) ? "1" : "?";
     }
-    return s;
+    return r;
+  };
+  auto mkVt = [&](const std::string& sh, const std::string& e) {
+    return "!torch.vtensor<[" + sh + "], " + e + ">";
+  };
+  auto mkBt = [&](const std::string& sh, const std::string& e) {
+    std::string dims;
+    for (char c : sh) dims += (c == ',') ? 'x' : c;
+    std::string be = e;
+    if (be.substr(0,2) == "si") be = "i" + be.substr(2);
+    return dims.empty() ? "tensor<" + be + ">" : "tensor<" + dims + "x" + be + ">";
   };
 
-  std::string out_s;
-  for (size_t i = 0; i < out_shape.size(); ++i) {
-    if (i > 0) out_s += ",";
-    out_s += (out_shape[i] == 1) ? "1" : "?";
-  }
+  std::string out_s = dynS(out_shape);
 
-  // Pre-compute per-input shape strings
-  c10::SmallVector<std::string, 8> input_shapes;
-  for (const auto& t : materialized)
-    input_shapes.push_back(dynShape(t.get()));
-
-  // Build input_names and input_types strings
-  std::string input_names, input_types;
+  // Build ComputeBody
+  ComputeBody body;
   for (size_t i = 0; i < materialized.size(); ++i) {
-    if (i > 0) { input_names += ", "; input_types += ", "; }
-    input_names += "%input" + std::to_string(i);
-    input_types += "!torch.vtensor<[" + input_shapes[i] + "], " + elt + ">";
+    std::string is = dynS(materialized[i].get().sizes());
+    body.input_names.push_back("input" + std::to_string(i));
+    body.input_vtensor_types.push_back(mkVt(is, elt));
+    body.input_shape_specs.push_back(broadcastAwareDimSpec(materialized[i].get().sizes()));
+    body.input_tensor_types.push_back(mkBt(is, elt));
+  }
+  body.output_vtensor_type = mkVt(out_s, elt);
+  body.output_tensor_type = mkBt(out_s, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+
+  std::string ops;
+  std::string list_names, list_types;
+  for (size_t i = 0; i < materialized.size(); ++i) {
+    if (i > 0) { list_names += ", "; list_types += ", "; }
+    list_names += "%input" + std::to_string(i);
+    list_types += body.input_vtensor_types[i];
+  }
+  ops += "    %tensors = torch.prim.ListConstruct " + list_names +
+         " : (" + list_types + ") -> !torch.list<vtensor>\n";
+  ops += "    %dim = torch.constant.int " + std::to_string(dim) + "\n";
+  ops += "    %result = torch.aten.cat %tensors, %dim : "
+         "!torch.list<vtensor>, !torch.int -> " +
+         body.output_vtensor_type + "\n";
+  body.mlir_ops = std::move(ops);
+
+  // Force contiguous for non-permutable strides.
+  c10::SmallVector<at::Tensor, 8> visit_tensors;
+  for (const auto& t : materialized) {
+    if (ArgAdapter::analyze(t.get()).kind == ArgAdapter::kContiguous)
+      visit_tensors.push_back(t.get().contiguous());
+    else
+      visit_tensors.push_back(t.get());
   }
 
-  // Recipe lambda: replayed in both digest and generate modes
-  auto recipe = [&](PyreKernelAsmBuilder& b) {
-    b.appendFragment(0, {{"FUNC", func_name}, {"OUT_SHAPE", out_s}, {"ELT", elt}});
-    for (size_t i = 0; i < materialized.size(); ++i) {
-      b.appendFragment(1, {
-          {"IDX", std::to_string(i)},
-          {"INPUT_SHAPE", input_shapes[i]},
-          {"ELT", elt}});
-    }
-    b.appendFragment(2, {
-        {"INPUT_NAMES", input_names}, {"INPUT_TYPES", input_types},
-        {"DIM", dim_str}, {"OUT_SHAPE", out_s}, {"ELT", elt}});
-  };
+  AbiPacker packer;
+  for (const auto& t : visit_tensors) packer.visitInput(t);
+  auto out = at::empty(out_shape, materialized[0].get().options());
+  packer.visitOutput(out);
 
-  auto& frags = catFragments();
-  auto cache_key = frags.digest(
-      c10::pyre::PyreDevice::get(0)->capabilities().compilerFlags(), recipe);
+  std::string identity = std::string("cat\0", 4) + elt + "\0" +
+      std::to_string(dim) + "\0" +
+      packer.bufTopology() + "\0" + packer.dimPattern();
+  auto cache_key = c10::sha1(identity).str();
 
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name);
+  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
   if (!kernel) {
-    auto mlir = frags.generateMlir(recipe);
-    kernel = getOrCompile(cache_key, func_name, mlir);
+    AbiGenerator gen;
+    for (const auto& t : visit_tensors) gen.visitInput(t);
+    gen.visitOutput(out);
+    auto mlir = gen.generateModule(func_name, body);
+    kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
   }
 
-  std::vector<at::Tensor> inputs;
-  inputs.reserve(materialized.size());
-  for (const auto& t : materialized)
-    inputs.push_back(t.get());
-
-  return invokeKernel(kernel, inputs, out_shape,
-                      materialized[0].get().options());
+  invokeEnvelope(kernel, packer, visit_tensors, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
