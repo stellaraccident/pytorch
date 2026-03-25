@@ -335,29 +335,43 @@ at::Tensor pyre_matmul(const at::Tensor& self, const at::Tensor& other) {
     return result.reshape(out_shape);
   }
   if (self.dim() >= 3 && other.dim() >= 3) {
-    // Broadcast batch dims, flatten to 3D for bmm, reshape back.
+    // Emit torch.aten.matmul as compiled kernel — handles batch
+    // broadcasting natively without .contiguous() copies.
+    TORCH_CHECK(hasPyreBuffer(self) && hasPyreBuffer(other),
+        "pyre: matmul requires IREE buffers");
+    auto dtype = self.scalar_type();
     auto self_batch = self.sizes().slice(0, self.dim() - 2);
     auto other_batch = other.sizes().slice(0, other.dim() - 2);
     auto bcast = at::infer_size(
         c10::IntArrayRef(self_batch.data(), self_batch.size()),
         c10::IntArrayRef(other_batch.data(), other_batch.size()));
-    auto m = self.size(-2), k = self.size(-1), n = other.size(-1);
-    int64_t batch = 1;
-    for (auto s : bcast) batch *= s;
-    // Expand then flatten batch dims to single dim for bmm.
-    c10::SmallVector<int64_t, 8> self_expand(bcast.begin(), bcast.end());
-    self_expand.push_back(m);
-    self_expand.push_back(k);
-    c10::SmallVector<int64_t, 8> other_expand(bcast.begin(), bcast.end());
-    other_expand.push_back(k);
-    other_expand.push_back(n);
-    auto a3 = self.expand(self_expand).contiguous().reshape({batch, m, k});
-    auto b3 = other.expand(other_expand).contiguous().reshape({batch, k, n});
-    auto result = at::bmm(a3, b3);
+    auto m = self.size(-2), n = other.size(-1);
     c10::SmallVector<int64_t, 8> out_shape(bcast.begin(), bcast.end());
     out_shape.push_back(m);
     out_shape.push_back(n);
-    return result.reshape(out_shape);
+    auto out = at::empty(out_shape, self.options());
+    auto func_name = funcNameDefault("matmul");
+
+    AbiPacker packer;
+    packer.visitInput(self);
+    packer.visitInput(other);
+    packer.visitOutput(out);
+
+    auto cache_key = packer.cacheKey(
+        "matmul", {}, AbiConfig::kEnvelope.compilerFlags());
+
+    auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+      AbiGenerator gen;
+      gen.visitInput(self);
+      gen.visitInput(other);
+      gen.visitOutput(out);
+      auto body = generateMatmulComputeBody(
+          dtype, self.sizes(), other.sizes(), out_shape);
+      return gen.generateModule(func_name, body);
+    });
+
+    invokeEnvelope(kernel, packer, {self, other}, out);
+    return out;
   }
   TORCH_CHECK(false, "pyre: matmul not yet supported for ",
               self.dim(), "D x ", other.dim(), "D");

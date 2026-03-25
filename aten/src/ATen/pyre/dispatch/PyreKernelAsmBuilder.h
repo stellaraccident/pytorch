@@ -146,6 +146,11 @@ ComputeBody generateBmmComputeBody(
     c10::ArrayRef<int64_t> mat1_shape, c10::ArrayRef<int64_t> mat2_shape,
     c10::ArrayRef<int64_t> out_shape);
 
+ComputeBody generateMatmulComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> self_shape, c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape);
+
 ComputeBody generateWhereComputeBody(
     c10::ScalarType dtype,
     c10::ArrayRef<int64_t> cond_shape,

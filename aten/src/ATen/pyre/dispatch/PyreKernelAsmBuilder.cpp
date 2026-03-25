@@ -1,5 +1,6 @@
 #include <ATen/pyre/dispatch/PyreKernelAsmBuilder.h>
 #include <ATen/pyre/dispatch/PyreStringSplicer.h>
+#include <ATen/pyre/PyreUtils.h>
 #include <c10/util/hash.h>
 
 #include <set>
@@ -127,17 +128,12 @@ static c10::SmallVector<int64_t, 6> logicalShape(
   return logical;
 }
 
-static bool isIntegralScalar(double value) {
-  return value == static_cast<int64_t>(value);
-}
-
 static std::string scalarDecl(const char* name, double value) {
   if (isIntegralScalar(value))
     return std::string("    %") + name + " = torch.constant.int " +
            std::to_string(static_cast<int64_t>(value));
-  std::ostringstream ss;
-  ss << "    %" << name << " = torch.constant.float " << std::fixed << value;
-  return ss.str();
+  return std::string("    %") + name + " = torch.constant.float " +
+         mlirFloatLiteral(value);
 }
 
 static std::string scalarType(double value) {
@@ -213,12 +209,12 @@ static BinaryAlphaOpInfo resolveAlphaOp(
   info.torch_op = (alpha_add_op.find("sub") != std::string::npos)
       ? "torch.aten.sub.Tensor" : "torch.aten.add.Tensor";
   std::ostringstream decl;
-  if (alpha_value == static_cast<int64_t>(alpha_value))
+  if (isIntegralScalar(alpha_value))
     decl << "    %alpha = torch.constant.int "
          << static_cast<int64_t>(alpha_value);
   else
     decl << "    %alpha = torch.constant.float "
-         << std::fixed << alpha_value;
+         << mlirFloatLiteral(alpha_value);
   info.alpha_decl = decl.str();
   return info;
 }
@@ -566,13 +562,13 @@ ComputeBody generateComparisonScalarComputeBody(
   body.output_shape_spec = broadcastAwareDimSpec(input_shape);
 
   std::string ops;
-  if (scalar_value == static_cast<int64_t>(scalar_value))
+  if (isIntegralScalar(scalar_value))
     ops += "    %scalar = torch.constant.int " +
            std::to_string(static_cast<int64_t>(scalar_value)) + "\n";
   else
     ops += "    %scalar = torch.constant.float " +
-           std::to_string(scalar_value) + "\n";
-  std::string scalar_type = (scalar_value == static_cast<int64_t>(scalar_value))
+           mlirFloatLiteral(scalar_value) + "\n";
+  std::string scalar_type = isIntegralScalar(scalar_value)
       ? "!torch.int" : "!torch.float";
   ops += "    %result = " + torch_op + " %input, %scalar : " +
       body.input_vtensor_types[0] + ", " + scalar_type +
@@ -604,6 +600,28 @@ ComputeBody generateBmmComputeBody(
   body.output_tensor_type = builtinTensorType(os, elt);
   body.output_shape_spec = broadcastAwareDimSpec(out_shape);
   body.mlir_ops = "    %result = torch.aten.bmm %mat1, %mat2 : " +
+      body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
+      " -> " + body.output_vtensor_type + "\n";
+  return body;
+}
+
+ComputeBody generateMatmulComputeBody(
+    c10::ScalarType dtype,
+    c10::ArrayRef<int64_t> self_shape, c10::ArrayRef<int64_t> other_shape,
+    c10::ArrayRef<int64_t> out_shape) {
+  std::string elt = scalarTypeToTorchMlir(dtype);
+  std::string s1 = broadcastAwareShapeStr(self_shape);
+  std::string s2 = broadcastAwareShapeStr(other_shape);
+  std::string os = broadcastAwareShapeStr(out_shape);
+  ComputeBody body;
+  body.input_vtensor_types = {vtensorType(s1, elt), vtensorType(s2, elt)};
+  body.input_shape_specs = {broadcastAwareDimSpec(self_shape), broadcastAwareDimSpec(other_shape)};
+  body.input_tensor_types = {builtinTensorType(s1, elt), builtinTensorType(s2, elt)};
+  body.input_names = {"self", "other"};
+  body.output_vtensor_type = vtensorType(os, elt);
+  body.output_tensor_type = builtinTensorType(os, elt);
+  body.output_shape_spec = broadcastAwareDimSpec(out_shape);
+  body.mlir_ops = "    %result = torch.aten.matmul %self, %other : " +
       body.input_vtensor_types[0] + ", " + body.input_vtensor_types[1] +
       " -> " + body.output_vtensor_type + "\n";
   return body;
@@ -2025,16 +2043,11 @@ static SubstPairs arangeVars(
   std::string scalar_type = is_float ? "!torch.float" : "!torch.int";
   std::string size_str = std::to_string(out_size);
 
-  std::ostringstream ss;
-  ss << std::fixed;
   std::string start_decl, end_decl, step_decl;
   if (is_float) {
-    ss.str(""); ss << "    %start = torch.constant.float " << start;
-    start_decl = ss.str();
-    ss.str(""); ss << "    %end = torch.constant.float " << end;
-    end_decl = ss.str();
-    ss.str(""); ss << "    %step = torch.constant.float " << step;
-    step_decl = ss.str();
+    start_decl = "    %start = torch.constant.float " + mlirFloatLiteral(start);
+    end_decl = "    %end = torch.constant.float " + mlirFloatLiteral(end);
+    step_decl = "    %step = torch.constant.float " + mlirFloatLiteral(step);
   } else {
     start_decl = "    %start = torch.constant.int " +
         std::to_string(static_cast<int64_t>(start));

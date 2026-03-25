@@ -195,7 +195,7 @@ class TestRealTemplates(TestCase):
         for ph in [
             "$$element_type$$",
             "$$func_name$$",
-            "$$lhs_shape$$",
+            "$$lhs_input_shape$$",
             "$$out_shape$$",
             "$$torch_op$$",
         ]:
@@ -208,7 +208,7 @@ class TestRealTemplates(TestCase):
         for ph in [
             "$$element_type$$",
             "$$func_name$$",
-            "$$input_shape$$",
+            "$$input_input_shape$$",
             "$$torch_op$$",
         ]:
             self.assertIn(ph, tmpl)

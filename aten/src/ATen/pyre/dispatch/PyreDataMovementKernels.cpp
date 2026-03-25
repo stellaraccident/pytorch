@@ -82,13 +82,11 @@ static void invokeNative(
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
   auto& stream_ctx = stream.context();
 
-  iree_vm_list_t* args = nullptr;
+  c10::pyre::vm_list_ptr args;
   PYRE_CHECK_OK(iree_vm_list_create(
       iree_vm_make_undefined_type_def(),
-      static_cast<iree_host_size_t>(inputs.size()) + 2, alloc, &args));
-  struct ArgsGuard { iree_vm_list_t*& p;
-    ~ArgsGuard() { if (p) iree_vm_list_release(p); }
-  } args_guard{args};
+      static_cast<iree_host_size_t>(inputs.size()) + 2, alloc,
+      args.for_output()));
 
   for (const auto& t : inputs) {
     auto view = makeOpaqueView(t);
@@ -96,50 +94,59 @@ static void invokeNative(
     PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
   }
 
-  // Wait fence.
-  iree_hal_fence_t* wait = nullptr;
-  PYRE_CHECK_OK(iree_hal_fence_create(
-      static_cast<iree_host_size_t>(inputs.size() + 2), alloc, &wait));
-  for (const auto& t : inputs) {
-    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
-        t.storage().data_ptr().get_context());
-    if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
-      PYRE_CHECK_OK(iree_hal_fence_insert(
-          wait, ctx->mutation_sem, ctx->mutation_timepoint));
-  }
+  // Wait fence — always include stream's current timepoint to enforce
+  // serial ordering on the timeline.
   {
-    auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
-        output.storage().data_ptr().get_context());
-    if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
+    c10::pyre::hal_fence_ptr wait;
+    PYRE_CHECK_OK(iree_hal_fence_create(
+        static_cast<iree_host_size_t>(inputs.size() + 3), alloc,
+        wait.for_output()));
+    if (stream_ctx.timepoint > 0)
       PYRE_CHECK_OK(iree_hal_fence_insert(
-          wait, ctx->mutation_sem, ctx->mutation_timepoint));
-  }
-  {
-    iree_vm_ref_t ref = iree_hal_fence_move_ref(wait);
+          wait, stream_ctx.timeline.get(), stream_ctx.timepoint));
+    for (const auto& t : inputs) {
+      auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+          t.storage().data_ptr().get_context());
+      if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
+        PYRE_CHECK_OK(iree_hal_fence_insert(
+            wait, ctx->mutation_sem, ctx->mutation_timepoint));
+    }
+    {
+      auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
+          output.storage().data_ptr().get_context());
+      if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
+        PYRE_CHECK_OK(iree_hal_fence_insert(
+            wait, ctx->mutation_sem, ctx->mutation_timepoint));
+    }
+    iree_vm_ref_t ref = iree_hal_fence_move_ref(wait.release());
     PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
   }
 
-  // Signal fence.
+  // Signal fence — FenceGuard owns this ref and signals on exception.
+  // A separate ref is retained into the args list for the dispatch engine.
   uint64_t signal_value = ++stream_ctx.timepoint;
+  iree_hal_fence_t* signal = nullptr;
+  PYRE_CHECK_OK(iree_hal_fence_create_at(
+      stream_ctx.timeline.get(), signal_value, alloc, &signal));
+  at::pyre::FenceGuard fence_guard(signal);
   {
-    iree_hal_fence_t* signal = nullptr;
-    PYRE_CHECK_OK(iree_hal_fence_create_at(
-        stream_ctx.timeline.get(), signal_value, alloc, &signal));
+    iree_hal_fence_retain(signal);  // args list gets its own ref
     iree_vm_ref_t ref = iree_hal_fence_move_ref(signal);
     PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
   }
 
-  iree_vm_list_t* rets = nullptr;
+  c10::pyre::vm_list_ptr rets;
   PYRE_CHECK_OK(iree_vm_list_create(
-      iree_vm_make_undefined_type_def(), 1, alloc, &rets));
-  struct RetsGuard { iree_vm_list_t*& p;
-    ~RetsGuard() { if (p) iree_vm_list_release(p); }
-  } rets_guard{rets};
+      iree_vm_make_undefined_type_def(), 1, alloc,
+      rets.for_output()));
 
   PYRE_CHECK_OK(iree_vm_invoke(
       kernel->context.get(), kernel->function,
       IREE_VM_INVOCATION_FLAG_NONE, nullptr,
       args, rets, alloc));
+
+  // Success — dispatch will signal the fence asynchronously.
+  fence_guard.disarm();
 
   // Timeline bookkeeping.
   for (const auto& t : inputs) {
@@ -152,74 +159,32 @@ static void invokeNative(
   if (out_ctx) out_ctx->recordMutation(stream_ctx.timeline.get(), signal_value);
 }
 
-// Compile-and-cache for native kernels.
-static CachedKernel* compileNative(
-    const std::string& cache_key,
-    const std::string& func_name,
-    const std::string& mlir) {
-  PYRE_LOG(INFO) << "cache MISS (native): " << cache_key << ", compiling\n";
-  PYRE_LOG(DEBUG) << "MLIR:\n" << mlir << "\n";
-
-  auto vmfb = PyreKernelCompiler::compileSync(
-      std::string(mlir), nativeCompilerFlags());
-
-  PYRE_LOG(INFO) << "compiled " << vmfb->size() << " bytes\n";
-
-  // Load with native function resolution (no $async).
-  auto& runtime = c10::pyre::PyreRuntime::get();
-  auto* device = c10::pyre::PyreDevice::get(0);
-  auto alloc = runtime.hostAllocator();
-
-  CachedKernel kernel;
-  kernel.vmfb = std::move(vmfb);
-
-  auto span = kernel.vmfb->span();
-  iree_vm_module_t* bytecode_module = nullptr;
-  PYRE_CHECK_OK(iree_vm_bytecode_module_create(
-      runtime.instance(), IREE_VM_BYTECODE_MODULE_FLAG_NONE,
-      span, iree_allocator_null(), alloc, &bytecode_module));
-  kernel.module = c10::pyre::vm_module_ptr::steal(bytecode_module);
-
-  iree_hal_device_group_t* device_group = nullptr;
-  PYRE_CHECK_OK(iree_hal_device_group_create_from_device(
-      device->halDevice(), alloc, &device_group));
-  iree_vm_module_t* hal_module = nullptr;
-  PYRE_CHECK_OK(iree_hal_module_create(
-      runtime.instance(), iree_hal_module_device_policy_default(),
-      device_group, IREE_HAL_MODULE_FLAG_NONE,
-      iree_hal_module_debug_sink_null(), alloc, &hal_module));
-  iree_hal_device_group_release(device_group);
-
-  iree_vm_module_t* modules[] = {hal_module, bytecode_module};
-  iree_vm_context_t* context = nullptr;
-  PYRE_CHECK_OK(iree_vm_context_create_with_modules(
-      runtime.instance(), IREE_VM_CONTEXT_FLAG_NONE,
-      2, modules, alloc, &context));
-  kernel.context = c10::pyre::vm_context_ptr::steal(context);
-  iree_vm_module_release(hal_module);
-
-  std::string full_name = resolveNativeFunction(func_name);
-  iree_string_view_t nv = {
-      full_name.c_str(), static_cast<iree_host_size_t>(full_name.size())};
-  PYRE_CHECK_OK(iree_vm_context_resolve_function(
-      context, nv, &kernel.function));
-
-  auto& cache = PyreKernelCache::get();
-  return cache.store(cache_key, func_name, std::move(kernel.vmfb),
-                     AbiConfig::kNativeOpaque);
-}
-
-// Lookup or compile a native kernel.
+// Lookup or compile a native kernel via lookupOrClaim/fulfill/fail.
 static CachedKernel* getOrCompileNative(
     const std::string& cache_key,
     const std::string& func_name,
     PyreKernelAsmFragments& frags,
     const std::function<void(PyreKernelAsmBuilder&)>& recipe) {
   auto& cache = PyreKernelCache::get();
-  auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kNativeOpaque);
-  if (kernel) return kernel;
-  auto mlir = frags.generateMlir(recipe);
-  return compileNative(cache_key, func_name, mlir);
+  auto result = cache.lookupOrClaim(
+      cache_key, func_name, AbiConfig::kNativeOpaque);
+
+  if (result.is_compiler) {
+    try {
+      auto mlir = frags.generateMlir(recipe);
+      PYRE_LOG(DEBUG) << "MLIR:\n" << mlir << "\n";
+      auto vmfb = PyreKernelCompiler::compileSync(
+          std::move(mlir), nativeCompilerFlags());
+      PYRE_LOG(INFO) << "compiled " << vmfb->size() << " bytes\n";
+      cache.fulfill(cache_key, std::move(vmfb), func_name,
+                    AbiConfig::kNativeOpaque);
+    } catch (...) {
+      cache.fail(cache_key, std::current_exception());
+      throw;
+    }
+  }
+
+  return result.future.get();
 }
 
 // ---------------------------------------------------------------------------

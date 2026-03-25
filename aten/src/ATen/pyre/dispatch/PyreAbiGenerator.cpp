@@ -158,7 +158,10 @@ std::string AbiGenerator::emitEnvelopeFunction(
       buf_used_by_input[t.buf_idx] = true;
   }
 
-  // Collect which tensors have non-zero offsets.
+  // Collect which tensors have non-zero offsets (inputs only — output
+  // offsets are handled by dispatching to a contiguous copy in PyreOp,
+  // because hal.buffer.subspan on the output triggers the IREE alignment
+  // bug: binding alignment(64) is false for non-64-aligned subspans).
   c10::SmallVector<int, 8> offset_tensor_indices;
   for (int i = 0; i < static_cast<int>(tensors_.size()); ++i) {
     if (tensors_[i].element_offset != 0 && !tensors_[i].is_output)
@@ -400,6 +403,7 @@ std::string AbiGenerator::emitEnvelopeFunction(
 
   // Alias result to output buffer. If output aliases an input buffer,
   // reference the input buffer arg directly (no separate output arg).
+  // If the output has a non-zero storage offset, create a subspan.
   std::string out_buf_name;
   if (buf_used_by_input[out.buf_idx]) {
     out_buf_name = "%buf" + std::to_string(out.buf_idx);

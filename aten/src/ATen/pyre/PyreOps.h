@@ -23,7 +23,10 @@
 #include <c10/pyre/impl/PyreDevice.h>
 #include <c10/pyre/impl/PyreStream.h>
 
+#include <iree/hal/fence.h>
 #include <torch/library.h>
+
+#include <ATen/pyre/PyreUtils.h>
 
 #include <sstream>
 #include <string>
@@ -87,13 +90,28 @@ std::string buildScalarBinaryMlirHelper(
     const std::string& extra_args = "",
     const std::string& extra_arg_types = "");
 
-// Compile-and-cache, returning the cached entry.
-// AbiConfig controls compiler flags and function resolution.
+// Compile-and-cache via lookupOrClaim + fulfill/fail.
+// mlir_generator is only called if this thread is the compiler (lazy).
 CachedKernel* getOrCompile(
     const std::string& cache_key,
     const std::string& func_name,
-    const std::string& mlir,
+    std::function<std::string()> mlir_generator,
     const AbiConfig& abi = AbiConfig::kEnvelope);
+
+// Signals the fence on destruction unless disarmed. Ensures the timeline
+// stays consistent if any exception escapes after the timepoint is
+// incremented — without this, a failed dispatch hangs every subsequent op.
+struct FenceGuard {
+  iree_hal_fence_t* fence;
+  bool armed = true;
+  explicit FenceGuard(iree_hal_fence_t* f) : fence(f) {}
+  ~FenceGuard() {
+    if (!fence) return;
+    if (armed) iree_hal_fence_signal(fence);
+    iree_hal_fence_release(fence);
+  }
+  void disarm() { armed = false; }
+};
 
 // Invoke an envelope kernel via AbiPacker's arg packing.
 // Handles timeline management (wait/signal fences).
@@ -134,6 +152,16 @@ struct PyreOp {
       TORCH_CHECK(hasPyreBuffer(t), "pyre: ", Derived::aten_name,
           " (in-place) requires tensors with IREE buffers");
 
+    // HACK(pyre-workspace-drek): In-place on offset output hits the IREE
+    // alignment bug — alignment(64) on Indirect bindings backed by
+    // hal.buffer.subspan at non-64-aligned offsets. See
+    // reproducers/inplace-output-offset/.
+    if (self.storage_offset() != 0) {
+      auto result = dispatch(all_inputs, scalars);
+      self.copy_(result);
+      return self;
+    }
+
     auto dtype = effective_inputs[0].scalar_type();
 
     c10::SmallVector<at::Tensor, 4> contiguous_storage;
@@ -168,16 +196,13 @@ struct PyreOp {
         spec.template_sha1, spec.substitutions,
         AbiConfig::kEnvelope.compilerFlags());
 
-    auto& cache = PyreKernelCache::get();
-    auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
-    if (!kernel) {
+    auto* kernel = getOrCompile(cache_key, func_name, [&]() {
       AbiGenerator gen;
       for (const auto& t : visit_inputs) gen.visitInput(t);
       gen.visitOutput(self);
       auto body = Derived::generateComputeBody(func_name, ctx);
-      auto mlir = gen.generateModule(func_name, body);
-      kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
-    }
+      return gen.generateModule(func_name, body);
+    });
 
     invokeEnvelope(kernel, packer, visit_inputs, self);
     return self;
@@ -244,17 +269,15 @@ struct PyreOp {
         spec.template_sha1, spec.substitutions,
         AbiConfig::kEnvelope.compilerFlags());
 
-    // Phase 2: lookup. Generate envelope MLIR on cache miss.
-    auto& cache = PyreKernelCache::get();
-    auto* kernel = cache.lookup(cache_key, func_name, AbiConfig::kEnvelope);
-    if (!kernel) {
+    // Phase 2: lookup or compile. MLIR generation is lazy — only the
+    // thread that claims the cache key generates and compiles.
+    auto* kernel = getOrCompile(cache_key, func_name, [&]() {
       AbiGenerator gen;
       for (const auto& t : visit_inputs) gen.visitInput(t);
       gen.visitOutput(out);
       auto body = Derived::generateComputeBody(func_name, ctx);
-      auto mlir = gen.generateModule(func_name, body);
-      kernel = getOrCompile(cache_key, func_name, mlir, AbiConfig::kEnvelope);
-    }
+      return gen.generateModule(func_name, body);
+    });
 
     invokeEnvelope(kernel, packer, visit_inputs, out);
     return out;
@@ -672,11 +695,8 @@ struct HardtanhOp : ParameterizedUnaryOp<HardtanhOp> {
   static std::string extraArgDecls(const OpContext& ctx) {
     double mn = ctx.scalars[0].toDouble();
     double mx = ctx.scalars[1].toDouble();
-    std::ostringstream ss;
-    ss << std::fixed
-       << "    %min = torch.constant.float " << mn << "\n"
-       << "    %max = torch.constant.float " << mx;
-    return ss.str();
+    return "    %min = torch.constant.float " + mlirFloatLiteral(mn) + "\n" +
+           "    %max = torch.constant.float " + mlirFloatLiteral(mx);
   }
   static std::string extraArgs() { return ", %min, %max"; }
   static std::string extraArgTypes() { return ", !torch.float, !torch.float"; }
@@ -696,9 +716,7 @@ struct LeakyReluOp : ParameterizedUnaryOp<LeakyReluOp> {
   }
   static std::string extraArgDecls(const OpContext& ctx) {
     double slope = ctx.scalars[0].toDouble();
-    std::ostringstream ss;
-    ss << std::fixed << "    %neg_slope = torch.constant.float " << slope;
-    return ss.str();
+    return "    %neg_slope = torch.constant.float " + mlirFloatLiteral(slope);
   }
   static std::string extraArgs() { return ", %neg_slope"; }
   static std::string extraArgTypes() { return ", !torch.float"; }
@@ -724,12 +742,9 @@ struct EluOp : ParameterizedUnaryOp<EluOp> {
     double a = ctx.scalars[0].toDouble();
     double s = ctx.scalars[1].toDouble();
     double is = ctx.scalars[2].toDouble();
-    std::ostringstream ss;
-    ss << std::fixed
-       << "    %alpha = torch.constant.float " << a << "\n"
-       << "    %scale = torch.constant.float " << s << "\n"
-       << "    %input_scale = torch.constant.float " << is;
-    return ss.str();
+    return "    %alpha = torch.constant.float " + mlirFloatLiteral(a) + "\n" +
+           "    %scale = torch.constant.float " + mlirFloatLiteral(s) + "\n" +
+           "    %input_scale = torch.constant.float " + mlirFloatLiteral(is);
   }
   static std::string extraArgs() { return ", %alpha, %scale, %input_scale"; }
   static std::string extraArgTypes() {
@@ -772,14 +787,14 @@ struct ScalarBinaryOp : PyreOp<Derived> {
       const std::string& /*func_name*/, const OpContext& ctx) {
     double scalar_val = ctx.scalars[0].toDouble();
     auto out_shape = inferShapeIdentity(ctx);
-    // Scalar binary: generate as unary with embedded scalar constant.
-    std::string scalar_decl = "    %scalar = torch.constant.float " +
-        std::to_string(scalar_val);
-    if (scalar_val == static_cast<int64_t>(scalar_val))
-      scalar_decl = "    %scalar = torch.constant.int " +
-          std::to_string(static_cast<int64_t>(scalar_val));
-    std::string scalar_type = (scalar_val == static_cast<int64_t>(scalar_val))
-        ? "!torch.int" : "!torch.float";
+    bool is_int = std::isfinite(scalar_val) &&
+        scalar_val == static_cast<int64_t>(scalar_val);
+    std::string scalar_decl = is_int
+        ? "    %scalar = torch.constant.int " +
+              std::to_string(static_cast<int64_t>(scalar_val))
+        : "    %scalar = torch.constant.float " +
+              mlirFloatLiteral(scalar_val);
+    std::string scalar_type = is_int ? "!torch.int" : "!torch.float";
     std::string extra_decls = scalar_decl;
     std::string extra_args_str = Derived::extraArgs();
     std::string extra_types_str = Derived::extraArgTypes();
@@ -1038,7 +1053,7 @@ struct ReductionOp : PyreOp<Derived> {
       const at::Tensor& self, at::OptionalIntArrayRef dim,
       bool keepdim, std::optional<at::ScalarType>) {
     c10::SmallVector<int64_t, 6> dims;
-    if (dim.has_value())
+    if (dim.has_value() && !dim->empty())
       for (auto d : *dim) dims.push_back(d);
     else
       for (int64_t i = 0; i < self.dim(); ++i) dims.push_back(i);

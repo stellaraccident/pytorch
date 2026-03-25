@@ -22,49 +22,79 @@ std::string PyreKernelCache::cacheDir() const {
 }
 
 std::string PyreKernelCache::diskCachePath(const std::string& cache_key) const {
-  // cache_key is a 40-char SHA1 hex digest — filesystem-safe as-is.
   return cacheDir() + "/" + cache_key + ".vmfb";
 }
 
-CachedKernel* PyreKernelCache::lookup(
+PyreKernelCache::LookupResult PyreKernelCache::lookupOrClaim(
     const std::string& cache_key,
     const std::string& func_name,
     const AbiConfig& abi) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cache_.find(cache_key);
-    if (it != cache_.end()) {
-      PYRE_LOG(TRACE) << "cache hit (memory): " << cache_key << "\n";
-      return &it->second;
-    }
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // 1. Memory hit.
+  auto it = ready_.find(cache_key);
+  if (it != ready_.end()) {
+    PYRE_LOG(TRACE) << "cache hit (memory): " << cache_key << "\n";
+    std::promise<CachedKernel*> p;
+    p.set_value(&it->second);
+    return {p.get_future().share(), false};
   }
 
-  PYRE_LOG(TRACE) << "cache miss (memory): " << cache_key << "\n";
+  // 2. Already being compiled by another thread — wait on its future.
+  auto pit = pending_.find(cache_key);
+  if (pit != pending_.end()) {
+    PYRE_LOG(INFO) << "cache pending (waiting): " << cache_key << "\n";
+    return {pit->second->get_future().share(), false};
+  }
 
+  // 3. Disk hit — load, store in ready_, return immediately.
+  //    (loadFromDisk doesn't need the lock, but store does — keep it simple.)
   auto vmfb = loadFromDisk(cache_key);
   if (vmfb) {
     PYRE_LOG(INFO) << "cache hit (disk): " << cache_key << "\n";
-    return store(cache_key, func_name, std::move(vmfb), abi);
+    auto kernel = loadKernel(std::move(vmfb), func_name, abi);
+    auto [inserted_it, ok] = ready_.emplace(cache_key, std::move(kernel));
+    std::promise<CachedKernel*> p;
+    p.set_value(&inserted_it->second);
+    return {p.get_future().share(), false};
   }
 
-  return nullptr;
+  // 4. True miss — claim this key for compilation.
+  PYRE_LOG(INFO) << "cache MISS: " << cache_key << ", compiling\n";
+  auto promise = std::make_shared<std::promise<CachedKernel*>>();
+  pending_.emplace(cache_key, promise);
+  return {promise->get_future().share(), true};
 }
 
-CachedKernel* PyreKernelCache::store(
+void PyreKernelCache::fulfill(
     const std::string& cache_key,
-    const std::string& func_name,
     std::shared_ptr<CompilerOutput> vmfb,
+    const std::string& func_name,
     const AbiConfig& abi) {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto it = cache_.find(cache_key);
-  if (it != cache_.end()) return &it->second;
 
-  // Save to disk before loading (best-effort).
   saveToDisk(cache_key, *vmfb);
 
   auto kernel = loadKernel(std::move(vmfb), func_name, abi);
-  auto [inserted_it, ok] = cache_.emplace(cache_key, std::move(kernel));
-  return &inserted_it->second;
+  auto [it, ok] = ready_.emplace(cache_key, std::move(kernel));
+
+  auto pit = pending_.find(cache_key);
+  if (pit != pending_.end()) {
+    pit->second->set_value(&it->second);
+    pending_.erase(pit);
+  }
+}
+
+void PyreKernelCache::fail(
+    const std::string& cache_key,
+    std::exception_ptr ex) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto pit = pending_.find(cache_key);
+  if (pit != pending_.end()) {
+    pit->second->set_exception(ex);
+    pending_.erase(pit);
+  }
 }
 
 std::shared_ptr<CompilerOutput> PyreKernelCache::loadFromDisk(

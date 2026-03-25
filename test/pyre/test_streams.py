@@ -32,5 +32,38 @@ class TestStream(TestCase):
         self.assertEqual(result, torch.ones(4))
 
 
+class TestErrorRecovery(TestCase):
+    def test_dispatch_error_does_not_hang(self):
+        """A failed dispatch must not leave the timeline desynchronized."""
+        x = torch.randn(4, 4, device="host:0")
+        y = torch.randn(4, 4, device="host:0")
+
+        # Force a dispatch failure via incompatible types for a compiled op.
+        try:
+            # bool tensors aren't supported by most compiled ops
+            bad = torch.ones(4, 4, dtype=torch.bool, device="host:0")
+            _ = bad + x
+        except RuntimeError:
+            pass
+
+        # This MUST NOT hang — the timeline should be consistent.
+        z = x + y
+        expected = x.cpu() + y.cpu()
+        self.assertEqual(z.cpu(), expected)
+
+    def test_multiple_errors_recover(self):
+        """Multiple consecutive failures should all recover."""
+        x = torch.randn(4, device="host:0")
+        for _ in range(3):
+            try:
+                bad = torch.ones(4, dtype=torch.bool, device="host:0")
+                _ = bad + x
+            except RuntimeError:
+                pass
+        # Still works after repeated failures.
+        result = (x + x).cpu()
+        self.assertEqual(result, x.cpu() * 2)
+
+
 if __name__ == "__main__":
     run_tests()
