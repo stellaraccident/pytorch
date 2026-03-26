@@ -58,11 +58,10 @@ void PyreTensor::copyFrom(
 
 void PyreTensor::updateFromHost(
     const void* data, iree_device_size_t offset, iree_device_size_t length) {
-  // The IREE task command buffer stores update_buffer data inline in the
-  // arena (struct header + payload in one allocation). Default arena block
-  // is 32KB, so the 64KB IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE overflows.
-  // 16KB leaves headroom for the cmd struct header within a 32KB block.
-  static const iree_device_size_t kInlineUpdateMax = 16 * 1024;
+  // update_buffer stores data inline in the command buffer arena. The max
+  // depends on the block builder's block size — 2KB on the new local-task
+  // (block_builder.c). Use a conservative limit to stay within one block.
+  static const iree_device_size_t kInlineUpdateMax = 1024;
   if (length <= kInlineUpdateMax) {
     auto target_ref = iree_hal_make_buffer_ref(buffer(), offset, length);
     submitTransfer([&](iree_hal_command_buffer_t* cmd) {

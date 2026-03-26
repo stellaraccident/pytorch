@@ -117,9 +117,11 @@ DataPtr PyreStorageAllocator::allocate(size_t n) {
 
   void* ptr = nullptr;
   if (map_on_allocate_) {
-    // For HOST_LOCAL buffers, map immediately. On local-task, alloca
-    // completed synchronously so the buffer is ready. On GPU, HOST_LOCAL
-    // buffers are in host memory and immediately mappable.
+    // Wait for the alloca to commit the buffer before mapping.
+    // With async local-task, queue_alloca returns immediately but the
+    // buffer isn't committed until the signal semaphore fires.
+    PYRE_CHECK_OK(iree_hal_semaphore_wait(
+        sem, signal_value, iree_infinite_timeout(), 0));
     PYRE_CHECK_OK(iree_hal_buffer_map_range(
         buffer, IREE_HAL_MAPPING_MODE_SCOPED,
         IREE_HAL_MEMORY_ACCESS_ALL, 0,
