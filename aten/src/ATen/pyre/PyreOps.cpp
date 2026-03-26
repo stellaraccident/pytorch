@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <set>
+#include <unordered_map>
 
 namespace at::pyre {
 
@@ -260,6 +261,56 @@ CachedKernel* getOrCompile(
 
 
 // ---------------------------------------------------------------------------
+// Transient size query — TLS-cached per cache key
+// ---------------------------------------------------------------------------
+
+static iree_device_size_t queryTransientSize(
+    CachedKernel* kernel,
+    const AbiPacker& packer,
+    iree_allocator_t alloc) {
+  if (!kernel->has_transients_size) return 64;
+
+  // The _transients_size companion has the same signature as the main
+  // function. Pass null for transient/wait/signal — it's a pure query.
+  c10::pyre::vm_list_ptr args;
+  PYRE_CHECK_OK(iree_vm_list_create(
+      iree_vm_make_undefined_type_def(), 32, alloc, args.for_output()));
+  packer.packArgs(args.get(), /*transients=*/nullptr,
+                  /*wait=*/nullptr, /*signal=*/nullptr);
+
+  c10::pyre::vm_list_ptr rets;
+  PYRE_CHECK_OK(iree_vm_list_create(
+      iree_vm_make_undefined_type_def(), 1, alloc, rets.for_output()));
+
+  PYRE_CHECK_OK(iree_vm_invoke(
+      kernel->context.get(), kernel->transients_size_fn,
+      IREE_VM_INVOCATION_FLAG_NONE, nullptr,
+      args.get(), rets.get(), alloc));
+
+  iree_vm_value_t size_val;
+  PYRE_CHECK_OK(iree_vm_list_get_value(rets.get(), 0, &size_val));
+  auto size = static_cast<iree_device_size_t>(size_val.i64);
+  return size > 0 ? size : 64;  // minimum 64 bytes (non-null required)
+}
+
+static thread_local std::unordered_map<std::string, iree_device_size_t>
+    tls_transient_size_cache;
+
+static iree_device_size_t getTransientSize(
+    CachedKernel* kernel,
+    const AbiPacker& packer,
+    const std::string& cache_key,
+    iree_allocator_t alloc) {
+  auto it = tls_transient_size_cache.find(cache_key);
+  if (it != tls_transient_size_cache.end()) return it->second;
+
+  iree_device_size_t size = queryTransientSize(kernel, packer, alloc);
+  PYRE_LOG(INFO) << "transient size for " << cache_key << ": " << size << "\n";
+  tls_transient_size_cache[cache_key] = size;
+  return size;
+}
+
+// ---------------------------------------------------------------------------
 // Envelope dispatch: AbiPacker-based invocation
 // ---------------------------------------------------------------------------
 
@@ -267,17 +318,56 @@ void invokeEnvelope(
     CachedKernel* kernel,
     const AbiPacker& packer,
     c10::ArrayRef<at::Tensor> inputs,
-    at::Tensor& output) {
+    at::Tensor& output,
+    const std::string& cache_key) {
   auto& runtime = c10::pyre::PyreRuntime::get();
   auto alloc = runtime.hostAllocator();
 
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
   auto& stream_ctx = stream.context();
 
-  // Build wait fence. Always include the stream's current timepoint to
-  // enforce serial ordering on the timeline — without this, two dispatches
-  // on disjoint buffers can complete out of order, and the earlier signal
-  // becomes illegal ("semaphore already signaled past N").
+  // Flush pending native ops (fill/copy) before VM invoke — the VM
+  // manages its own command buffers internally, so we must submit any
+  // buffered HAL commands first to maintain timeline ordering.
+  stream.flush();
+
+  // Allocate transient workspace first — queue_alloca advances the
+  // timepoint, and the wait fence must include the post-alloca timepoint.
+  // queue_alloca advances the timepoint; the signal fence must come after.
+  auto* device = c10::pyre::PyreDevice::get(0);
+  c10::pyre::hal_buffer_ptr transient_buf;
+  {
+    iree_device_size_t transient_size =
+        getTransientSize(kernel, packer, cache_key, alloc);
+
+    iree_hal_buffer_params_t params = {};
+    params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE;
+    params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+    params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL
+                | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+
+    uint64_t alloca_wait = stream_ctx.timepoint;
+    auto* alloca_sem = stream_ctx.timeline.get();
+    iree_hal_semaphore_list_t alloca_wait_list = {
+        .count = (alloca_wait > 0) ? 1u : 0u,
+        .semaphores = &alloca_sem,
+        .payload_values = &alloca_wait};
+    uint64_t alloca_signal = ++stream_ctx.timepoint;
+    iree_hal_semaphore_list_t alloca_signal_list = {
+        .count = 1, .semaphores = &alloca_sem,
+        .payload_values = &alloca_signal};
+
+    PYRE_CHECK_OK(iree_hal_device_queue_alloca(
+        device->halDevice(), stream_ctx.affinity,
+        alloca_wait_list, alloca_signal_list,
+        IREE_HAL_ALLOCATOR_POOL_DEFAULT,
+        params, transient_size,
+        IREE_HAL_ALLOCA_FLAG_NONE,
+        transient_buf.for_output()));
+  }
+
+  // Build wait fence. Include the stream's current timepoint (which now
+  // includes the transient alloca signal) to enforce serial ordering.
   c10::pyre::hal_fence_ptr wait;
   PYRE_CHECK_OK(iree_hal_fence_create(
       static_cast<iree_host_size_t>(inputs.size() + 3), alloc,
@@ -317,29 +407,6 @@ void invokeEnvelope(
   PYRE_CHECK_OK(iree_vm_list_create(
       iree_vm_make_undefined_type_def(), arg_count, alloc,
       args.for_output()));
-
-  // Allocate a minimal transient buffer. The envelope's hal.tensor.transients
-  // annotation requires a non-null buffer even if no transient space is needed.
-  // The compiler's _transients_size companion returns the actual requirement.
-  auto* device = c10::pyre::PyreDevice::get(0);
-  c10::pyre::hal_buffer_ptr transient_buf;
-  {
-    iree_hal_buffer_params_t params = {};
-    params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE;
-    params.access = IREE_HAL_MEMORY_ACCESS_ALL;
-    params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL
-                | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
-    // HACK(pyre-workspace-ijr.5): Allocate a fixed transient buffer instead
-    // of calling the _transients_size companion function. T5 (transient cache)
-    // will query the actual size and TLS-cache the result.
-    iree_device_size_t transient_size = 64;
-    if (kernel->has_transients_size) {
-      transient_size = 1024 * 1024;  // 1MB default
-    }
-    PYRE_CHECK_OK(iree_hal_allocator_allocate_buffer(
-        device->allocator(), params, transient_size,
-        transient_buf.for_output()));
-  }
 
   packer.packArgs(args, transient_buf, wait, signal);
 
@@ -500,7 +567,7 @@ at::Tensor dispatchMultiDimReduction(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self}, out);
+  invokeEnvelope(kernel, packer, {visit_self}, out, cache_key);
   return out;
 }
 
@@ -556,7 +623,7 @@ at::Tensor dispatchSingleDimReduction(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self}, out);
+  invokeEnvelope(kernel, packer, {visit_self}, out, cache_key);
   return out;
 }
 
@@ -612,7 +679,7 @@ at::Tensor EmbeddingOp::impl(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_weight, visit_indices}, out);
+  invokeEnvelope(kernel, packer, {visit_weight, visit_indices}, out, cache_key);
   return out;
 }
 
@@ -665,7 +732,7 @@ at::Tensor IndexSelectOp::impl(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self, visit_index}, out);
+  invokeEnvelope(kernel, packer, {visit_self, visit_index}, out, cache_key);
   return out;
 }
 
@@ -717,7 +784,7 @@ at::Tensor GatherOp::impl(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self, visit_index}, out);
+  invokeEnvelope(kernel, packer, {visit_self, visit_index}, out, cache_key);
   return out;
 }
 
@@ -763,7 +830,7 @@ static at::Tensor dispatchSoftmax(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self}, out);
+  invokeEnvelope(kernel, packer, {visit_self}, out, cache_key);
   return out;
 }
 
@@ -827,7 +894,7 @@ static at::Tensor dispatchScatterSrc(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self, visit_index, visit_src}, out);
+  invokeEnvelope(kernel, packer, {visit_self, visit_index, visit_src}, out, cache_key);
   return out;
 }
 
@@ -870,7 +937,7 @@ at::Tensor& ScatterSrcOp::impl_inplace(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {self, index, src}, self);
+  invokeEnvelope(kernel, packer, {self, index, src}, self, cache_key);
   return self;
 }
 
@@ -924,7 +991,7 @@ static at::Tensor dispatchScatterAdd(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self, visit_index, visit_src}, out);
+  invokeEnvelope(kernel, packer, {visit_self, visit_index, visit_src}, out, cache_key);
   return out;
 }
 
@@ -967,7 +1034,7 @@ at::Tensor& ScatterAddOp::impl_inplace(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {self, index, src}, self);
+  invokeEnvelope(kernel, packer, {self, index, src}, self, cache_key);
   return self;
 }
 
@@ -1144,7 +1211,7 @@ static at::Tensor dispatchIndexPut(
   for (const auto& [dim, idx] : non_none) inputs.push_back(idx);
   inputs.push_back(v_values);
 
-  invokeEnvelope(kernel, packer, inputs, out);
+  invokeEnvelope(kernel, packer, inputs, out, cache_key);
   return out;
 }
 
@@ -1202,7 +1269,7 @@ at::Tensor& IndexPutOp::impl_inplace(
   for (const auto& [dim, idx] : non_none) inputs.push_back(idx);
   inputs.push_back(v_values);
 
-  invokeEnvelope(kernel, packer, inputs, self);
+  invokeEnvelope(kernel, packer, inputs, self, cache_key);
   return self;
 }
 
@@ -1343,7 +1410,7 @@ at::Tensor IndexTensorOp::impl(
   inputs.push_back(self_effective);
   for (const auto& [dim, idx] : non_none) inputs.push_back(idx);
 
-  invokeEnvelope(kernel, packer, inputs, out);
+  invokeEnvelope(kernel, packer, inputs, out, cache_key);
   return out;
 }
 
@@ -1395,7 +1462,7 @@ at::Tensor ArangeOp::impl(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {}, out);
+  invokeEnvelope(kernel, packer, {}, out, cache_key);
   return out;
 }
 
@@ -1448,7 +1515,7 @@ at::Tensor TypeCastOp::impl(
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, {visit_self}, out);
+  invokeEnvelope(kernel, packer, {visit_self}, out, cache_key);
   return out;
 }
 
@@ -1550,7 +1617,7 @@ at::Tensor CatOp::impl(const at::ITensorListRef& tensors, int64_t dim) {
     return gen.generateModule(func_name, body);
   });
 
-  invokeEnvelope(kernel, packer, visit_tensors, out);
+  invokeEnvelope(kernel, packer, visit_tensors, out, cache_key);
   return out;
 }
 

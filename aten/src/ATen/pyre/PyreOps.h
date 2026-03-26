@@ -119,7 +119,8 @@ void invokeEnvelope(
     CachedKernel* kernel,
     const AbiPacker& packer,
     c10::ArrayRef<at::Tensor> inputs,
-    at::Tensor& output);
+    at::Tensor& output,
+    const std::string& cache_key);
 
 // ---------------------------------------------------------------------------
 // CRTP base
@@ -204,7 +205,7 @@ struct PyreOp {
       return gen.generateModule(func_name, body);
     });
 
-    invokeEnvelope(kernel, packer, visit_inputs, self);
+    invokeEnvelope(kernel, packer, visit_inputs, self, cache_key);
     return self;
   }
 
@@ -279,7 +280,7 @@ struct PyreOp {
       return gen.generateModule(func_name, body);
     });
 
-    invokeEnvelope(kernel, packer, visit_inputs, out);
+    invokeEnvelope(kernel, packer, visit_inputs, out, cache_key);
     return out;
   }
 

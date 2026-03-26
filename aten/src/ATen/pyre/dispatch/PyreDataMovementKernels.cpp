@@ -80,6 +80,8 @@ static void invokeNative(
     at::Tensor& output) {
   auto alloc = c10::pyre::PyreRuntime::get().hostAllocator();
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  // Flush pending native ops before VM invoke.
+  stream.flush();
   auto& stream_ctx = stream.context();
 
   c10::pyre::vm_list_ptr args;

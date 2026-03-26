@@ -99,8 +99,34 @@ StreamId PyreDevice::getStreamFromPool(bool high_priority) {
 }
 
 void PyreDevice::syncAllStreams() {
-  auto sync_ctx = [](PyreStreamContext& ctx) {
-    if (ctx.initialized() && ctx.timepoint > 0) {
+  auto flush_and_sync = [this](PyreStreamContext& ctx) {
+    if (!ctx.initialized()) return;
+    // Flush any pending command buffer before waiting.
+    if (ctx.hasPending()) {
+      // Build a temporary PyreStream to flush. We need the Stream value
+      // type — use DEFAULT since we're operating directly on the context.
+      // The flush path only needs device_index to find the PyreDevice,
+      // and we already have it (this).
+      pyre_log_status(
+          iree_hal_command_buffer_end(ctx.active_cb.get()),
+          "ending pending CB during device sync");
+      auto* sem = ctx.timeline.get();
+      uint64_t signal_value = ++ctx.timepoint;
+      iree_hal_semaphore_list_t signal_list = {
+          .count = 1, .semaphores = &sem, .payload_values = &signal_value};
+      pyre_log_status(
+          iree_hal_device_queue_execute(
+              device_, ctx.affinity,
+              iree_hal_fence_semaphore_list(ctx.active_deps.get()),
+              signal_list,
+              ctx.active_cb.get(),
+              iree_hal_buffer_binding_table_empty(),
+              IREE_HAL_EXECUTE_FLAG_NONE),
+          "flushing pending CB during device sync");
+      ctx.active_cb.reset();
+      ctx.active_deps.reset();
+    }
+    if (ctx.timepoint > 0) {
       pyre_log_status(
           iree_hal_semaphore_wait(
               ctx.timeline.get(), ctx.timepoint,
@@ -109,9 +135,9 @@ void PyreDevice::syncAllStreams() {
     }
   };
 
-  sync_ctx(default_stream_);
-  for (auto& ctx : low_priority_streams_) sync_ctx(ctx);
-  for (auto& ctx : high_priority_streams_) sync_ctx(ctx);
+  flush_and_sync(default_stream_);
+  for (auto& ctx : low_priority_streams_) flush_and_sync(ctx);
+  for (auto& ctx : high_priority_streams_) flush_and_sync(ctx);
 }
 
 PyreDevice* PyreDevice::get(DeviceIndex index) {

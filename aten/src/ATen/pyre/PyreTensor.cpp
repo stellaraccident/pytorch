@@ -2,7 +2,6 @@
 #include <ATen/pyre/dispatch/PyreTypeMapping.h>
 #include <c10/pyre/impl/PyreRuntime.h>
 
-#include <algorithm>
 #include <cstring>
 
 namespace at::pyre {
@@ -17,37 +16,14 @@ PyreTensor::PyreTensor(const at::Tensor& tensor)
 
 void PyreTensor::submitTransfer(
     const std::function<void(iree_hal_command_buffer_t*)>& record_fn) {
-  auto* hal_device = device_->halDevice();
-
-  iree_hal_command_buffer_t* cmd = nullptr;
-  PYRE_CHECK_OK(iree_hal_command_buffer_create(
-      hal_device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
-      IREE_HAL_COMMAND_CATEGORY_TRANSFER, IREE_HAL_QUEUE_AFFINITY_ANY,
-      0, &cmd));
-
-  PYRE_CHECK_OK(iree_hal_command_buffer_begin(cmd));
-  record_fn(cmd);
-  PYRE_CHECK_OK(iree_hal_command_buffer_end(cmd));
-
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
-  auto& ctx = stream.context();
-  auto* sem = ctx.timeline.get();
 
-  uint64_t wait_value = ctx.timepoint;
-  uint64_t signal_value = stream.advance();
+  // Record into the stream's pending command buffer.
+  auto* cmd = stream.getOrCreateCB(IREE_HAL_COMMAND_CATEGORY_TRANSFER);
+  record_fn(cmd);
 
-  iree_hal_semaphore_list_t wait_list = {
-      .count = 1, .semaphores = &sem, .payload_values = &wait_value};
-  iree_hal_semaphore_list_t signal_list = {
-      .count = 1, .semaphores = &sem, .payload_values = &signal_value};
-
-  PYRE_CHECK_OK(iree_hal_device_queue_execute(
-      hal_device, IREE_HAL_QUEUE_AFFINITY_ANY,
-      wait_list, signal_list, cmd,
-      iree_hal_buffer_binding_table_empty(),
-      IREE_HAL_EXECUTE_FLAG_NONE));
-
-  iree_hal_command_buffer_release(cmd);
+  // EAGER mode: flush immediately.
+  stream.flushIfEager();
 }
 
 void PyreTensor::fill(
@@ -179,8 +155,9 @@ void executeCopyPlan(
       cmds.data(),
       &cmd_buf));
 
-  // Submit with timeline semaphore.
+  // Flush pending CB to maintain ordering, then submit.
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  stream.flush();
   auto& ctx = stream.context();
   auto* sem = ctx.timeline.get();
   uint64_t wait_value = ctx.timepoint;

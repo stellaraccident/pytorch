@@ -62,6 +62,7 @@ class AbiPacker {
       iree_hal_fence_t* wait,
       iree_hal_fence_t* signal) const;
 
+
   // Access the recorded slots (for AbiGenerator to use matching analysis).
   c10::ArrayRef<TensorSlot> slots() const { return slots_; }
 
