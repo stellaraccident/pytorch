@@ -370,7 +370,7 @@ at::Tensor pyre_matmul(const at::Tensor& self, const at::Tensor& other) {
       return gen.generateModule(func_name, body);
     });
 
-    invokeEnvelope(kernel, packer, {self, other}, out);
+    invokeEnvelope(kernel, packer, {self, other}, out, cache_key);
     return out;
   }
   TORCH_CHECK(false, "pyre: matmul not yet supported for ",
