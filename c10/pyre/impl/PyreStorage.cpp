@@ -35,61 +35,18 @@ PyreBufferContext::~PyreBufferContext() {
     iree_hal_buffer_unmap_range(&mapping);
   }
 
-  // Check if this buffer was allocated via queue_alloca.
-  iree_hal_buffer_placement_t placement =
-      iree_hal_buffer_allocation_placement(buffer.get());
-
-  if (iree_all_bits_set(placement.flags,
-      IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS) && device) {
-    // Stream-ordered deallocation: non-blocking.
-    auto* hal_device = device->halDevice();
-    auto alloc = PyreRuntime::get().hostAllocator();
-
-    // Build wait fence from use entries.
-    iree_hal_fence_t* wait_fence = nullptr;
-    iree_status_t status = iree_hal_fence_create(
-        static_cast<iree_host_size_t>(use_entries.size() + 1),
-        alloc, &wait_fence);
-    if (iree_status_is_ok(status)) {
-      for (auto& entry : use_entries) {
-        iree_hal_fence_insert(wait_fence, entry.sem, entry.timepoint);
-      }
-
-      // Signal on default stream — deallocation is not latency-sensitive.
-      auto& default_ctx = device->defaultStream();
-      uint64_t signal_value = ++default_ctx.timepoint;
-      auto* sem = default_ctx.timeline.get();
-      iree_hal_semaphore_list_t signal_list = {
-          .count = 1, .semaphores = &sem, .payload_values = &signal_value};
-
-      status = iree_hal_device_queue_dealloca(
-          hal_device,
-          IREE_HAL_QUEUE_AFFINITY_ANY,
-          iree_hal_fence_semaphore_list(wait_fence),
-          signal_list,
-          buffer.get(),
-          IREE_HAL_DEALLOCA_FLAG_NONE);
-      iree_hal_fence_release(wait_fence);
-    }
-
-    if (!iree_status_is_ok(status)) {
-      // Fallback: synchronous wait + release.
-      pyre_log_status(status, "queue_dealloca failed, falling back");
-      for (auto& entry : use_entries) {
+  // Synchronous wait on all pending uses before releasing.
+  // queue_dealloca is deferred to GPU backends with true async dealloc —
+  // on local-task it's synchronous anyway, and advancing the timeline
+  // from destructors (which fire at GC time, potentially mid-dispatch)
+  // corrupts the timeline ordering.
+  for (auto& entry : use_entries) {
+    pyre_log_status(
         iree_hal_semaphore_wait(
-            entry.sem, entry.timepoint, iree_infinite_timeout(), 0);
-      }
-    }
-  } else {
-    // Synchronous fallback for non-async buffers.
-    for (auto& entry : use_entries) {
-      pyre_log_status(
-          iree_hal_semaphore_wait(
-              entry.sem, entry.timepoint, iree_infinite_timeout(), 0),
-          "waiting on buffer use barrier in destructor");
-    }
+            entry.sem, entry.timepoint, iree_infinite_timeout(), 0),
+        "waiting on buffer use barrier in destructor");
   }
-  // buffer released by hal_buffer_ptr destructor after dealloca queued.
+  // buffer released by hal_buffer_ptr destructor
 }
 
 // --- PyreStorageAllocator ---

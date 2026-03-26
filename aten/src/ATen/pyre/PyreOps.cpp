@@ -301,12 +301,20 @@ static iree_device_size_t getTransientSize(
     const AbiPacker& packer,
     const std::string& cache_key,
     iree_allocator_t alloc) {
-  auto it = tls_transient_size_cache.find(cache_key);
+  // The transient size depends on actual dim values, not just the dim pattern
+  // in cache_key. Build a size-specific key by appending dynamic dims.
+  std::string size_key = cache_key;
+  for (int64_t d : packer.dynamicDims()) {
+    size_key += ':';
+    size_key += std::to_string(d);
+  }
+
+  auto it = tls_transient_size_cache.find(size_key);
   if (it != tls_transient_size_cache.end()) return it->second;
 
   iree_device_size_t size = queryTransientSize(kernel, packer, alloc);
-  PYRE_LOG(INFO) << "transient size for " << cache_key << ": " << size << "\n";
-  tls_transient_size_cache[cache_key] = size;
+  PYRE_LOG(INFO) << "transient size for " << size_key << ": " << size << "\n";
+  tls_transient_size_cache[size_key] = size;
   return size;
 }
 
@@ -331,9 +339,7 @@ void invokeEnvelope(
   // buffered HAL commands first to maintain timeline ordering.
   stream.flush();
 
-  // Allocate transient workspace first — queue_alloca advances the
-  // timepoint, and the wait fence must include the post-alloca timepoint.
-  // queue_alloca advances the timepoint; the signal fence must come after.
+  // Allocate transient workspace via queue_alloca before building fences.
   auto* device = c10::pyre::PyreDevice::get(0);
   c10::pyre::hal_buffer_ptr transient_buf;
   {
