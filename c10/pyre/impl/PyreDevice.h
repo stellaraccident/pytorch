@@ -6,8 +6,6 @@
 // Each accessible device gets its own instance with independent stream
 // contexts. The PyreRuntime singleton manages the collection of devices.
 
-#include <iree/hal/api.h>
-
 #include <c10/core/Device.h>
 #include <c10/core/ScalarType.h>
 #include <c10/macros/Export.h>
@@ -40,16 +38,15 @@ class C10_PYRE_API DeviceCapabilities {
 
 class C10_PYRE_API PyreDevice {
  public:
-  PyreDevice(iree_hal_device_t* device, iree_hal_driver_t* driver);
+  explicit PyreDevice(pyre_device_t device);
   ~PyreDevice();
 
   PyreDevice(const PyreDevice&) = delete;
   PyreDevice& operator=(const PyreDevice&) = delete;
 
   // HAL access
-  iree_hal_device_t* halDevice() const { return device_; }
-  iree_hal_allocator_t* allocator() const { return allocator_; }
-  iree_hal_driver_t* driver() const { return driver_; }
+  pyre_device_t handle() const { return device_.get(); }
+  pyre_allocator_t allocator() const { return allocator_; }
 
   // Compiler capabilities for this device.
   const DeviceCapabilities& capabilities() const { return capabilities_; }
@@ -64,9 +61,8 @@ class C10_PYRE_API PyreDevice {
   static int32_t deviceCount();
 
  private:
-  iree_hal_device_t* device_;
-  iree_hal_driver_t* driver_;           // borrowed from runtime
-  iree_hal_allocator_t* allocator_;     // borrowed from device
+  device_ptr device_;
+  pyre_allocator_t allocator_;          // borrowed from device
   DeviceCapabilities capabilities_;
 
   // Stream pool

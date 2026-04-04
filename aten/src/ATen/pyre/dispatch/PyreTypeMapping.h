@@ -1,9 +1,9 @@
 #pragma once
 
 // Centralized dtype mapping between PyTorch ScalarType, torch-mlir MLIR types,
-// and IREE HAL element types.
+// and pyre buffer-view element types.
 
-#include <iree/hal/api.h>
+#include <pyre_runtime.h>
 
 #include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>
@@ -29,19 +29,19 @@ inline const char* scalarTypeToTorchMlir(c10::ScalarType dtype) {
   }
 }
 
-// PyTorch ScalarType → IREE HAL element type.
-inline iree_hal_element_type_t scalarTypeToHalElement(c10::ScalarType dtype) {
+// PyTorch ScalarType → pyre buffer-view element type.
+inline pyre_element_type_t scalarTypeToHalElement(c10::ScalarType dtype) {
   switch (dtype) {
-    case c10::ScalarType::Float: return IREE_HAL_ELEMENT_TYPE_FLOAT_32;
-    case c10::ScalarType::Double: return IREE_HAL_ELEMENT_TYPE_FLOAT_64;
-    case c10::ScalarType::Half: return IREE_HAL_ELEMENT_TYPE_FLOAT_16;
-    case c10::ScalarType::BFloat16: return IREE_HAL_ELEMENT_TYPE_BFLOAT_16;
-    case c10::ScalarType::Int: return IREE_HAL_ELEMENT_TYPE_INT_32;
-    case c10::ScalarType::Long: return IREE_HAL_ELEMENT_TYPE_INT_64;
-    case c10::ScalarType::Short: return IREE_HAL_ELEMENT_TYPE_INT_16;
-    case c10::ScalarType::Byte: return IREE_HAL_ELEMENT_TYPE_UINT_8;
-    case c10::ScalarType::Char: return IREE_HAL_ELEMENT_TYPE_SINT_8;
-    case c10::ScalarType::Bool: return IREE_HAL_ELEMENT_TYPE_BOOL_8;
+    case c10::ScalarType::Float: return PYRE_ELEMENT_TYPE_FLOAT_32;
+    case c10::ScalarType::Double: return PYRE_ELEMENT_TYPE_FLOAT_64;
+    case c10::ScalarType::Half: return PYRE_ELEMENT_TYPE_FLOAT_16;
+    case c10::ScalarType::BFloat16: return PYRE_ELEMENT_TYPE_BFLOAT_16;
+    case c10::ScalarType::Int: return PYRE_ELEMENT_TYPE_INT_32;
+    case c10::ScalarType::Long: return PYRE_ELEMENT_TYPE_INT_64;
+    case c10::ScalarType::Short: return PYRE_ELEMENT_TYPE_INT_16;
+    case c10::ScalarType::Byte: return PYRE_ELEMENT_TYPE_UINT_8;
+    case c10::ScalarType::Char: return PYRE_ELEMENT_TYPE_SINT_8;
+    case c10::ScalarType::Bool: return PYRE_ELEMENT_TYPE_BOOL_8;
     default:
       TORCH_CHECK(false, "pyre: unsupported dtype for HAL: ",
                   c10::toString(dtype));

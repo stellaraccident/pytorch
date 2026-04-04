@@ -10,8 +10,6 @@
 // and work executes on a task pool. Streams provide ordered execution
 // via timeline semaphores.
 
-#include <iree/hal/api.h>
-
 #include <c10/core/DeviceType.h>
 #include <c10/core/Stream.h>
 #include <c10/macros/Export.h>
@@ -25,18 +23,12 @@ namespace c10::pyre {
 // command buffer for batching native HAL operations.
 // Owned by PyreDevice in its stream pool.
 struct PyreStreamContext {
-  hal_semaphore_ptr timeline;
+  stream_ptr stream;
+  semaphore_ptr timeline;
   uint64_t timepoint = 0;
-  iree_hal_queue_affinity_t affinity = IREE_HAL_QUEUE_AFFINITY_ANY;
+  pyre_queue_affinity_t affinity = 0;
 
-  // Pending command buffer — accumulates native HAL commands (fill, copy,
-  // transfer) between flushes. Null when idle.
-  hal_command_buffer_ptr active_cb;
-  hal_fence_ptr active_deps;
-  iree_hal_command_category_t active_category = IREE_HAL_COMMAND_CATEGORY_ANY;
-
-  bool initialized() const { return static_cast<bool>(timeline); }
-  bool hasPending() const { return static_cast<bool>(active_cb); }
+  bool initialized() const { return static_cast<bool>(stream); }
 };
 
 // StreamId encoding — matches the CUDA/OpenReg pattern.
@@ -85,17 +77,11 @@ class C10_PYRE_API PyreStream {
 
   PyreStreamContext& context() const;
 
-  iree_hal_semaphore_t* timeline() const { return context().timeline.get(); }
-  uint64_t timepoint() const { return context().timepoint; }
-  uint64_t advance() { return ++context().timepoint; }
+  pyre_stream_t handle() const { return context().stream.get(); }
+  pyre_semaphore_t timeline() const { return context().timeline.get(); }
+  uint64_t timepoint() const;
+  uint64_t advance();
   void synchronize() const;
-
-  // Get or create a pending command buffer for the given category.
-  // If a pending CB exists with a different category, flushes first.
-  // Merges deps into the accumulated wait fence.
-  iree_hal_command_buffer_t* getOrCreateCB(
-      iree_hal_command_category_t category,
-      iree_hal_fence_t* deps = nullptr);
 
   // Flush the pending command buffer: end, queue_execute, reset.
   // No-op if no pending CB. Advances the timeline. Returns signal timepoint.
@@ -108,6 +94,8 @@ class C10_PYRE_API PyreStream {
   DeviceIndex device_index() const { return stream_.device_index(); }
 
  private:
+  void refreshTimeline() const;
+
   Stream stream_;
 };
 

@@ -23,7 +23,6 @@
 #include <c10/pyre/impl/PyreDevice.h>
 #include <c10/pyre/impl/PyreStream.h>
 
-#include <iree/hal/fence.h>
 #include <torch/library.h>
 
 #include <ATen/pyre/PyreUtils.h>
@@ -102,13 +101,15 @@ CachedKernel* getOrCompile(
 // stays consistent if any exception escapes after the timepoint is
 // incremented — without this, a failed dispatch hangs every subsequent op.
 struct FenceGuard {
-  iree_hal_fence_t* fence;
+  pyre_fence_t fence;
   bool armed = true;
-  explicit FenceGuard(iree_hal_fence_t* f) : fence(f) {}
+  explicit FenceGuard(pyre_fence_t f) : fence(f) {}
   ~FenceGuard() {
     if (!fence) return;
-    if (armed) iree_hal_fence_signal(fence);
-    iree_hal_fence_release(fence);
+    if (armed) c10::pyre::pyre_log_status(
+        pyre_fence_signal(fence),
+        "signaling fence after failed dispatch");
+    pyre_fence_release(fence);
   }
   void disarm() { armed = false; }
 };

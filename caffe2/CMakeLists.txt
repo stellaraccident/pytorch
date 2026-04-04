@@ -1281,7 +1281,6 @@ if(USE_PYRE)
     COMMENT "Generating PyreKernelTemplates.inc"
   )
   add_custom_target(pyre_templates DEPENDS ${PYRE_TEMPLATES_INC})
-
   add_library(torch_pyre ${Caffe2_PYRE_SRCS})
   add_dependencies(torch_pyre pyre_templates)
   torch_compile_options(torch_pyre)
@@ -1759,13 +1758,10 @@ endif()
 
 # ---[ Pyre library.
 if(USE_PYRE)
-  target_link_libraries(torch_pyre PUBLIC c10_pyre)
-  target_link_libraries(torch_pyre PRIVATE ${Caffe2_PYRE_DEPENDENCY_LIBS})
+  target_link_libraries(torch_pyre PUBLIC c10_pyre pyre::pyre)
 
   target_include_directories(
     torch_pyre INTERFACE $<INSTALL_INTERFACE:include>)
-  target_include_directories(
-    torch_pyre PRIVATE ${Caffe2_PYRE_INCLUDE})
 
   add_dependencies(torch_pyre torch_cpu)
 

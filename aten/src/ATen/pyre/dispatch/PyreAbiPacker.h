@@ -17,9 +17,6 @@
 #include <c10/util/SmallVector.h>
 #include <c10/util/hash.h>
 
-#include <iree/hal/api.h>
-#include <iree/vm/api.h>
-
 #include <cstdint>
 #include <string>
 
@@ -57,10 +54,10 @@ class AbiPacker {
   // Pack args into VM list for dispatch (envelope calling convention).
   // Order: [bufs..., offsets..., dims..., out_bufs..., transients, wait, signal]
   void packArgs(
-      iree_vm_list_t* args,
-      iree_hal_buffer_t* transients,
-      iree_hal_fence_t* wait,
-      iree_hal_fence_t* signal) const;
+      pyre_value_list_t args,
+      pyre_buffer_t transients,
+      pyre_fence_t wait,
+      pyre_fence_t signal) const;
 
   // Access the recorded slots (for AbiGenerator to use matching analysis).
   c10::ArrayRef<TensorSlot> slots() const { return slots_; }
@@ -86,10 +83,10 @@ class AbiPacker {
   // Shared visit logic for input and output.
   void visitTensor(const at::Tensor& t, bool is_output);
 
-  // Storage dedup: StorageImpl* → (buffer index, iree_hal_buffer_t*).
+  // Storage dedup: StorageImpl* → (buffer index, pyre_buffer_t).
   struct UniqueBuffer {
     c10::StorageImpl* storage;
-    iree_hal_buffer_t* buffer;  // non-owning
+    pyre_buffer_t buffer;       // non-owning
     int64_t total_elements;     // total elements in the allocation
   };
   c10::SmallVector<UniqueBuffer, 4> unique_bufs_;

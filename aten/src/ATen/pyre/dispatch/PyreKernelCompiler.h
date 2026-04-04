@@ -1,15 +1,13 @@
 #pragma once
 
-// IREE compiler wrapper: MLIR → VMFB compilation with two backends.
+// Pyre graph compiler wrapper: MLIR -> VMFB compilation via libpyre.
 //
-// PYRE_IREE_COMPILE     — Path to iree-compile CLI (debug/dev)
-// PYRE_IREE_COMPILER_LIB — Path to libIREECompiler.so (dlopen, production)
+// PYRE_IREE_COMPILE      — Path to libIREECompiler.so (dlopen, production)
+// PYRE_IREE_COMPILER_CLI — Path to iree-compile CLI (debug/dev fallback)
 //
-// CompilerOutput owns the resulting VMFB with alignment guarantees.
+// CompilerOutput owns the resulting VMFB bytes.
 // CompilerResult carries either a CompilerOutput or an error message.
 // compile() returns a shared_future<CompilerResult>.
-
-#include <iree/io/file_contents.h>
 
 #include <c10/macros/Export.h>
 #include <c10/pyre/impl/PyreHelpers.h>
@@ -32,37 +30,28 @@ class CompilerOutput {
   virtual ~CompilerOutput() = default;
   virtual const uint8_t* data() const = 0;
   virtual size_t size() const = 0;
-
-  iree_const_byte_span_t span() const {
-    return {data(), static_cast<iree_host_size_t>(size())};
-  }
-
-  // Transfer ownership of this output to an iree_allocator_t.
-  // The allocator's free calls delete on this CompilerOutput.
-  // After calling, do NOT delete the CompilerOutput separately.
-  iree_allocator_t transferDeallocator();
-
- private:
-  static iree_status_t deallocator_ctl(
-      void* self, iree_allocator_command_t command,
-      const void* params, void** inout_ptr);
+  virtual void loadInto(pyre_device_t device, pyre_module_t* module) const = 0;
 };
 
-// CompilerOutput backed by iree_io_file_contents_t (page-aligned).
+// CompilerOutput backed by pyre host allocator memory (page-aligned).
 class FileContentsOutput final : public CompilerOutput {
  public:
   static std::unique_ptr<FileContentsOutput> fromBytes(
-      const uint8_t* bytes, size_t len, iree_allocator_t alloc);
+      const uint8_t* bytes, size_t len, pyre_host_allocator_t alloc);
   static std::unique_ptr<FileContentsOutput> fromFile(
-      const std::string& path, iree_allocator_t alloc);
+      const std::string& path, pyre_host_allocator_t alloc);
 
   ~FileContentsOutput() override;
   const uint8_t* data() const override;
   size_t size() const override;
+  void loadInto(pyre_device_t device, pyre_module_t* module) const override;
 
  private:
-  explicit FileContentsOutput(iree_io_file_contents_t* contents);
-  iree_io_file_contents_t* contents_;
+  FileContentsOutput(
+      pyre_host_allocator_t allocator, uint8_t* data, size_t size);
+  pyre_host_allocator_t allocator_;
+  uint8_t* data_;
+  size_t size_;
 };
 
 // Result of a compilation attempt.
@@ -74,7 +63,7 @@ struct CompilerResult {
   bool ok() const { return output != nullptr; }
 };
 
-class TORCH_PYRE_API PyreKernelCompiler {
+class TORCH_PYRE_API PyreGraphCompiler {
  public:
   static bool initialize();
   static bool isAvailable();
@@ -92,15 +81,12 @@ class TORCH_PYRE_API PyreKernelCompiler {
  private:
   static std::once_flag init_flag_;
   static bool available_;
-  static bool use_cli_;
-  static std::string cli_path_;
-  static bool compiler_lib_loaded_;
 
   static void doInitialize();
-  static CompilerResult compileCLI(
-      const std::string& mlir_asm, const std::vector<std::string>& flags);
-  static CompilerResult compileCAPI(
+  static CompilerResult compileGraph(
       const std::string& mlir_asm, const std::vector<std::string>& flags);
 };
+
+using PyreKernelCompiler = PyreGraphCompiler;
 
 } // namespace at::pyre

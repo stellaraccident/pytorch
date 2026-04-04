@@ -145,25 +145,25 @@ class TestKernelCompilerInit(TestCase):
         # These env var names are part of the public interface.
         # We just verify they don't crash if set to garbage.
         old_compile = os.environ.get("PYRE_IREE_COMPILE")
-        old_lib = os.environ.get("PYRE_IREE_COMPILER_LIB")
+        old_cli = os.environ.get("PYRE_IREE_COMPILER_CLI")
         try:
-            os.environ["PYRE_IREE_COMPILE"] = "/nonexistent/iree-compile"
-            os.environ["PYRE_IREE_COMPILER_LIB"] = "/nonexistent/lib.so"
+            os.environ["PYRE_IREE_COMPILE"] = "/nonexistent/lib.so"
+            os.environ["PYRE_IREE_COMPILER_CLI"] = "/nonexistent/iree-compile"
             # These env vars are checked at initialization time, which happens
             # lazily. We can't easily re-initialize, so just verify the vars
             # exist as documented.
             self.assertEqual(
-                os.environ["PYRE_IREE_COMPILE"], "/nonexistent/iree-compile"
+                os.environ["PYRE_IREE_COMPILER_CLI"], "/nonexistent/iree-compile"
             )
         finally:
             if old_compile is not None:
                 os.environ["PYRE_IREE_COMPILE"] = old_compile
             else:
                 os.environ.pop("PYRE_IREE_COMPILE", None)
-            if old_lib is not None:
-                os.environ["PYRE_IREE_COMPILER_LIB"] = old_lib
+            if old_cli is not None:
+                os.environ["PYRE_IREE_COMPILER_CLI"] = old_cli
             else:
-                os.environ.pop("PYRE_IREE_COMPILER_LIB", None)
+                os.environ.pop("PYRE_IREE_COMPILER_CLI", None)
 
 
 class TestRealTemplates(TestCase):

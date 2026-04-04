@@ -3,8 +3,6 @@
 #include <c10/pyre/impl/PyreRuntime.h>
 #include <c10/pyre/impl/PyreStream.h>
 #include <c10/pyre/impl/PyreStorage.h>
-#include <iree/hal/fence.h>
-#include <iree/vm/api.h>
 
 #ifdef AT_PER_OPERATOR_HEADERS
 #include <ATen/ops/_to_copy_native.h>
@@ -264,43 +262,37 @@ CachedKernel* getOrCompile(
 // Transient size query — TLS-cached per cache key
 // ---------------------------------------------------------------------------
 
-static iree_device_size_t queryTransientSize(
+static size_t queryTransientSize(
     CachedKernel* kernel,
-    const AbiPacker& packer,
-    iree_allocator_t alloc) {
-  if (!kernel->has_transients_size) return 0;
+    const AbiPacker& packer) {
+  if (!kernel->transients_size_fn) return 0;
 
   // The _transients_size companion has the same signature as the main
   // function. Pass null for transient/wait/signal — it's a pure query.
-  c10::pyre::vm_list_ptr args;
-  PYRE_CHECK_OK(iree_vm_list_create(
-      iree_vm_make_undefined_type_def(), 32, alloc, args.for_output()));
+  c10::pyre::value_list_ptr args;
+  PYRE_CHECK_OK(pyre_value_list_create(32, args.for_output()));
   packer.packArgs(args.get(), /*transients=*/nullptr,
                   /*wait=*/nullptr, /*signal=*/nullptr);
 
-  c10::pyre::vm_list_ptr rets;
-  PYRE_CHECK_OK(iree_vm_list_create(
-      iree_vm_make_undefined_type_def(), 1, alloc, rets.for_output()));
+  c10::pyre::value_list_ptr rets;
+  PYRE_CHECK_OK(pyre_value_list_create(1, rets.for_output()));
 
-  PYRE_CHECK_OK(iree_vm_invoke(
-      kernel->context.get(), kernel->transients_size_fn,
-      IREE_VM_INVOCATION_FLAG_NONE, nullptr,
-      args.get(), rets.get(), alloc));
+  PYRE_CHECK_OK(pyre_function_invoke(
+      kernel->module.get(), kernel->transients_size_fn.get(),
+      args.get(), rets.get()));
 
-  iree_vm_value_t size_val;
-  PYRE_CHECK_OK(iree_vm_list_get_value(rets.get(), 0, &size_val));
-  auto size = static_cast<iree_device_size_t>(size_val.i64);
-  return size;
+  int64_t size_val = 0;
+  PYRE_CHECK_OK(pyre_value_list_get_i64(rets.get(), 0, &size_val));
+  return static_cast<size_t>(size_val);
 }
 
-static thread_local std::unordered_map<std::string, iree_device_size_t>
+static thread_local std::unordered_map<std::string, size_t>
     tls_transient_size_cache;
 
-static iree_device_size_t getTransientSize(
+static size_t getTransientSize(
     CachedKernel* kernel,
     const AbiPacker& packer,
-    const std::string& cache_key,
-    iree_allocator_t alloc) {
+    const std::string& cache_key) {
   // The transient size depends on actual dim values, not just the dim pattern
   // in cache_key. Build a size-specific key by appending dynamic dims.
   std::string size_key = cache_key;
@@ -312,7 +304,7 @@ static iree_device_size_t getTransientSize(
   auto it = tls_transient_size_cache.find(size_key);
   if (it != tls_transient_size_cache.end()) return it->second;
 
-  iree_device_size_t size = queryTransientSize(kernel, packer, alloc);
+  size_t size = queryTransientSize(kernel, packer);
   PYRE_LOG(INFO) << "transient size for " << size_key << ": " << size << "\n";
   tls_transient_size_cache[size_key] = size;
   return size;
@@ -329,10 +321,9 @@ void invokeEnvelope(
     at::Tensor& output,
     const std::string& cache_key) {
   auto& runtime = c10::pyre::PyreRuntime::get();
-  auto alloc = runtime.hostAllocator();
+  (void)runtime;
 
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
-  auto& stream_ctx = stream.context();
 
   // Flush pending native ops (fill/copy) before VM invoke — the VM
   // manages its own command buffers internally, so we must submit any
@@ -341,85 +332,61 @@ void invokeEnvelope(
 
   // Allocate transient workspace via queue_alloca if needed.
   auto* device = c10::pyre::PyreDevice::get(0);
-  c10::pyre::hal_buffer_ptr transient_buf;
-  iree_device_size_t transient_size =
-      getTransientSize(kernel, packer, cache_key, alloc);
+  (void)device;
+  c10::pyre::buffer_ptr transient_buf;
+  size_t transient_size = getTransientSize(kernel, packer, cache_key);
   if (transient_size > 0) {
-    iree_hal_buffer_params_t params = {};
-    params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE;
-    params.access = IREE_HAL_MEMORY_ACCESS_ALL;
-    params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL
-                | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
-
-    uint64_t alloca_wait = stream_ctx.timepoint;
-    auto* alloca_sem = stream_ctx.timeline.get();
-    iree_hal_semaphore_list_t alloca_wait_list = {
-        .count = (alloca_wait > 0) ? 1u : 0u,
-        .semaphores = &alloca_sem,
-        .payload_values = &alloca_wait};
-    uint64_t alloca_signal = ++stream_ctx.timepoint;
-    iree_hal_semaphore_list_t alloca_signal_list = {
-        .count = 1, .semaphores = &alloca_sem,
-        .payload_values = &alloca_signal};
-
-    PYRE_CHECK_OK(iree_hal_device_queue_alloca(
-        device->halDevice(), stream_ctx.affinity,
-        alloca_wait_list, alloca_signal_list,
-        IREE_HAL_ALLOCATOR_POOL_DEFAULT,
-        params, transient_size,
-        IREE_HAL_ALLOCA_FLAG_NONE,
+    PYRE_CHECK_OK(pyre_buffer_allocate(
+        stream.handle(), transient_size,
+        PYRE_MEMORY_TYPE_DEVICE_LOCAL | PYRE_MEMORY_TYPE_HOST_VISIBLE,
+        PYRE_BUFFER_USAGE_DISPATCH_STORAGE,
         transient_buf.for_output()));
   }
 
   // Build wait fence. Include the stream's current timepoint (which now
   // includes the transient alloca signal) to enforce serial ordering.
-  c10::pyre::hal_fence_ptr wait;
-  PYRE_CHECK_OK(iree_hal_fence_create(
-      static_cast<iree_host_size_t>(inputs.size() + 3), alloc,
-      wait.for_output()));
-  if (stream_ctx.timepoint > 0)
-    PYRE_CHECK_OK(iree_hal_fence_insert(
-        wait, stream_ctx.timeline.get(), stream_ctx.timepoint));
+  c10::pyre::fence_ptr wait;
+  PYRE_CHECK_OK(pyre_fence_create(inputs.size() + 3, wait.for_output()));
+  uint64_t stream_timepoint = stream.timepoint();
+  if (stream_timepoint > 0)
+    PYRE_CHECK_OK(pyre_fence_insert(
+        wait.get(), stream.timeline(), stream_timepoint));
   for (const auto& t : inputs) {
     auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
         t.storage().data_ptr().get_context());
     if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
-      PYRE_CHECK_OK(iree_hal_fence_insert(
-          wait, ctx->mutation_sem, ctx->mutation_timepoint));
+      PYRE_CHECK_OK(pyre_fence_insert(
+          wait.get(), ctx->mutation_sem.get(), ctx->mutation_timepoint));
   }
   {
     auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
         output.storage().data_ptr().get_context());
     if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
-      PYRE_CHECK_OK(iree_hal_fence_insert(
-          wait, ctx->mutation_sem, ctx->mutation_timepoint));
+      PYRE_CHECK_OK(pyre_fence_insert(
+          wait.get(), ctx->mutation_sem.get(), ctx->mutation_timepoint));
   }
 
   // Signal fence — FenceGuard owns this ref and signals on exception
   // so subsequent ops don't hang waiting on a timepoint never reached.
-  uint64_t signal_value = ++stream_ctx.timepoint;
-  iree_hal_fence_t* signal = nullptr;
-  PYRE_CHECK_OK(iree_hal_fence_create_at(
-      stream_ctx.timeline.get(), signal_value, alloc, &signal));
+  uint64_t signal_value = stream.advance();
+  pyre_fence_t signal = nullptr;
+  PYRE_CHECK_OK(pyre_fence_create_at(stream.timeline(), signal_value, &signal));
   FenceGuard fence_guard(signal);
 
   // Build args via packer.
-  iree_host_size_t arg_count =
-      static_cast<iree_host_size_t>(packer.numUniqueBuffers()) +
-      static_cast<iree_host_size_t>(packer.dynamicDims().size()) +
+  size_t arg_count =
+      static_cast<size_t>(packer.numUniqueBuffers()) +
+      static_cast<size_t>(packer.dynamicDims().size()) +
       20;  // generous: offsets + output bufs + transients + fences
-  c10::pyre::vm_list_ptr args;
-  PYRE_CHECK_OK(iree_vm_list_create(
-      iree_vm_make_undefined_type_def(), arg_count, alloc,
-      args.for_output()));
+  c10::pyre::value_list_ptr args;
+  PYRE_CHECK_OK(pyre_value_list_create(arg_count, args.for_output()));
 
   packer.packArgs(args, transient_buf, wait, signal);
 
   // Invoke.
-  PYRE_CHECK_OK(iree_vm_invoke(
-      kernel->context.get(), kernel->function,
-      IREE_VM_INVOCATION_FLAG_NONE, nullptr,
-      args, /*rets=*/nullptr, alloc));
+  PYRE_CHECK_OK(pyre_function_invoke(
+      kernel->module.get(), kernel->function.get(),
+      args.get(), /*rets=*/nullptr));
 
   // Success — the dispatch itself will signal the fence asynchronously.
   fence_guard.disarm();
@@ -428,12 +395,12 @@ void invokeEnvelope(
   for (const auto& t : inputs) {
     auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
         t.storage().data_ptr().get_context());
-    if (ctx) ctx->recordUse(stream_ctx.timeline.get(), signal_value);
+    if (ctx) ctx->recordUse(stream.timeline(), signal_value);
   }
   auto* out_ctx = static_cast<c10::pyre::PyreBufferContext*>(
       output.storage().data_ptr().get_context());
   if (out_ctx) out_ctx->recordMutation(
-      stream_ctx.timeline.get(), signal_value);
+      stream.timeline(), signal_value);
 }
 
 // ---------------------------------------------------------------------------

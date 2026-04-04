@@ -7,10 +7,8 @@
 // - Status checking (throwable and non-throwable contexts)
 // - Status string formatting (dynamic allocation, no fixed buffer)
 
-#include <iree/async/util/proactor_pool.h>
-#include <iree/hal/api.h>
-#include <iree/hal/fence.h>
-#include <iree/vm/api.h>
+#include <pyre_runtime.h>
+#include <pyre_runtime_cxx.h>
 
 #include <c10/macros/Export.h>
 #include <c10/util/Exception.h>
@@ -71,161 +69,40 @@ struct PyreLogVoidify { void operator&(std::ostream&) const {} };
 // Status handling
 // -------------------------------------------------------------------------- //
 
-// Format an iree_status_t into a human-readable string.
-// Consumes (ignores) the status. Uses dynamic allocation (no fixed buffer).
-inline std::string formatIreeStatus(iree_status_t status) {
-  if (iree_status_is_ok(status)) return "OK";
-  iree_allocator_t alloc = iree_allocator_system();
-  char* buf = nullptr;
-  iree_host_size_t len = 0;
-  if (iree_status_to_string(status, &alloc, &buf, &len)) {
-    std::string result(buf, len);
-    iree_allocator_free(alloc, buf);
-    return result;
-  }
-  iree_status_ignore(status);
-  return "<<could not format iree_status_t>>";
+// Format a pyre_status_t into a human-readable string.
+// Does not consume status.
+inline std::string formatPyreStatus(pyre_status_t status) {
+  return ::pyre::runtime::format_status(status);
 }
 
-// Check an iree_status_t in a throwable context.
-// Throws via TORCH_CHECK on failure with a formatted message.
-inline void pyre_check_ok(iree_status_t status, const char* expr) {
-  if (IREE_LIKELY(iree_status_is_ok(status))) return;
-  auto msg = formatIreeStatus(status);
+// Check a pyre_status_t in a throwable context.
+// Consumes the status on failure and throws a formatted TORCH_CHECK.
+inline void pyre_check_ok(pyre_status_t status, const char* expr) {
+  if (pyre_status_is_ok(status)) return;
+  auto msg = formatPyreStatus(status);
+  pyre_status_ignore(status);
   TORCH_CHECK(false, "pyre: ", expr, " — ", msg);
 }
 
 #define PYRE_CHECK_OK(expr) ::c10::pyre::pyre_check_ok((expr), #expr)
 
-// Log an iree_status_t failure in a non-throwable context (destructors).
-// Does not throw. Logs the error and consumes the status.
-inline void pyre_log_status(iree_status_t status, const char* context) {
-  if (IREE_LIKELY(iree_status_is_ok(status))) return;
-  auto msg = formatIreeStatus(status);
+inline void pyre_log_status(pyre_status_t status, const char* context) {
+  if (pyre_status_is_ok(status)) return;
+  auto msg = formatPyreStatus(status);
+  pyre_status_ignore(status);
   LOG(ERROR) << "pyre: " << context << " — " << msg;
 }
 
-// -------------------------------------------------------------------------- //
-// RAII wrappers for IREE retain/release types
-// -------------------------------------------------------------------------- //
-
-template <
-    typename T,
-    void (*RetainFn)(T*),
-    void (*ReleaseFn)(T*)>
-class iree_ptr {
- public:
-  iree_ptr() : ptr_(nullptr) {}
-  explicit iree_ptr(T* owned) : ptr_(owned) {}
-
-  iree_ptr(const iree_ptr& other) : ptr_(other.ptr_) {
-    if (ptr_) RetainFn(ptr_);
-  }
-  iree_ptr(iree_ptr&& other) noexcept : ptr_(other.ptr_) {
-    other.ptr_ = nullptr;
-  }
-
-  iree_ptr& operator=(const iree_ptr&) = delete;
-  iree_ptr& operator=(iree_ptr&& other) noexcept {
-    reset();
-    ptr_ = other.ptr_;
-    other.ptr_ = nullptr;
-    return *this;
-  }
-
-  ~iree_ptr() { reset(); }
-
-  static iree_ptr steal(T* ptr) { return iree_ptr(ptr); }
-
-  static iree_ptr borrow(T* ptr) {
-    if (ptr) RetainFn(ptr);
-    return iree_ptr(ptr);
-  }
-
-  T** for_output() {
-    reset();
-    return &ptr_;
-  }
-
-  void reset() {
-    if (ptr_) {
-      ReleaseFn(ptr_);
-      ptr_ = nullptr;
-    }
-  }
-
-  T* get() const { return ptr_; }
-  T* release() { T* p = ptr_; ptr_ = nullptr; return p; }
-  operator T*() const { return ptr_; }
-  explicit operator bool() const { return ptr_ != nullptr; }
-
- private:
-  T* ptr_;
-};
-
-// IREE HAL types
-using hal_device_ptr = iree_ptr<
-    iree_hal_device_t,
-    iree_hal_device_retain,
-    iree_hal_device_release>;
-
-using hal_semaphore_ptr = iree_ptr<
-    iree_hal_semaphore_t,
-    iree_hal_semaphore_retain,
-    iree_hal_semaphore_release>;
-
-using hal_command_buffer_ptr = iree_ptr<
-    iree_hal_command_buffer_t,
-    iree_hal_command_buffer_retain,
-    iree_hal_command_buffer_release>;
-
-using hal_buffer_ptr = iree_ptr<
-    iree_hal_buffer_t,
-    iree_hal_buffer_retain,
-    iree_hal_buffer_release>;
-
-using hal_driver_ptr = iree_ptr<
-    iree_hal_driver_t,
-    iree_hal_driver_retain,
-    iree_hal_driver_release>;
-
-// IREE HAL buffer view
-using hal_buffer_view_ptr = iree_ptr<
-    iree_hal_buffer_view_t,
-    iree_hal_buffer_view_retain,
-    iree_hal_buffer_view_release>;
-
-// IREE HAL fence
-using hal_fence_ptr = iree_ptr<
-    iree_hal_fence_t,
-    iree_hal_fence_retain,
-    iree_hal_fence_release>;
-
-// IREE VM types
-using vm_instance_ptr = iree_ptr<
-    iree_vm_instance_t,
-    iree_vm_instance_retain,
-    iree_vm_instance_release>;
-
-using vm_context_ptr = iree_ptr<
-    iree_vm_context_t,
-    iree_vm_context_retain,
-    iree_vm_context_release>;
-
-using vm_module_ptr = iree_ptr<
-    iree_vm_module_t,
-    iree_vm_module_retain,
-    iree_vm_module_release>;
-
-using vm_list_ptr = iree_ptr<
-    iree_vm_list_t,
-    iree_vm_list_retain,
-    iree_vm_list_release>;
-
-// IREE async types
-using proactor_pool_ptr = iree_ptr<
-    iree_async_proactor_pool_t,
-    iree_async_proactor_pool_retain,
-    iree_async_proactor_pool_release>;
+using ::pyre::runtime::allocator_ptr;
+using ::pyre::runtime::buffer_ptr;
+using ::pyre::runtime::buffer_view_ptr;
+using ::pyre::runtime::device_ptr;
+using ::pyre::runtime::fence_ptr;
+using ::pyre::runtime::function_ptr;
+using ::pyre::runtime::module_ptr;
+using ::pyre::runtime::pyre_ptr;
+using ::pyre::runtime::semaphore_ptr;
+using ::pyre::runtime::stream_ptr;
+using ::pyre::runtime::value_list_ptr;
 
 } // namespace c10::pyre

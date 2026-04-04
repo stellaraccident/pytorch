@@ -22,17 +22,13 @@ if(${COMPILER_SUPPORTS_HIDDEN_VISIBILITY})
   target_compile_options(c10_pyre PRIVATE "-fvisibility=hidden")
 endif()
 
-target_link_libraries(c10_pyre PUBLIC ${C10_LIB})
-target_link_libraries(c10_pyre PRIVATE ${Caffe2_PYRE_DEPENDENCY_LIBS})
+target_link_libraries(c10_pyre PUBLIC ${C10_LIB} pyre::pyre)
 
 target_include_directories(
   c10_pyre PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../..>
   $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}>
   $<INSTALL_INTERFACE:include>)
-
-target_include_directories(
-  c10_pyre PRIVATE ${Caffe2_PYRE_INCLUDE})
 
 install(TARGETS c10_pyre EXPORT Caffe2Targets DESTINATION lib)
 set(C10_PYRE_LIB c10_pyre)

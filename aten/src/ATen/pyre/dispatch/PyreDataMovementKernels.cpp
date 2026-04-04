@@ -19,13 +19,7 @@
 #include <c10/pyre/impl/PyreStorage.h>
 #include <c10/pyre/impl/PyreStream.h>
 
-#include <iree/hal/fence.h>
-#include <iree/modules/hal/debugging.h>
-#include <iree/modules/hal/module.h>
-#include <iree/modules/hal/types.h>
-#include <iree/vm/api.h>
-#include <iree/vm/bytecode/module.h>
-
+#include <cstdint>
 #include <cstring>
 
 namespace at::pyre {
@@ -40,36 +34,31 @@ static c10::ArrayRef<std::string> nativeCompilerFlags() {
   return AbiConfig::kNativeOpaque.compilerFlags();
 }
 
-static std::string resolveNativeFunction(const std::string& func_name) {
-  return AbiConfig::kNativeOpaque.resolveFunction(func_name);
-}
-
 // Build an opaque buffer view (element type by bitwidth, for native dispatch).
-static c10::pyre::hal_buffer_view_ptr makeOpaqueView(const at::Tensor& t) {
+static c10::pyre::buffer_view_ptr makeOpaqueView(const at::Tensor& t) {
   auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
       t.storage().data_ptr().get_context());
   TORCH_CHECK(ctx && ctx->buffer, "pyre: tensor has no IREE buffer");
 
-  c10::SmallVector<iree_hal_dim_t, 6> shape;
+  c10::SmallVector<int64_t, 6> shape;
   for (int64_t i = 0; i < t.dim(); ++i)
-    shape.push_back(static_cast<iree_hal_dim_t>(t.size(i)));
+    shape.push_back(t.size(i));
 
-  iree_hal_element_type_t elt;
+  pyre_element_type_t elt;
   switch (t.element_size()) {
-    case 1: elt = IREE_HAL_ELEMENT_TYPE_SINT_8; break;
-    case 2: elt = IREE_HAL_ELEMENT_TYPE_SINT_16; break;
-    case 4: elt = IREE_HAL_ELEMENT_TYPE_SINT_32; break;
-    case 8: elt = IREE_HAL_ELEMENT_TYPE_SINT_64; break;
+    case 1: elt = PYRE_ELEMENT_TYPE_SINT_8; break;
+    case 2: elt = PYRE_ELEMENT_TYPE_SINT_16; break;
+    case 4: elt = PYRE_ELEMENT_TYPE_SINT_32; break;
+    case 8: elt = PYRE_ELEMENT_TYPE_SINT_64; break;
     default:
       TORCH_CHECK(false, "pyre: unsupported element size: ", t.element_size());
   }
 
-  iree_hal_buffer_view_t* view = nullptr;
-  PYRE_CHECK_OK(iree_hal_buffer_view_create(
+  pyre_buffer_view_t view = nullptr;
+  PYRE_CHECK_OK(pyre_buffer_view_create(
       ctx->buffer.get(), shape.size(), shape.data(),
-      elt, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
-      c10::pyre::PyreRuntime::get().hostAllocator(), &view));
-  return c10::pyre::hal_buffer_view_ptr::steal(view);
+      elt, PYRE_ENCODING_TYPE_DENSE_ROW_MAJOR, &view));
+  return c10::pyre::buffer_view_ptr::steal(view);
 }
 
 // Self-contained dispatch for native coarse-fences kernels.
@@ -78,74 +67,64 @@ static void invokeNative(
     CachedKernel* kernel,
     c10::ArrayRef<at::Tensor> inputs,
     at::Tensor& output) {
-  auto alloc = c10::pyre::PyreRuntime::get().hostAllocator();
+  (void)c10::pyre::PyreRuntime::get();
   c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
   // Flush pending native ops before VM invoke.
   stream.flush();
-  auto& stream_ctx = stream.context();
 
-  c10::pyre::vm_list_ptr args;
-  PYRE_CHECK_OK(iree_vm_list_create(
-      iree_vm_make_undefined_type_def(),
-      static_cast<iree_host_size_t>(inputs.size()) + 2, alloc,
-      args.for_output()));
+  c10::pyre::value_list_ptr args;
+  PYRE_CHECK_OK(pyre_value_list_create(
+      static_cast<size_t>(inputs.size()) + 2, args.for_output()));
 
   for (const auto& t : inputs) {
     auto view = makeOpaqueView(t);
-    iree_vm_ref_t ref = iree_hal_buffer_view_move_ref(view.release());
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_buffer_view(args.get(), view.get()));
   }
 
   // Wait fence — always include stream's current timepoint to enforce
   // serial ordering on the timeline.
   {
-    c10::pyre::hal_fence_ptr wait;
-    PYRE_CHECK_OK(iree_hal_fence_create(
-        static_cast<iree_host_size_t>(inputs.size() + 3), alloc,
-        wait.for_output()));
-    if (stream_ctx.timepoint > 0)
-      PYRE_CHECK_OK(iree_hal_fence_insert(
-          wait, stream_ctx.timeline.get(), stream_ctx.timepoint));
+    c10::pyre::fence_ptr wait;
+    PYRE_CHECK_OK(
+        pyre_fence_create(inputs.size() + 3, wait.for_output()));
+    uint64_t stream_timepoint = stream.timepoint();
+    if (stream_timepoint > 0)
+      PYRE_CHECK_OK(pyre_fence_insert(
+          wait.get(), stream.timeline(), stream_timepoint));
     for (const auto& t : inputs) {
       auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
           t.storage().data_ptr().get_context());
       if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
-        PYRE_CHECK_OK(iree_hal_fence_insert(
-            wait, ctx->mutation_sem, ctx->mutation_timepoint));
+        PYRE_CHECK_OK(pyre_fence_insert(
+            wait.get(), ctx->mutation_sem.get(),
+            ctx->mutation_timepoint));
     }
     {
       auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
           output.storage().data_ptr().get_context());
       if (ctx && ctx->mutation_sem && ctx->mutation_timepoint > 0)
-        PYRE_CHECK_OK(iree_hal_fence_insert(
-            wait, ctx->mutation_sem, ctx->mutation_timepoint));
+        PYRE_CHECK_OK(pyre_fence_insert(
+            wait.get(), ctx->mutation_sem.get(),
+            ctx->mutation_timepoint));
     }
-    iree_vm_ref_t ref = iree_hal_fence_move_ref(wait.release());
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_fence(args.get(), wait.get()));
   }
 
   // Signal fence — FenceGuard owns this ref and signals on exception.
   // A separate ref is retained into the args list for the dispatch engine.
-  uint64_t signal_value = ++stream_ctx.timepoint;
-  iree_hal_fence_t* signal = nullptr;
-  PYRE_CHECK_OK(iree_hal_fence_create_at(
-      stream_ctx.timeline.get(), signal_value, alloc, &signal));
+  uint64_t signal_value = stream.advance();
+  pyre_fence_t signal = nullptr;
+  PYRE_CHECK_OK(pyre_fence_create_at(stream.timeline(), signal_value,
+                                     &signal));
   at::pyre::FenceGuard fence_guard(signal);
-  {
-    iree_hal_fence_retain(signal);  // args list gets its own ref
-    iree_vm_ref_t ref = iree_hal_fence_move_ref(signal);
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
-  }
+  PYRE_CHECK_OK(pyre_value_list_push_fence(args.get(), signal));
 
-  c10::pyre::vm_list_ptr rets;
-  PYRE_CHECK_OK(iree_vm_list_create(
-      iree_vm_make_undefined_type_def(), 1, alloc,
-      rets.for_output()));
+  c10::pyre::value_list_ptr rets;
+  PYRE_CHECK_OK(pyre_value_list_create(1, rets.for_output()));
 
-  PYRE_CHECK_OK(iree_vm_invoke(
-      kernel->context.get(), kernel->function,
-      IREE_VM_INVOCATION_FLAG_NONE, nullptr,
-      args, rets, alloc));
+  PYRE_CHECK_OK(pyre_function_invoke(
+      kernel->module.get(), kernel->function.get(),
+      args.get(), rets.get()));
 
   // Success — dispatch will signal the fence asynchronously.
   fence_guard.disarm();
@@ -154,11 +133,11 @@ static void invokeNative(
   for (const auto& t : inputs) {
     auto* ctx = static_cast<c10::pyre::PyreBufferContext*>(
         t.storage().data_ptr().get_context());
-    if (ctx) ctx->recordUse(stream_ctx.timeline.get(), signal_value);
+    if (ctx) ctx->recordUse(stream.timeline(), signal_value);
   }
   auto* out_ctx = static_cast<c10::pyre::PyreBufferContext*>(
       output.storage().data_ptr().get_context());
-  if (out_ctx) out_ctx->recordMutation(stream_ctx.timeline.get(), signal_value);
+  if (out_ctx) out_ctx->recordMutation(stream.timeline(), signal_value);
 }
 
 // Lookup or compile a native kernel via lookupOrClaim/fulfill/fail.

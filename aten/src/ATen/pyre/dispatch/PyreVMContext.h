@@ -13,11 +13,9 @@ namespace at::pyre {
 
 struct CachedKernel {
   std::shared_ptr<CompilerOutput> vmfb;  // owns VMFB data (module refs it)
-  c10::pyre::vm_module_ptr module;
-  c10::pyre::vm_context_ptr context;
-  iree_vm_function_t function{};
-  iree_vm_function_t transients_size_fn{};
-  bool has_transients_size = false;
+  c10::pyre::module_ptr module;
+  c10::pyre::function_ptr function;
+  c10::pyre::function_ptr transients_size_fn;
 };
 
 // Load a compiled VMFB into a ready-to-dispatch CachedKernel.

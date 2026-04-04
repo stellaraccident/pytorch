@@ -1,10 +1,6 @@
 #include <ATen/pyre/dispatch/PyreAbiPacker.h>
 #include <ATen/pyre/PyreTensor.h>
 #include <ATen/pyre/dispatch/PyreTypeMapping.h>
-#include <c10/pyre/impl/PyreRuntime.h>
-
-#include <iree/hal/buffer_view.h>
-#include <iree/modules/hal/types.h>
 
 #include <algorithm>
 
@@ -170,10 +166,10 @@ std::string AbiPacker::cacheKey(
 // ---------------------------------------------------------------------------
 
 void AbiPacker::packArgs(
-    iree_vm_list_t* args,
-    iree_hal_buffer_t* transients,
-    iree_hal_fence_t* wait,
-    iree_hal_fence_t* signal) const {
+    pyre_value_list_t args,
+    pyre_buffer_t transients,
+    pyre_fence_t wait,
+    pyre_fence_t signal) const {
   // Arg order (envelope convention):
   // [buf0, buf0_elems, buf1, buf1_elems, ...,
   //  element_offsets..., dynamic_dims...,
@@ -190,59 +186,49 @@ void AbiPacker::packArgs(
   // Output-only buffers go in the output_buffers section.
   for (int i = 0; i < static_cast<int>(unique_bufs_.size()); ++i) {
     if (!buf_used_by_input[i]) continue;
-    iree_vm_ref_t ref = iree_hal_buffer_retain_ref(unique_bufs_[i].buffer);
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_buffer(args, unique_bufs_[i].buffer));
   }
 
   // 2. Element offsets (only for non-zero offsets).
   for (const auto& slot : slots_) {
     if (slot.element_offset != 0) {
-      iree_vm_value_t val = iree_vm_value_make_i64(slot.element_offset);
-      PYRE_CHECK_OK(iree_vm_list_push_value(args, &val));
+      PYRE_CHECK_OK(pyre_value_list_push_i64(args, slot.element_offset));
     }
   }
 
   // 3. Dynamic dims.
   for (int64_t d : dynamic_dims_) {
-    iree_vm_value_t val = iree_vm_value_make_i64(d);
-    PYRE_CHECK_OK(iree_vm_list_push_value(args, &val));
+    PYRE_CHECK_OK(pyre_value_list_push_i64(args, d));
   }
 
   // 4. Output buffers (as !hal.buffer). Skip if output aliases an input
   // buffer — the envelope uses the input buffer directly via hal.tensor.alias.
   for (const auto& slot : slots_) {
     if (slot.is_output && !buf_used_by_input[slot.buf_idx]) {
-      iree_hal_buffer_t* buf = unique_bufs_[slot.buf_idx].buffer;
-      iree_vm_ref_t ref = iree_hal_buffer_retain_ref(buf);
-      PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+      PYRE_CHECK_OK(pyre_value_list_push_buffer(
+          args, unique_bufs_[slot.buf_idx].buffer));
     }
   }
 
   // 5. Transients.
   if (transients) {
-    iree_vm_ref_t ref = iree_hal_buffer_retain_ref(transients);
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_buffer(args, transients));
   } else {
-    iree_vm_ref_t null_ref = iree_vm_ref_null();
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &null_ref));
+    PYRE_CHECK_OK(pyre_value_list_push_null_ref(args));
   }
 
   // 6. Wait fence.
   if (wait) {
-    iree_vm_ref_t ref = iree_hal_fence_retain_ref(wait);
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_fence(args, wait));
   } else {
-    iree_vm_ref_t ref = iree_vm_ref_null();
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_null_ref(args));
   }
 
   // 7. Signal fence.
   if (signal) {
-    iree_vm_ref_t ref = iree_hal_fence_retain_ref(signal);
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_fence(args, signal));
   } else {
-    iree_vm_ref_t ref = iree_vm_ref_null();
-    PYRE_CHECK_OK(iree_vm_list_push_ref_move(args, &ref));
+    PYRE_CHECK_OK(pyre_value_list_push_null_ref(args));
   }
 }
 

@@ -1,10 +1,5 @@
 #include <ATen/pyre/dispatch/PyreVMContext.h>
 #include <c10/pyre/impl/PyreDevice.h>
-#include <c10/pyre/impl/PyreRuntime.h>
-
-#include <iree/modules/hal/debugging.h>
-#include <iree/modules/hal/module.h>
-#include <iree/vm/bytecode/module.h>
 
 namespace at::pyre {
 
@@ -12,70 +7,32 @@ CachedKernel loadKernel(
     std::shared_ptr<CompilerOutput> vmfb,
     const std::string& func_name,
     const AbiConfig& abi) {
-  auto& runtime = c10::pyre::PyreRuntime::get();
   auto* device = c10::pyre::PyreDevice::get(0);
-  auto alloc = runtime.hostAllocator();
 
   PYRE_LOG(INFO) << "loading kernel, func=" << func_name
                  << " vmfb=" << vmfb->size() << " bytes\n";
 
   CachedKernel kernel;
-  kernel.vmfb = std::move(vmfb);  // keep data alive
-
-  // The CachedKernel owns the CompilerOutput which owns the page-aligned
-  // VMFB data. Pass null archive_allocator so IREE doesn't try to free it —
-  // the data lifetime is managed by kernel.vmfb (shared_ptr).
-  auto span = kernel.vmfb->span();
-  iree_vm_module_t* bytecode_module = nullptr;
-  PYRE_CHECK_OK(iree_vm_bytecode_module_create(
-      runtime.instance(),
-      IREE_VM_BYTECODE_MODULE_FLAG_NONE,
-      span, iree_allocator_null(), alloc,
-      &bytecode_module));
-  kernel.module = c10::pyre::vm_module_ptr::steal(bytecode_module);
-
-  iree_hal_device_group_t* device_group = nullptr;
-  PYRE_CHECK_OK(iree_hal_device_group_create_from_device(
-      device->halDevice(), alloc, &device_group));
-
-  iree_vm_module_t* hal_module = nullptr;
-  PYRE_CHECK_OK(iree_hal_module_create(
-      runtime.instance(),
-      iree_hal_module_device_policy_default(),
-      device_group, IREE_HAL_MODULE_FLAG_NONE,
-      iree_hal_module_debug_sink_null(),
-      alloc, &hal_module));
-  iree_hal_device_group_release(device_group);
-
-  iree_vm_module_t* modules[] = {hal_module, bytecode_module};
-  iree_vm_context_t* context = nullptr;
-  PYRE_CHECK_OK(iree_vm_context_create_with_modules(
-      runtime.instance(), IREE_VM_CONTEXT_FLAG_NONE,
-      2, modules, alloc, &context));
-  kernel.context = c10::pyre::vm_context_ptr::steal(context);
-  iree_vm_module_release(hal_module);
+  kernel.vmfb = std::move(vmfb);
+  kernel.vmfb->loadInto(device->handle(), kernel.module.for_output());
 
   std::string full_name = abi.resolveFunction(func_name);
   PYRE_LOG(DEBUG) << "resolving: " << full_name << "\n";
-  iree_string_view_t nv = {
-      full_name.c_str(), static_cast<iree_host_size_t>(full_name.size())};
-  PYRE_CHECK_OK(iree_vm_context_resolve_function(context, nv, &kernel.function));
+  PYRE_CHECK_OK(pyre_module_lookup_function(
+      kernel.module.get(), full_name.c_str(),
+      kernel.function.for_output()));
 
-  PYRE_LOG(INFO) << "kernel loaded: " << full_name
-                 << " ordinal=" << kernel.function.ordinal << "\n";
+  PYRE_LOG(INFO) << "kernel loaded: " << full_name << "\n";
 
   // Try to resolve the transients_size companion function.
   std::string size_fn_name = full_name + "_transients_size";
-  iree_string_view_t snv = {
-      size_fn_name.c_str(),
-      static_cast<iree_host_size_t>(size_fn_name.size())};
-  iree_status_t status = iree_vm_context_resolve_function(
-      context, snv, &kernel.transients_size_fn);
-  if (iree_status_is_ok(status)) {
-    kernel.has_transients_size = true;
+  pyre_status_t status = pyre_module_lookup_function(
+      kernel.module.get(), size_fn_name.c_str(),
+      kernel.transients_size_fn.for_output());
+  if (pyre_status_is_ok(status)) {
     PYRE_LOG(DEBUG) << "resolved transients_size: " << size_fn_name << "\n";
   } else {
-    iree_status_ignore(status);
+    pyre_status_ignore(status);
   }
 
   return kernel;
