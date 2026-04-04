@@ -44,6 +44,13 @@ struct OpContext {
 c10::DimVector inferShapeBroadcast(const OpContext& ctx);
 c10::DimVector inferShapeIdentity(const OpContext& ctx);
 std::string funcNameDefault(const char* aten_name);
+c10::pyre::PyreDevice* opDevice(const at::Tensor& tensor);
+std::vector<std::string> opCompilerFlags(
+    const at::Tensor& tensor,
+    const AbiConfig& abi);
+std::string opCacheKey(
+    const at::Tensor& tensor,
+    const std::string& digest);
 
 // Promote 0-dim CPU scalar tensors to the target device with matching
 // dtype (matches CUDA behavior). Returns true if promotion occurred,
@@ -92,6 +99,7 @@ std::string buildScalarBinaryMlirHelper(
 // Compile-and-cache via lookupOrClaim + fulfill/fail.
 // mlir_generator is only called if this thread is the compiler (lazy).
 CachedKernel* getOrCompile(
+    const at::Tensor& tensor,
     const std::string& cache_key,
     const std::string& func_name,
     std::function<std::string()> mlir_generator,
@@ -194,11 +202,13 @@ struct PyreOp {
 
     auto func_name = Derived::buildFuncName(ctx);
     auto spec = Derived::buildKernelSpec(func_name, ctx);
-    auto cache_key = packer.cacheKey(
-        spec.template_sha1, spec.substitutions,
-        AbiConfig::kEnvelope.compilerFlags());
+    auto cache_key = opCacheKey(
+        self,
+        packer.cacheKey(
+            spec.template_sha1, spec.substitutions,
+            opCompilerFlags(self, AbiConfig::kEnvelope)));
 
-    auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+    auto* kernel = getOrCompile(self, cache_key, func_name, [&]() {
       AbiGenerator gen;
       for (const auto& t : visit_inputs) gen.visitInput(t);
       gen.visitOutput(self);
@@ -267,13 +277,15 @@ struct PyreOp {
 
     // Phase 1: build spec for compute identity and cache key.
     auto spec = Derived::buildKernelSpec(func_name, ctx);
-    auto cache_key = packer.cacheKey(
-        spec.template_sha1, spec.substitutions,
-        AbiConfig::kEnvelope.compilerFlags());
+    auto cache_key = opCacheKey(
+        out,
+        packer.cacheKey(
+            spec.template_sha1, spec.substitutions,
+            opCompilerFlags(out, AbiConfig::kEnvelope)));
 
     // Phase 2: lookup or compile. MLIR generation is lazy — only the
     // thread that claims the cache key generates and compiles.
-    auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+    auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
       AbiGenerator gen;
       for (const auto& t : visit_inputs) gen.visitInput(t);
       gen.visitOutput(out);

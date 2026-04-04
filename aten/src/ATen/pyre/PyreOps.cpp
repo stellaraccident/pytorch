@@ -82,6 +82,23 @@ std::string funcNameDefault(const char* aten_name) {
   return s;
 }
 
+c10::pyre::PyreDevice* opDevice(const at::Tensor& tensor) {
+  return c10::pyre::PyreDevice::get(
+      tensor.device().type(), tensor.device().index());
+}
+
+std::vector<std::string> opCompilerFlags(
+    const at::Tensor& tensor,
+    const AbiConfig& abi) {
+  return abi.compilerFlags(*opDevice(tensor));
+}
+
+std::string opCacheKey(
+    const at::Tensor& tensor,
+    const std::string& digest) {
+  return opDevice(tensor)->capabilities().cacheNamespace() + "/" + digest;
+}
+
 // Binary: common logic for building args used by both spec and mlir paths.
 static void binaryArgs(
     const char* torch_op, const std::string& func_name,
@@ -232,28 +249,30 @@ std::string buildScalarBinaryMlirHelper(
 // ---------------------------------------------------------------------------
 
 CachedKernel* getOrCompile(
+    const at::Tensor& tensor,
     const std::string& cache_key,
     const std::string& func_name,
     std::function<std::string()> mlir_generator,
     const AbiConfig& abi) {
   auto& cache = PyreKernelCache::get();
-  auto result = cache.lookupOrClaim(cache_key, func_name, abi);
+  auto result = cache.lookupOrClaim(cache_key);
 
   if (result.is_compiler) {
     try {
       auto mlir = mlir_generator();
       PYRE_LOG(DEBUG) << "MLIR:\n" << mlir << "\n";
       auto vmfb = PyreKernelCompiler::compileSync(
-          std::move(mlir), abi.compilerFlags());
+          std::move(mlir), opCompilerFlags(tensor, abi));
       PYRE_LOG(INFO) << "compiled " << vmfb->size() << " bytes\n";
-      cache.fulfill(cache_key, std::move(vmfb), func_name, abi);
+      cache.fulfill(cache_key, std::move(vmfb));
     } catch (...) {
       cache.fail(cache_key, std::current_exception());
       throw;
     }
   }
 
-  return result.future.get();
+  return cache.loadForDevice(
+      opDevice(tensor), cache_key, result.future.get(), func_name, abi);
 }
 
 
@@ -528,11 +547,13 @@ at::Tensor dispatchMultiDimReduction(
       visit_self.sizes(), out_shape, norm_dims, keepdim,
       extra_decls, extra_args, extra_types);
 
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitOutput(out);
@@ -584,11 +605,13 @@ at::Tensor dispatchSingleDimReduction(
       visit_self.sizes(), out_shape, dim, keepdim,
       extra_decls, extra_args, extra_types);
 
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitOutput(out);
@@ -640,11 +663,13 @@ at::Tensor EmbeddingOp::impl(
 
   auto spec = buildEmbeddingKernelSpec(
       func_name, dtype, visit_weight.sizes(), visit_indices.sizes(), out_shape);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_weight);
     gen.visitInput(visit_indices);
@@ -693,11 +718,13 @@ at::Tensor IndexSelectOp::impl(
 
   auto spec = buildIndexSelectKernelSpec(
       func_name, dtype, visit_self.sizes(), visit_index.sizes(), out_shape, dim);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitInput(visit_index);
@@ -745,11 +772,13 @@ at::Tensor GatherOp::impl(
 
   auto spec = buildGatherKernelSpec(
       func_name, dtype, visit_self.sizes(), visit_index.sizes(), out_shape, dim);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitInput(visit_index);
@@ -792,11 +821,13 @@ static at::Tensor dispatchSoftmax(
 
   auto spec = buildSoftmaxKernelSpec(func_name, softmax_op, dtype,
       visit_self.sizes(), dim);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitOutput(out);
@@ -854,11 +885,13 @@ static at::Tensor dispatchScatterSrc(
   auto spec = buildScatterSrcKernelSpec(
       func_name, dtype, visit_self.sizes(), visit_index.sizes(),
       visit_src.sizes(), dim);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitInput(visit_index);
@@ -897,11 +930,13 @@ at::Tensor& ScatterSrcOp::impl_inplace(
 
   auto spec = buildScatterSrcInplaceKernelSpec(
       func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      self,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(self, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(self, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(self);
     gen.visitInput(index);
@@ -951,11 +986,13 @@ static at::Tensor dispatchScatterAdd(
   auto spec = buildScatterAddKernelSpec(
       func_name, dtype, visit_self.sizes(), visit_index.sizes(),
       visit_src.sizes(), dim);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitInput(visit_index);
@@ -994,11 +1031,13 @@ at::Tensor& ScatterAddOp::impl_inplace(
 
   auto spec = buildScatterAddInplaceKernelSpec(
       func_name, dtype, self.sizes(), index.sizes(), src.sizes(), dim);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      self,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(self, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(self, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(self);
     gen.visitInput(index);
@@ -1170,9 +1209,9 @@ static at::Tensor dispatchIndexPut(
   // Cache key from op identity hash
   std::string identity = std::string("index_put\0", 10) + elt + "\0" +
       packer.bufTopology() + "\0" + packer.dimPattern();
-  auto cache_key = c10::sha1(identity).str();
+  auto cache_key = opCacheKey(out, c10::sha1(identity).str());
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(v_self);
     for (const auto& [dim, idx] : non_none) gen.visitInput(idx);
@@ -1228,9 +1267,9 @@ at::Tensor& IndexPutOp::impl_inplace(
 
   std::string identity = std::string("index_put_ip\0", 13) + elt + "\0" +
       packer.bufTopology() + "\0" + packer.dimPattern();
-  auto cache_key = c10::sha1(identity).str();
+  auto cache_key = opCacheKey(self, c10::sha1(identity).str());
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(self, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(self);
     for (const auto& [dim, idx] : non_none) gen.visitInput(idx);
@@ -1371,9 +1410,9 @@ at::Tensor IndexTensorOp::impl(
 
   std::string identity = std::string("index_tensor\0", 13) + elt + "\0" +
       packer.bufTopology() + "\0" + packer.dimPattern();
-  auto cache_key = c10::sha1(identity).str();
+  auto cache_key = opCacheKey(out, c10::sha1(identity).str());
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(self_effective);
     for (const auto& [dim, idx] : non_none) gen.visitInput(idx);
@@ -1425,11 +1464,13 @@ at::Tensor ArangeOp::impl(
 
   auto spec = buildArangeKernelSpec(
       func_name, out_dtype, out_size, start_d, end_d, step_d);
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitOutput(out);
     auto body = generateArangeComputeBody(
@@ -1477,11 +1518,13 @@ at::Tensor TypeCastOp::impl(
 
   auto spec = buildTypeCastKernelSpec(
       func_name, in_dtype, out_dtype, visit_self.sizes());
-  auto cache_key = packer.cacheKey(
-      spec.template_sha1, spec.substitutions,
-      AbiConfig::kEnvelope.compilerFlags());
+  auto cache_key = opCacheKey(
+      out,
+      packer.cacheKey(
+          spec.template_sha1, spec.substitutions,
+          opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     gen.visitInput(visit_self);
     gen.visitOutput(out);
@@ -1583,9 +1626,9 @@ at::Tensor CatOp::impl(const at::ITensorListRef& tensors, int64_t dim) {
   std::string identity = std::string("cat\0", 4) + elt + "\0" +
       std::to_string(dim) + "\0" +
       packer.bufTopology() + "\0" + packer.dimPattern();
-  auto cache_key = c10::sha1(identity).str();
+  auto cache_key = opCacheKey(out, c10::sha1(identity).str());
 
-  auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+  auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
     AbiGenerator gen;
     for (const auto& t : visit_tensors) gen.visitInput(t);
     gen.visitOutput(out);

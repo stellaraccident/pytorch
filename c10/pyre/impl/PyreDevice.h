@@ -27,6 +27,7 @@ class C10_PYRE_API DeviceCapabilities {
 
   const std::vector<std::string>& compilerFlags() const { return flags_; }
   const std::string& cacheKey() const { return cache_key_; }
+  const std::string& cacheNamespace() const { return cache_key_; }
   int64_t preferredVectorWidth(c10::ScalarType dtype) const;
 
  private:

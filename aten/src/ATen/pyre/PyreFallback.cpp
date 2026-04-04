@@ -372,10 +372,13 @@ at::Tensor pyre_matmul(const at::Tensor& self, const at::Tensor& other) {
     packer.visitInput(other);
     packer.visitOutput(out);
 
-    auto cache_key = packer.cacheKey(
-        "matmul", {}, AbiConfig::kEnvelope.compilerFlags());
+    auto cache_key = opCacheKey(
+        out,
+        packer.cacheKey(
+            "matmul", {},
+            opCompilerFlags(out, AbiConfig::kEnvelope)));
 
-    auto* kernel = getOrCompile(cache_key, func_name, [&]() {
+    auto* kernel = getOrCompile(out, cache_key, func_name, [&]() {
       AbiGenerator gen;
       gen.visitInput(self);
       gen.visitInput(other);
