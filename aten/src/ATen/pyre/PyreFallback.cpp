@@ -1,4 +1,4 @@
-// Pyre kernel registrations for PrivateUse1 (host device).
+// Pyre kernel registrations for host and gpu frontends over one backend core.
 //
 // Non-compiled ops (empty, fill, copy, view) live here.
 // Compiled ops are registered via PyreOps.h / PyreOps.cpp.
@@ -49,6 +49,11 @@
 namespace at::pyre {
 namespace {
 
+bool isPyreDeviceType(c10::DeviceType device_type) {
+  return device_type == c10::DeviceType::PrivateUse1 ||
+      device_type == c10::DeviceType::HIP;
+}
+
 // --- empty.memory_format ---
 
 at::Tensor empty_memory_format(
@@ -60,16 +65,21 @@ at::Tensor empty_memory_format(
     std::optional<c10::MemoryFormat> memory_format_opt) {
   const auto device = c10::device_or_default(device_opt);
   const auto dtype = c10::dtype_or_default(dtype_opt);
-  TORCH_CHECK(device.is_privateuseone());
+  TORCH_CHECK(
+      isPyreDeviceType(device.type()),
+      "pyre: expected host or gpu device");
   TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
       "pyre: only strided layout");
   TORCH_CHECK(!c10::pinned_memory_or_default(pin_memory_opt),
       "pyre: no pinned memory");
   const c10::DeviceGuard device_guard(device);
-  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
-  auto allocator = at::GetAllocator(at::kPrivateUse1);
+  const c10::DispatchKeySet pyre_dks(
+      device.type() == c10::DeviceType::HIP
+          ? c10::DispatchKey::HIP
+          : c10::DispatchKey::PrivateUse1);
+  auto allocator = at::GetAllocator(device.type());
   return at::detail::empty_generic(
-      size, allocator, pu1_dks, dtype, memory_format_opt);
+      size, allocator, pyre_dks, dtype, memory_format_opt);
 }
 
 // --- empty_strided ---
@@ -82,12 +92,17 @@ at::Tensor empty_strided(
     std::optional<bool> pin_memory_opt) {
   const auto device = c10::device_or_default(device_opt);
   const auto dtype = c10::dtype_or_default(dtype_opt);
-  TORCH_CHECK(device.is_privateuseone());
+  TORCH_CHECK(
+      isPyreDeviceType(device.type()),
+      "pyre: expected host or gpu device");
   const c10::DeviceGuard device_guard(device);
-  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
-  auto allocator = at::GetAllocator(at::kPrivateUse1);
+  const c10::DispatchKeySet pyre_dks(
+      device.type() == c10::DeviceType::HIP
+          ? c10::DispatchKey::HIP
+          : c10::DispatchKey::PrivateUse1);
+  auto allocator = at::GetAllocator(device.type());
   return at::detail::empty_strided_generic(
-      size, stride, allocator, pu1_dks, dtype);
+      size, stride, allocator, pyre_dks, dtype);
 }
 
 // --- fill_.Scalar ---
@@ -139,7 +154,7 @@ at::Tensor pyreReadToCpuContiguous(const at::Tensor& src) {
 
 at::Tensor pyre_copy_from(
     const at::Tensor& self, const at::Tensor& dst, bool /*non_blocking*/) {
-  if (self.is_privateuseone() && dst.is_privateuseone()) {
+  if (hasPyreBuffer(self) && hasPyreBuffer(dst)) {
     if (self.dtype() != dst.dtype()) {
       // Cross-dtype: route through CPU.
       auto cpu_src = self.to(at::kCPU).to(dst.dtype()).contiguous();
@@ -162,7 +177,7 @@ at::Tensor pyre_copy_from(
           auto* dst_ctx = static_cast<c10::pyre::PyreBufferContext*>(
               dst.storage().data_ptr().get_context());
           executeCopyPlan(plan, src_pt.buffer(), dst_pt.buffer(),
-                          dst_pt.device(), src_ctx, dst_ctx);
+                          dst_pt.tensorDevice(), src_ctx, dst_ctx);
           break;
         }
         case CopyPlan::kCompiledKernel:
@@ -432,9 +447,7 @@ void cpu_fallback(
   at::native::cpu_fallback(op, stack);
 }
 
-} // namespace
-
-TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+void registerPyreKernels(torch::Library& m) {
   // Factory ops
   m.impl("arange", pyre_arange);
   m.impl("arange.start", pyre_arange_start);
@@ -476,9 +489,26 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   registerCompiledOps(m);
 }
 
+void registerPyreFallback(torch::Library& m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
+}
+
+} // namespace
+
+TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  registerPyreKernels(m);
+}
+
+TORCH_LIBRARY_IMPL(aten, HIP, m) {
+  registerPyreKernels(m);
+}
+
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
-  m.fallback(
-      torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
+  registerPyreFallback(m);
+}
+
+TORCH_LIBRARY_IMPL(_, HIP, m) {
+  registerPyreFallback(m);
 }
 
 } // namespace at::pyre

@@ -323,7 +323,9 @@ void invokeEnvelope(
   auto& runtime = c10::pyre::PyreRuntime::get();
   (void)runtime;
 
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream(
+      c10::pyre::getCurrentPyreStream(
+          output.device().type(), output.device().index()));
 
   // Flush pending native ops (fill/copy) before VM invoke — the VM
   // manages its own command buffers internally, so we must submit any
@@ -331,7 +333,8 @@ void invokeEnvelope(
   stream.flush();
 
   // Allocate transient workspace via queue_alloca if needed.
-  auto* device = c10::pyre::PyreDevice::get(0);
+  auto* device = c10::pyre::PyreDevice::get(
+      output.device().type(), output.device().index());
   (void)device;
   c10::pyre::buffer_ptr transient_buf;
   size_t transient_size = getTransientSize(kernel, packer, cache_key);
@@ -1257,7 +1260,7 @@ at::Tensor IndexTensorOp::impl(
     c10::Device target = c10::kCPU;
     for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
       if (indices[i].has_value() && indices[i]->defined() &&
-          indices[i]->is_privateuseone()) {
+          hasPyreBuffer(*indices[i])) {
         target = indices[i]->device();
         break;
       }

@@ -68,7 +68,9 @@ static void invokeNative(
     c10::ArrayRef<at::Tensor> inputs,
     at::Tensor& output) {
   (void)c10::pyre::PyreRuntime::get();
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream(
+      c10::pyre::getCurrentPyreStream(
+          output.device().type(), output.device().index()));
   // Flush pending native ops before VM invoke.
   stream.flush();
 
@@ -317,7 +319,7 @@ void executeCompiledFill(
       auto* dst_ctx = static_cast<c10::pyre::PyreBufferContext*>(
           dst.storage().data_ptr().get_context());
       executeCopyPlan(plan, src_pt.buffer(), dst_pt.buffer(),
-                      dst_pt.device(), src_ctx, dst_ctx);
+                      dst_pt.tensorDevice(), src_ctx, dst_ctx);
     }
   }
 }

@@ -128,9 +128,25 @@ void copy_same_type_transpose_(Tensor& self, const Tensor& src) {
 
 // Devices directly supported by this copy implementation. Other device types
 // (e.g. XLA) may be supported by overriding copy_ and _copy_from.
+//
+// Native HIP copy kernels are available only in USE_ROCM builds. In CPU-only
+// builds, HIP may still be claimed by an out-of-tree backend and must route
+// through _copy_from instead of copy_stub(kHIP).
+#if defined(USE_ROCM)
+constexpr bool kUseNativeHipCopy = true;
+#else
+constexpr bool kUseNativeHipCopy = false;
+#endif
+
 bool is_supported_device(Device device) {
   DeviceType device_type = device.type();
-  return device_type == kCPU || device_type == kCUDA || device_type == kHIP || device_type == kVulkan || device_type == kMetal || device_type == kMPS || device_type == kXPU;
+  return device_type == kCPU ||
+      device_type == kCUDA ||
+      (kUseNativeHipCopy && device_type == kHIP) ||
+      device_type == kVulkan ||
+      device_type == kMetal ||
+      device_type == kMPS ||
+      device_type == kXPU;
 }
 
 } // namespace

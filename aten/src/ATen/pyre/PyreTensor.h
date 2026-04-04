@@ -19,6 +19,7 @@ class PyreTensor {
 
   pyre_buffer_t buffer() const { return ctx_->buffer.get(); }
   c10::pyre::PyreDevice* device() const { return device_; }
+  const c10::Device& tensorDevice() const { return tensor_device_; }
 
   void fill(const void* pattern, size_t pattern_length,
             size_t offset, size_t length);
@@ -34,8 +35,11 @@ class PyreTensor {
                   size_t length);
 
  private:
+  c10::pyre::PyreStream currentStream() const;
+
   c10::pyre::PyreBufferContext* ctx_;
   c10::pyre::PyreDevice* device_;
+  c10::Device tensor_device_;
 };
 
 // Check if a tensor has a real pyre IREE buffer (vs CPU fallback backing).
@@ -46,7 +50,7 @@ void executeCopyPlan(
     const CopyPlan& plan,
     pyre_buffer_t src_buffer,
     pyre_buffer_t dst_buffer,
-    c10::pyre::PyreDevice* device,
+    c10::Device device,
     c10::pyre::PyreBufferContext* src_ctx,
     c10::pyre::PyreBufferContext* dst_ctx);
 
