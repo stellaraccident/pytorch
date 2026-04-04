@@ -77,14 +77,29 @@ PyreStorageAllocator& PyreStorageAllocator::hostAllocator() {
   return instance;
 }
 
+PyreStorageAllocator& PyreStorageAllocator::gpuAllocator() {
+  static PyreStorageAllocator instance(
+      DeviceType::HIP,
+      pyre_buffer_params_t{
+          .type = PYRE_MEMORY_TYPE_DEVICE_LOCAL,
+          .access = PYRE_MEMORY_ACCESS_ALL,
+          .usage = PYRE_BUFFER_USAGE_DEFAULT,
+          .queue_affinity = 0,
+      },
+      /*map_on_allocate=*/false);
+  return instance;
+}
+
 DataPtr PyreStorageAllocator::allocate(size_t n) {
+  DeviceIndex device_index = getCurrentPyreDeviceIndex(device_type_);
+  Device device(device_type_, device_index);
   if (n == 0) {
-    return {nullptr, nullptr, &deleter, Device(device_type_, 0)};
+    return {nullptr, nullptr, &deleter, device};
   }
 
-  auto* pyre_device = PyreDevice::get(0);
+  auto* pyre_device = PyreDevice::get(device_type_, device_index);
   // Stream-ordered allocation via queue_alloca.
-  PyreStream stream(getCurrentHostStream(0));
+  PyreStream stream(getCurrentPyreStream(device_type_, device_index));
 
   pyre_buffer_t buffer = nullptr;
   PYRE_CHECK_OK(pyre_buffer_allocate(
@@ -112,7 +127,7 @@ DataPtr PyreStorageAllocator::allocate(size_t n) {
     ctx->mapped_ptr = ptr;
   }
 
-  return {ptr, ctx, &deleter, Device(device_type_, 0)};
+  return {ptr, ctx, &deleter, device};
 }
 
 DeleterFnPtr PyreStorageAllocator::raw_deleter() const {

@@ -57,6 +57,8 @@ class C10_PYRE_API PyreDevice {
   StreamId getStreamFromPool(bool high_priority = false);
 
   // Convenience: get device by index (delegates to PyreRuntime).
+  static PyreDevice* get(DeviceType type, DeviceIndex index);
+  static int32_t deviceCount(DeviceType type);
   static PyreDevice* get(DeviceIndex index = 0);
   static int32_t deviceCount();
 

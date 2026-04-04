@@ -133,4 +133,12 @@ int32_t PyreDevice::deviceCount() {
   return PyreRuntime::get().deviceCount();
 }
 
+PyreDevice* PyreDevice::get(DeviceType type, DeviceIndex index) {
+  return PyreRuntime::get().device(type, index);
+}
+
+int32_t PyreDevice::deviceCount(DeviceType type) {
+  return PyreRuntime::get().deviceCount(type);
+}
+
 } // namespace c10::pyre

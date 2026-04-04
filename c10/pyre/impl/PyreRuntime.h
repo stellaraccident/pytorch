@@ -12,6 +12,7 @@
 #include <c10/util/Exception.h>
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -31,6 +32,9 @@ class C10_PYRE_API PyreRuntime {
   pyre_host_allocator_t hostAllocator() const { return host_allocator_; }
 
   // Device registry
+  PyreDevice* device(DeviceType type, DeviceIndex index);
+  int32_t deviceCount(DeviceType type) const;
+
   PyreDevice* device(DeviceIndex index);
   int32_t deviceCount() const;
 
@@ -39,11 +43,14 @@ class C10_PYRE_API PyreRuntime {
   ~PyreRuntime();
 
   void initialize();
+  std::vector<std::unique_ptr<PyreDevice>>& devicesForType(DeviceType type);
+  const std::vector<std::unique_ptr<PyreDevice>>& devicesForType(
+      DeviceType type) const;
 
   pyre_host_allocator_t host_allocator_;
 
-  // Owns all device instances.
-  std::vector<std::unique_ptr<PyreDevice>> devices_;
+  std::array<std::vector<std::unique_ptr<PyreDevice>>, 2> devices_by_type_;
+  bool gpu_initialized_ = false;
 };
 
 } // namespace c10::pyre

@@ -2,34 +2,93 @@
 #include <c10/pyre/impl/PyreDevice.h>
 #include <c10/pyre/impl/PyreRuntime.h>
 
+#include <array>
+
 namespace c10::pyre {
+namespace {
+
+constexpr size_t kPyreDeviceTypeCount = 2;
+
+size_t pyreDeviceTypeSlot(DeviceType device_type) {
+  switch (device_type) {
+    case DeviceType::PrivateUse1:
+      return 0;
+    case DeviceType::HIP:
+      return 1;
+    default:
+      TORCH_CHECK(false, "pyre: unsupported stream device type ", device_type);
+  }
+}
+
+thread_local std::array<DeviceIndex, kPyreDeviceTypeCount>
+    current_device_indices = {0, 0};
+thread_local std::array<std::array<StreamId, kMaxPyreDevices>,
+                        kPyreDeviceTypeCount>
+    current_stream_ids = {};
+
+StreamId& currentPyreStreamId(DeviceType device_type, DeviceIndex device_index) {
+  TORCH_CHECK(
+      device_index >= 0 && device_index < kMaxPyreDevices,
+      "pyre: invalid device index for stream TLS ", device_index);
+  return current_stream_ids[pyreDeviceTypeSlot(device_type)]
+                           [static_cast<size_t>(device_index)];
+}
+
+} // namespace
 
 // Thread-local current stream per device.
 // Default stream (StreamId 0) until explicitly changed.
-static thread_local StreamId current_stream_id = 0;
+
+DeviceIndex getCurrentPyreDeviceIndex(DeviceType device_type) {
+  return current_device_indices[pyreDeviceTypeSlot(device_type)];
+}
+
+void setCurrentPyreDeviceIndex(
+    DeviceType device_type, DeviceIndex device_index) {
+  TORCH_CHECK(
+      device_index >= 0 && device_index < PyreDevice::deviceCount(device_type),
+      "pyre: invalid ", device_type, " device index ", device_index);
+  current_device_indices[pyreDeviceTypeSlot(device_type)] = device_index;
+}
+
+Stream getDefaultPyreStream(DeviceType device_type, DeviceIndex device_index) {
+  return Stream(Stream::DEFAULT, Device(device_type, device_index));
+}
+
+Stream getCurrentPyreStream(DeviceType device_type, DeviceIndex device_index) {
+  return Stream(
+      Stream::UNSAFE,
+      Device(device_type, device_index),
+      currentPyreStreamId(device_type, device_index));
+}
+
+void setCurrentPyreStream(Stream stream) {
+  currentPyreStreamId(stream.device_type(), stream.device_index()) =
+      stream.id();
+}
 
 Stream getDefaultHostStream(DeviceIndex device_index) {
-  return Stream(Stream::DEFAULT, Device(DeviceType::PrivateUse1, device_index));
+  return getDefaultPyreStream(DeviceType::PrivateUse1, device_index);
 }
 
 Stream getCurrentHostStream(DeviceIndex device_index) {
-  return Stream(
-      Stream::UNSAFE,
-      Device(DeviceType::PrivateUse1, device_index),
-      current_stream_id);
+  return getCurrentPyreStream(DeviceType::PrivateUse1, device_index);
 }
 
 void setCurrentHostStream(Stream stream) {
-  current_stream_id = stream.id();
+  setCurrentPyreStream(stream);
 }
 
 PyreStream::PyreStream(Stream stream) : stream_(stream) {
-  TORCH_CHECK(stream_.device_type() == DeviceType::PrivateUse1,
-      "pyre: expected host device stream");
+  TORCH_CHECK(
+      stream_.device_type() == DeviceType::PrivateUse1 ||
+          stream_.device_type() == DeviceType::HIP,
+      "pyre: expected host or gpu device stream");
 }
 
 PyreStreamContext& PyreStream::context() const {
-  auto* device = PyreDevice::get(stream_.device_index());
+  auto* device = PyreDevice::get(
+      stream_.device_type(), stream_.device_index());
   return device->streamFromId(stream_.id());
 }
 
