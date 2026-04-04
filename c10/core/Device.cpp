@@ -13,7 +13,7 @@ namespace {
 DeviceType parse_type(const std::string& device_string) {
   static const std::array<
       std::pair<const char*, DeviceType>,
-      static_cast<size_t>(DeviceType::COMPILE_TIME_MAX_DEVICE_TYPES)>
+      static_cast<size_t>(DeviceType::COMPILE_TIME_MAX_DEVICE_TYPES) + 1>
       types = {{
           {"cpu", DeviceType::CPU},
           {"cuda", DeviceType::CUDA},
@@ -23,6 +23,7 @@ DeviceType parse_type(const std::string& device_string) {
           {"opengl", DeviceType::OPENGL},
           {"opencl", DeviceType::OPENCL},
           {"ideep", DeviceType::IDEEP},
+          {"gpu", DeviceType::HIP},
           {"hip", DeviceType::HIP},
           {"ve", DeviceType::VE},
           {"fpga", DeviceType::FPGA},

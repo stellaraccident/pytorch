@@ -304,10 +304,12 @@ static PyObject* THPStream_enter(PyObject* _self, PyObject* unused) {
     self->context = list.release();
   }
 
-  c10::DeviceIndex cur_device_idx = at::accelerator::getDeviceIndex();
   c10::DeviceIndex stream_device_idx =
       static_cast<c10::DeviceIndex>(self->device_index);
-  c10::Stream cur_stream = at::accelerator::getCurrentStream(stream_device_idx);
+  c10::impl::VirtualGuardImpl stream_impl(stream_device_type);
+  c10::DeviceIndex cur_device_idx = stream_impl.getDevice().index();
+  c10::Stream cur_stream =
+      stream_impl.getStream({stream_device_type, stream_device_idx});
 
   // If the stream is already current, push None as a no-op sentinel.
   if (cur_stream.id() == self->stream_id &&
@@ -322,9 +324,9 @@ static PyObject* THPStream_enter(PyObject* _self, PyObject* unused) {
   // If the stream is not on the current device, switch the current device to
   // the device of the stream.
   if (stream_device_idx != cur_device_idx) {
-    at::accelerator::setDeviceIndex(stream_device_idx);
+    stream_impl.setDevice({stream_device_type, stream_device_idx});
   }
-  at::accelerator::setCurrentStream(c10::Stream::unpack3(
+  stream_impl.exchangeStream(c10::Stream::unpack3(
       self->stream_id, stream_device_idx, stream_device_type));
 
   // Save the current device index and previous stream as a dict on the stack.
@@ -392,13 +394,19 @@ static PyObject* THPStream_exit(PyObject* _self, PyObject* unused) {
       "ctx_device_index should be present on the context dict.");
   auto prev_device_index = THPUtils_unpackDeviceIndex(ctx_device_index.get());
 
-  at::accelerator::setCurrentStream(c10::Stream::unpack3(
+  c10::DeviceType prev_device_type =
+      static_cast<c10::DeviceType>(prev_stream->device_type);
+  c10::impl::VirtualGuardImpl prev_impl(prev_device_type);
+  prev_impl.exchangeStream(c10::Stream::unpack3(
       prev_stream->stream_id,
       static_cast<c10::DeviceIndex>(prev_stream->device_index),
-      static_cast<c10::DeviceType>(prev_stream->device_type)));
+      prev_device_type));
   // Reset the current device to the previous device if they differ.
   if (static_cast<c10::DeviceIndex>(self->device_index) != prev_device_index) {
-    at::accelerator::setDeviceIndex(prev_device_index);
+    c10::DeviceType stream_device_type =
+        static_cast<c10::DeviceType>(self->device_type);
+    c10::impl::VirtualGuardImpl stream_impl(stream_device_type);
+    stream_impl.setDevice({stream_device_type, prev_device_index});
   }
   if (PyList_SetSlice(self->context, stack_size - 1, stack_size, nullptr) < 0) {
     throw python_error();
