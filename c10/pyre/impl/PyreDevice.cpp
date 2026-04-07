@@ -1,5 +1,6 @@
 #include <c10/pyre/impl/PyreDevice.h>
 #include <c10/pyre/impl/PyreRuntime.h>
+#include <c10/util/Exception.h>
 
 namespace c10::pyre {
 
@@ -16,7 +17,10 @@ DeviceCapabilities::DeviceCapabilities(
   if (backend_ == "llvm-cpu") {
     flags_.push_back("--iree-llvmcpu-target-cpu=" + target_);
   } else if (backend_ == "rocm") {
-    flags_.push_back("--iree-rocm-target-chip=" + target_);
+    TORCH_CHECK(
+        !target_.empty() && target_ != "unknown",
+        "pyre: GPU runtime device reported an unknown target ISA");
+    flags_.push_back("--iree-rocm-target=" + target_);
   }
   cache_key_ = backend_ + "-" + target_;
 }
@@ -131,6 +135,14 @@ PyreDevice* PyreDevice::get(DeviceIndex index) {
 
 int32_t PyreDevice::deviceCount() {
   return PyreRuntime::get().deviceCount();
+}
+
+PyreDevice* PyreDevice::get(DeviceType type, DeviceIndex index) {
+  return PyreRuntime::get().device(type, index);
+}
+
+int32_t PyreDevice::deviceCount(DeviceType type) {
+  return PyreRuntime::get().deviceCount(type);
 }
 
 } // namespace c10::pyre

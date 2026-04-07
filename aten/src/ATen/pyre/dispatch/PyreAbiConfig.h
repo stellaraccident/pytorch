@@ -6,10 +6,10 @@
 // - kNativeOpaque: native IREE flags, direct entry points (copy/fill).
 // - kEnvelope: torch-mlir flags, direct entry points (all arithmetic ops).
 
-#include <c10/util/ArrayRef.h>
-#include <c10/util/SmallVector.h>
+#include <c10/pyre/impl/PyreDevice.h>
 
 #include <string>
+#include <vector>
 
 namespace at::pyre {
 
@@ -17,8 +17,9 @@ class AbiConfig {
  public:
   enum class Convention { kNative, kEnvelope };
 
-  // Compiler flags for this ABI. Cached after first call.
-  c10::ArrayRef<std::string> compilerFlags() const;
+  // Compiler flags for this ABI on a specific runtime device profile.
+  std::vector<std::string> compilerFlags(
+      const c10::pyre::PyreDevice& device) const;
 
   // Resolve exported function name.
   std::string resolveFunction(const std::string& func_name) const;
@@ -34,8 +35,6 @@ class AbiConfig {
  private:
   AbiConfig(Convention c) : convention_(c) {}
   Convention convention_;
-  mutable c10::SmallVector<std::string, 8> cached_flags_;
-  mutable bool flags_cached_ = false;
 };
 
 } // namespace at::pyre

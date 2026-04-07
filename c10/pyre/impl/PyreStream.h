@@ -42,6 +42,7 @@ struct PyreStreamContext {
 //   0x7 = EXTERNAL (StreamId is a raw pointer)
 
 static constexpr int kStreamsPerPool = 32;
+static constexpr DeviceIndex kMaxPyreDevices = 64;
 
 enum class PyreStreamType : uint8_t {
   DEFAULT = 0x0,
@@ -65,6 +66,15 @@ inline void decodeStreamId(StreamId id, PyreStreamType& type, uint32_t& index) {
 }
 
 // Thread-local current stream per device.
+C10_PYRE_API DeviceIndex getCurrentPyreDeviceIndex(DeviceType device_type);
+C10_PYRE_API void setCurrentPyreDeviceIndex(
+    DeviceType device_type, DeviceIndex device_index);
+C10_PYRE_API Stream getDefaultPyreStream(
+    DeviceType device_type, DeviceIndex device_index = 0);
+C10_PYRE_API Stream getCurrentPyreStream(
+    DeviceType device_type, DeviceIndex device_index = 0);
+C10_PYRE_API void setCurrentPyreStream(Stream stream);
+
 C10_PYRE_API Stream getDefaultHostStream(DeviceIndex device_index = 0);
 C10_PYRE_API Stream getCurrentHostStream(DeviceIndex device_index = 0);
 C10_PYRE_API void setCurrentHostStream(Stream stream);

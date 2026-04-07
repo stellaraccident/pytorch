@@ -27,6 +27,7 @@ class C10_PYRE_API DeviceCapabilities {
 
   const std::vector<std::string>& compilerFlags() const { return flags_; }
   const std::string& cacheKey() const { return cache_key_; }
+  const std::string& cacheNamespace() const { return cache_key_; }
   int64_t preferredVectorWidth(c10::ScalarType dtype) const;
 
  private:
@@ -57,6 +58,8 @@ class C10_PYRE_API PyreDevice {
   StreamId getStreamFromPool(bool high_priority = false);
 
   // Convenience: get device by index (delegates to PyreRuntime).
+  static PyreDevice* get(DeviceType type, DeviceIndex index);
+  static int32_t deviceCount(DeviceType type);
   static PyreDevice* get(DeviceIndex index = 0);
   static int32_t deviceCount();
 

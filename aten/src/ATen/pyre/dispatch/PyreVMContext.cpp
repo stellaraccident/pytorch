@@ -1,13 +1,13 @@
 #include <ATen/pyre/dispatch/PyreVMContext.h>
-#include <c10/pyre/impl/PyreDevice.h>
-
+#include <c10/util/Exception.h>
 namespace at::pyre {
 
 CachedKernel loadKernel(
+    c10::pyre::PyreDevice* device,
     std::shared_ptr<CompilerOutput> vmfb,
     const std::string& func_name,
     const AbiConfig& abi) {
-  auto* device = c10::pyre::PyreDevice::get(0);
+  TORCH_CHECK(device, "pyre: loadKernel requires a device");
 
   PYRE_LOG(INFO) << "loading kernel, func=" << func_name
                  << " vmfb=" << vmfb->size() << " bytes\n";

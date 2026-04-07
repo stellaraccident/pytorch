@@ -6,19 +6,37 @@
 #include <cstring>
 
 namespace at::pyre {
+namespace {
+
+bool isPyreDeviceType(c10::DeviceType device_type) {
+  return device_type == c10::DeviceType::PrivateUse1 ||
+      device_type == c10::DeviceType::HIP;
+}
+
+} // namespace
 
 PyreTensor::PyreTensor(const at::Tensor& tensor)
-    : device_(c10::pyre::PyreDevice::get(tensor.device().index())) {
-  TORCH_CHECK(tensor.is_privateuseone(), "pyre: expected pyre device tensor");
+    : device_(c10::pyre::PyreDevice::get(
+          tensor.device().type(), tensor.device().index())),
+      tensor_device_(tensor.device()) {
+  TORCH_CHECK(
+      isPyreDeviceType(tensor_device_.type()),
+      "pyre: expected pyre device tensor");
   ctx_ = static_cast<c10::pyre::PyreBufferContext*>(
       tensor.storage().data_ptr().get_context());
   TORCH_CHECK(ctx_ && ctx_->buffer, "pyre: tensor has no IREE buffer");
 }
 
+c10::pyre::PyreStream PyreTensor::currentStream() const {
+  return c10::pyre::PyreStream(
+      c10::pyre::getCurrentPyreStream(
+          tensor_device_.type(), tensor_device_.index()));
+}
+
 void PyreTensor::fill(
     const void* pattern, size_t pattern_length,
     size_t offset, size_t length) {
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream = currentStream();
   PYRE_CHECK_OK(pyre_stream_fill_buffer(
       stream.handle(), buffer(), offset, length, pattern, pattern_length));
   stream.flushIfEager();
@@ -30,7 +48,7 @@ void PyreTensor::copyFrom(
     size_t src_offset,
     size_t dst_offset,
     size_t length) {
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream = currentStream();
   PYRE_CHECK_OK(pyre_stream_copy_buffer(
       stream.handle(), src.buffer(), src_offset, buffer(), dst_offset,
       length));
@@ -41,7 +59,7 @@ void PyreTensor::copyFrom(
 
 void PyreTensor::updateFromHost(
     const void* data, size_t offset, size_t length) {
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream = currentStream();
 
   // update_buffer stores data inline in the command buffer arena. The max
   // depends on the block builder's block size — 2KB on the new local-task
@@ -75,8 +93,15 @@ void PyreTensor::updateFromHost(
 
 void PyreTensor::readToHost(
     void* data, size_t offset, size_t length) {
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream = currentStream();
   stream.synchronize();
+  if (tensor_device_.type() == c10::DeviceType::HIP) {
+    // HACK: GPU buffers are DEVICE_LOCAL and not directly mappable here.
+    // Replace with an async staging transfer once the runtime exposes one.
+    PYRE_CHECK_OK(pyre_synchronous_d2h(
+        device_->handle(), buffer(), offset, data, length));
+    return;
+  }
   void* mapped = nullptr;
   PYRE_CHECK_OK(
       pyre_buffer_map(buffer(), PYRE_MAP_READ, offset, length, &mapped));
@@ -92,7 +117,7 @@ void executeCopyPlan(
     const CopyPlan& plan,
     pyre_buffer_t src_buffer,
     pyre_buffer_t dst_buffer,
-    c10::pyre::PyreDevice* device,
+    c10::Device device,
     c10::pyre::PyreBufferContext* src_ctx,
     c10::pyre::PyreBufferContext* dst_ctx) {
   TORCH_CHECK(plan.tier == CopyPlan::kSingleCopy ||
@@ -103,10 +128,9 @@ void executeCopyPlan(
   PYRE_LOG(INFO) << "executeCopyPlan: " << plan.chunks.size()
                  << " chunks, tier=" << static_cast<int>(plan.tier) << "\n";
 
-  (void)device;
-
   // Record all chunks into the current stream and submit once.
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream(
+      c10::pyre::getCurrentPyreStream(device.type(), device.index()));
   for (const auto& chunk : plan.chunks) {
     PYRE_CHECK_OK(pyre_stream_copy_buffer(
         stream.handle(),
@@ -128,7 +152,7 @@ void executeCopyPlan(
 // -------------------------------------------------------------------------- //
 
 bool hasPyreBuffer(const at::Tensor& tensor) {
-  if (!tensor.is_privateuseone()) return false;
+  if (!isPyreDeviceType(tensor.device().type())) return false;
   void* ctx = tensor.storage().data_ptr().get_context();
   if (!ctx) return false;
   auto* pctx = static_cast<c10::pyre::PyreBufferContext*>(ctx);

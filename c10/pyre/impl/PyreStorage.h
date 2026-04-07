@@ -63,6 +63,7 @@ class C10_PYRE_API PyreStorageAllocator final : public Allocator {
 
   // Host device allocator (HOST_LOCAL | DEVICE_VISIBLE, mapped).
   static PyreStorageAllocator& hostAllocator();
+  static PyreStorageAllocator& gpuAllocator();
 
   DataPtr allocate(size_t n) override;
   DeleterFnPtr raw_deleter() const override;

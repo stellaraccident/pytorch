@@ -20,6 +20,7 @@ struct CachedKernel {
 
 // Load a compiled VMFB into a ready-to-dispatch CachedKernel.
 CachedKernel loadKernel(
+    c10::pyre::PyreDevice* device,
     std::shared_ptr<CompilerOutput> vmfb,
     const std::string& func_name,
     const AbiConfig& abi = AbiConfig::kEnvelope);

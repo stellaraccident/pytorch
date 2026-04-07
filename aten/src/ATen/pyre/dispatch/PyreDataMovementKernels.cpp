@@ -30,8 +30,8 @@ namespace at::pyre {
 
 namespace {
 
-static c10::ArrayRef<std::string> nativeCompilerFlags() {
-  return AbiConfig::kNativeOpaque.compilerFlags();
+static std::vector<std::string> nativeCompilerFlags(const at::Tensor& tensor) {
+  return opCompilerFlags(tensor, AbiConfig::kNativeOpaque);
 }
 
 // Build an opaque buffer view (element type by bitwidth, for native dispatch).
@@ -68,7 +68,9 @@ static void invokeNative(
     c10::ArrayRef<at::Tensor> inputs,
     at::Tensor& output) {
   (void)c10::pyre::PyreRuntime::get();
-  c10::pyre::PyreStream stream(c10::pyre::getCurrentHostStream(0));
+  c10::pyre::PyreStream stream(
+      c10::pyre::getCurrentPyreStream(
+          output.device().type(), output.device().index()));
   // Flush pending native ops before VM invoke.
   stream.flush();
 
@@ -142,30 +144,31 @@ static void invokeNative(
 
 // Lookup or compile a native kernel via lookupOrClaim/fulfill/fail.
 static CachedKernel* getOrCompileNative(
+    const at::Tensor& tensor,
     const std::string& cache_key,
     const std::string& func_name,
     PyreKernelAsmFragments& frags,
     const std::function<void(PyreKernelAsmBuilder&)>& recipe) {
   auto& cache = PyreKernelCache::get();
-  auto result = cache.lookupOrClaim(
-      cache_key, func_name, AbiConfig::kNativeOpaque);
+  auto result = cache.lookupOrClaim(cache_key);
 
   if (result.is_compiler) {
     try {
       auto mlir = frags.generateMlir(recipe);
       PYRE_LOG(DEBUG) << "MLIR:\n" << mlir << "\n";
       auto vmfb = PyreKernelCompiler::compileSync(
-          std::move(mlir), nativeCompilerFlags());
+          std::move(mlir), nativeCompilerFlags(tensor));
       PYRE_LOG(INFO) << "compiled " << vmfb->size() << " bytes\n";
-      cache.fulfill(cache_key, std::move(vmfb), func_name,
-                    AbiConfig::kNativeOpaque);
+      cache.fulfill(cache_key, std::move(vmfb));
     } catch (...) {
       cache.fail(cache_key, std::current_exception());
       throw;
     }
   }
 
-  return result.future.get();
+  return cache.loadForDevice(
+      opDevice(tensor), cache_key, result.future.get(), func_name,
+      AbiConfig::kNativeOpaque);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,9 +296,10 @@ void executeCompiledFill(
       });
     };
 
-    auto cache_key = fillFragments().digest(nativeCompilerFlags(), recipe);
+    auto cache_key = opCacheKey(
+        dst, fillFragments().digest(nativeCompilerFlags(dst), recipe));
     auto* kernel = getOrCompileNative(
-        cache_key, func_name, fillFragments(), recipe);
+        dst, cache_key, func_name, fillFragments(), recipe);
 
     auto dst_flat = dst.as_strided({numel}, {1}, dst.storage_offset());
     invokeNative(kernel, {dst_flat}, dst_flat);
@@ -317,7 +321,7 @@ void executeCompiledFill(
       auto* dst_ctx = static_cast<c10::pyre::PyreBufferContext*>(
           dst.storage().data_ptr().get_context());
       executeCopyPlan(plan, src_pt.buffer(), dst_pt.buffer(),
-                      dst_pt.device(), src_ctx, dst_ctx);
+                      dst_pt.tensorDevice(), src_ctx, dst_ctx);
     }
   }
 }
@@ -394,9 +398,10 @@ void executeCompiledCopy(
         {"SRC_OFF", src_off}, {"DST_OFF", dst_off}, {"DST_N", dst_n}});
   };
 
-  auto cache_key = copyFragments().digest(nativeCompilerFlags(), recipe);
+  auto cache_key = opCacheKey(
+      dst, copyFragments().digest(nativeCompilerFlags(dst), recipe));
   auto* kernel = getOrCompileNative(
-      cache_key, func_name, copyFragments(), recipe);
+      dst, cache_key, func_name, copyFragments(), recipe);
 
   auto src_flat = src.as_strided({src_storage_numel}, {1}, 0);
   auto dst_flat = dst.as_strided({dst_storage_numel}, {1}, 0);
